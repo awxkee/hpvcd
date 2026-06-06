@@ -1,0 +1,8 @@
+/target
+*.zip
+.idea
+target
+app/target
+*.jpg
+*.png
+*.heic
