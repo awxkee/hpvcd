@@ -238,6 +238,113 @@ static DST4: [[i32; 4]; 4] = [
 
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
+#[inline(always)]
+fn idct_raw_4(c: [i32; 4]) -> [i32; 4] {
+    let mut e = [0i32; 4];
+    for j in 0..4 {
+        let cj = c[j];
+        if cj == 0 {
+            continue;
+        }
+        let trow = T4[j];
+        for k in 0..4 {
+            e[k] += trow[k] * cj;
+        }
+    }
+    e
+}
+
+#[inline(always)]
+fn idct_raw_8(c: [i32; 8]) -> [i32; 8] {
+    let ee = idct_raw_4([c[0], c[2], c[4], c[6]]);
+    let mut oo = [0i32; 4];
+    for j in 0..4 {
+        let co = c[2 * j + 1];
+        if co == 0 {
+            continue;
+        }
+        let trow = T8[2 * j + 1]; // odd row of T8, anti-sym: first 4 cols used
+        for k in 0..4 {
+            oo[k] += trow[k] * co;
+        }
+    }
+    let mut out = [0i32; 8];
+    for k in 0..4 {
+        out[k] = ee[k] + oo[k];
+        out[7 - k] = ee[k] - oo[k];
+    }
+    out
+}
+
+#[inline(always)]
+fn idct_raw_16(c: [i32; 16]) -> [i32; 16] {
+    let ee = idct_raw_8(std::array::from_fn(|j| c[2 * j]));
+    let mut oo = [0i32; 8];
+    for j in 0..8 {
+        let co = c[2 * j + 1];
+        if co == 0 {
+            continue;
+        }
+        let trow = T16[2 * j + 1]; // odd row of T16, first 8 cols used
+        for k in 0..8 {
+            oo[k] += trow[k] * co;
+        }
+    }
+    let mut out = [0i32; 16];
+    for k in 0..8 {
+        out[k] = ee[k] + oo[k];
+        out[15 - k] = ee[k] - oo[k];
+    }
+    out
+}
+
+#[inline(always)]
+fn idct_raw_32(c: [i32; 32]) -> [i32; 32] {
+    let ee = idct_raw_16(std::array::from_fn(|j| c[2 * j]));
+    let mut oo = [0i32; 16];
+    for j in 0..16 {
+        let co = c[2 * j + 1];
+        if co == 0 {
+            continue;
+        }
+        let trow = T32[2 * j + 1];
+        for k in 0..16 {
+            oo[k] += trow[k] * co;
+        }
+    }
+    let mut out = [0i32; 32];
+    for k in 0..16 {
+        out[k] = ee[k] + oo[k];
+        out[31 - k] = ee[k] - oo[k];
+    }
+    out
+}
+
+/// 2-D 32×32 partial butterfly IDCT into `out[..1024]`.
+#[inline]
+fn inv_butterfly_32_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
+    const N: usize = 32;
+    let shift1 = 7i32;
+    let add1 = 1i32 << (shift1 - 1);
+    let shift2 = 20 - bit_depth as i32;
+    let add2 = 1i32 << (shift2 - 1);
+    let mut tmp = [0i32; N * N];
+    for c in 0..N {
+        let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c] as i32);
+        let raw = idct_raw_32(col);
+        for m in 0..N {
+            tmp[m * N + c] = ((raw[m] + add1) >> shift1).clamp(-32768, 32767);
+        }
+    }
+    for r in 0..N {
+        let row: [i32; N] = std::array::from_fn(|k| tmp[r * N + k]);
+        let raw = idct_raw_32(row);
+        for m in 0..N {
+            out[r * N + m] = (raw[m] + add2) >> shift2;
+        }
+    }
+}
+
 /// Allocation-free inverse integer transform.
 ///
 /// Two key optimisations over a naive dense matrix multiply:
@@ -327,7 +434,7 @@ pub(crate) fn inv_transform_into(coeff: &[i64], n: usize, bit_depth: u8, out: &m
         4 => inv_transform_n_into::<4>(coeff, &T4, bit_depth, out),
         8 => inv_transform_n_into::<8>(coeff, &T8, bit_depth, out),
         16 => inv_transform_n_into::<16>(coeff, &T16, bit_depth, out),
-        32 => inv_transform_n_into::<32>(coeff, &T32, bit_depth, out),
+        32 => inv_butterfly_32_into(coeff, bit_depth, &mut out[..1024]),
         _ => panic!("unsupported transform size {n}"),
     }
 }
