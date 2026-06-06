@@ -322,7 +322,7 @@ fn idct_raw_32(c: [i32; 32]) -> [i32; 32] {
 
 /// 2-D 32×32 partial butterfly IDCT into `out[..1024]`.
 #[inline]
-fn inv_butterfly_32_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
+fn inv_butterfly_32_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     const N: usize = 32;
     let shift1 = 7i32;
     let add1 = 1i32 << (shift1 - 1);
@@ -330,7 +330,7 @@ fn inv_butterfly_32_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
     let add2 = 1i32 << (shift2 - 1);
     let mut tmp = [0i32; N * N];
     for c in 0..N {
-        let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c] as i32);
+        let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c]);
         let raw = idct_raw_32(col);
         for m in 0..N {
             tmp[m * N + c] = ((raw[m] + add1) >> shift1).clamp(-32768, 32767);
@@ -347,7 +347,7 @@ fn inv_butterfly_32_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
 
 /// Allocation-free inverse integer transform.
 ///
-/// Two key optimisations over a naive dense matrix multiply:
+/// Two key optimizations over a naive dense matrix multiply:
 ///   * **Sparse skip** — residual blocks are typically zero except for a few
 ///     low-frequency coefficients, so each zero input contributes nothing and
 ///     is skipped before the inner accumulation runs at all.
@@ -356,7 +356,7 @@ fn inv_butterfly_32_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
 ///     `m`-th column of `t` (stride `N`) for every output.
 #[inline]
 fn inv_transform_n_into<const N: usize>(
-    coeff: &[i64],
+    coeff: &[i32],
     t: &[[i32; N]; N],
     bit_depth: u8,
     out: &mut [i32],
@@ -373,7 +373,7 @@ fn inv_transform_n_into<const N: usize>(
     for c in 0..N {
         acc[..N].fill(0);
         for k in 0..N {
-            let ck = coeff[k * N + c] as i32;
+            let ck = coeff[k * N + c];
             if ck == 0 {
                 continue; // sparse skip — most residual coeffs are zero
             }
@@ -412,7 +412,7 @@ pub(crate) fn dequantize_i32_into(
     n: usize,
     qp: u8,
     bit_depth: u8,
-    out: &mut [i64],
+    out: &mut [i32],
 ) {
     let log2n = (n as u32).trailing_zeros() as i64;
     let bd = bit_depth as i64;
@@ -424,12 +424,14 @@ pub(crate) fn dequantize_i32_into(
     let per = 1i64 << (qp_scaled / 6);
     let factor = scale * per * 16;
     for (o, &l) in out[..n * n].iter_mut().zip(levels) {
-        *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767);
+        // Intermediate stays i64 (l*factor can exceed i32 for high QP); the
+        // clamped result is always within i16 range, so storing as i32 is exact.
+        *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
     }
 }
 
 /// Inverse DCT into `out[..n*n]` — no heap allocation.
-pub(crate) fn inv_transform_into(coeff: &[i64], n: usize, bit_depth: u8, out: &mut [i32]) {
+pub(crate) fn inv_transform_into(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
     match n {
         4 => inv_transform_n_into::<4>(coeff, &T4, bit_depth, out),
         8 => inv_transform_n_into::<8>(coeff, &T8, bit_depth, out),
@@ -440,6 +442,6 @@ pub(crate) fn inv_transform_into(coeff: &[i64], n: usize, bit_depth: u8, out: &m
 }
 
 /// Inverse 4×4 DST into `out[..16]` — no heap allocation.
-pub(crate) fn inv_transform_dst_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
+pub(crate) fn inv_transform_dst_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     inv_transform_n_into::<4>(coeff, &DST4, bit_depth, out);
 }

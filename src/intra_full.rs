@@ -28,13 +28,13 @@
  */
 
 /// intraPredAngle for modes 2..=34 (Table 8-5), indexed by mode-2.
-pub(crate) const INTRA_PRED_ANGLE: [i32; 33] = [
+pub(crate) static INTRA_PRED_ANGLE: [i32; 33] = [
     32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13, -9,
     -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
 ];
 
 /// invAngle for modes 11..=25 (Table 8-6), indexed by mode-11.
-pub(crate) const INV_ANGLE: [i32; 15] = [
+pub(crate) static INV_ANGLE: [i32; 15] = [
     -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482, -630, -910, -1638, -4096,
 ];
 
@@ -52,8 +52,10 @@ pub(crate) struct IntraScratch {
     pub(crate) left: Vec<u16>,
     pub(crate) fa: Vec<u16>,
     pub(crate) fl: Vec<u16>,
-    pub(crate) refs_ang: Vec<i32>, // 3*N+1
-    pub(crate) pred: Vec<u16>,     // N*N
+    pub(crate) refs_ang: Vec<i32>,          // 3*N+1
+    pub(crate) pred: Vec<u16>,              // N*N
+    pub(crate) raw_above: Vec<Option<u16>>, // 2*N, reused for ref gathering (no per-TU alloc)
+    pub(crate) raw_left: Vec<Option<u16>>,  // 2*N
 }
 
 impl Default for IntraScratch {
@@ -74,6 +76,8 @@ impl IntraScratch {
             fl: vec![0u16; 2 * max_n + 1],
             refs_ang: vec![0i32; 3 * max_n + 1],
             pred: vec![0u16; max_n * max_n],
+            raw_above: vec![None; 2 * max_n],
+            raw_left: vec![None; 2 * max_n],
         }
     }
 }

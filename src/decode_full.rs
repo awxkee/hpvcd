@@ -85,7 +85,7 @@ pub(crate) struct FullDecoder<'a> {
     // QP tracking
     slice_qp: i32,
     qp_y_prev: i32,
-    qp_y_map: Vec<i32>, // per 4×4 luma
+    qp_y_map: Vec<i16>, // per 4×4 luma (QpY ∈ −24..51, fits i16; halves a multi-MB buffer)
     cu_qp_delta_val: i32,
     is_cu_qp_delta_coded: bool,
     log2_qg: u32,
@@ -106,8 +106,8 @@ pub(crate) struct FullDecoder<'a> {
     /// Pre-allocated scratch memory reused every TU to avoid per-block
     /// heap allocations on the hot path (~4–6 allocs per TU eliminated).
     scratch: intra_full::IntraScratch,
-    /// Dequantised coefficient scratch (max 32×32 = 1024 i64 values)
-    deq_scratch: Vec<i64>,
+    /// Dequantised coefficient scratch (max 32×32 = 1024 values, clamped to ±32768 → i32)
+    deq_scratch: Vec<i32>,
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
     res_scratch: Vec<i32>,
     /// Cached strong_intra_smoothing (avoids env-var lookup per TU)
@@ -191,7 +191,7 @@ impl<'a> FullDecoder<'a> {
             grid_h,
             slice_qp,
             qp_y_prev: slice_qp,
-            qp_y_map: vec![slice_qp; grid_w * grid_h],
+            qp_y_map: vec![slice_qp as i16; grid_w * grid_h],
             cu_qp_delta_val: 0,
             is_cu_qp_delta_coded: false,
             log2_qg,
@@ -205,7 +205,7 @@ impl<'a> FullDecoder<'a> {
             wpp_ctx_snap: vec![None; ctb_rows],
             wpp_ictx_snap: vec![None; ctb_rows],
             scratch: intra_full::IntraScratch::new(),
-            deq_scratch: vec![0i64; 1024],
+            deq_scratch: vec![0i32; 1024],
             res_scratch: vec![0i32; 1024],
             strong_smoothing: std::env::var("NOSTRONG").is_err(),
             sps,
@@ -377,7 +377,7 @@ impl<'a> FullDecoder<'a> {
     fn apply_deblocking(&mut self) {
         // HEVC §8.7.2.4 Tables 8-10 / 8-11 (beta, tC)
         #[rustfmt::skip]
-        const BETA: [i32; 52] = [
+        static BETA: [i32; 52] = [
              0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
              0, 0, 0, 0, 0, 0, 6, 7, 8, 9,
             10,11,12,13,14,15,16,17,18,20,
@@ -386,7 +386,7 @@ impl<'a> FullDecoder<'a> {
             62,64,
         ];
         #[rustfmt::skip]
-        const TC: [i32; 54] = [
+        static TC: [i32; 54] = [
             0,0,0,0,0,0,0,0,0,0,
             0,0,0,0,0,0,0,0,1,1,
             1,1,1,1,1,1,1,2,2,2,
@@ -412,8 +412,8 @@ impl<'a> FullDecoder<'a> {
         let gw = self.grid_w;
 
         // Helper: look up qp_y_map for a luma pixel (rounded to 4×4 grid)
-        let qp_at = |qp_map: &[i32], px: usize, py: usize| -> i32 {
-            qp_map[(py / 4).min(h / 4 - 1) * gw + (px / 4).min(w / 4 - 1)]
+        let qp_at = |qp_map: &[i16], px: usize, py: usize| -> i32 {
+            qp_map[(py / 4).min(h / 4 - 1) * gw + (px / 4).min(w / 4 - 1)] as i32
         };
 
         // Vertical edges first (filter across columns), then horizontal.
@@ -1050,13 +1050,13 @@ impl<'a> FullDecoder<'a> {
 
         // qPY_A: left neighbour, must be in same CTB
         let qp_a = if xqg >= 1 && (xqg - 1) >= ctb_x {
-            self.qp_y_map[(yqg / 4) * self.grid_w + (xqg - 1) / 4]
+            self.qp_y_map[(yqg / 4) * self.grid_w + (xqg - 1) / 4] as i32
         } else {
             self.qp_y_prev
         };
         // qPY_B: above neighbour, must be in same CTB
         let qp_b = if yqg >= 1 && (yqg - 1) >= ctb_y {
-            self.qp_y_map[((yqg - 1) / 4) * self.grid_w + xqg / 4]
+            self.qp_y_map[((yqg - 1) / 4) * self.grid_w + xqg / 4] as i32
         } else {
             self.qp_y_prev
         };
@@ -1067,7 +1067,7 @@ impl<'a> FullDecoder<'a> {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
                 if xx < self.w && yy < self.h {
-                    self.qp_y_map[(yy / 4) * self.grid_w + xx / 4] = qp;
+                    self.qp_y_map[(yy / 4) * self.grid_w + xx / 4] = qp as i16;
                 }
             }
         }
@@ -1465,30 +1465,34 @@ impl<'a> FullDecoder<'a> {
         self.decoded[(ly / 4) * self.grid_w + lx / 4]
     }
 
-    fn gather_luma_refs(
+    fn gather_luma_refs_into(
         &self,
         x0: usize,
         y0: usize,
         n: usize,
-    ) -> (Option<u16>, Vec<Option<u16>>, Vec<Option<u16>>) {
+        above: &mut [Option<u16>],
+        left: &mut [Option<u16>],
+    ) -> Option<u16> {
         let corner = if self.luma_avail(x0 as i32 - 1, y0 as i32 - 1) {
             Some(self.y[(y0 - 1) * self.w + (x0 - 1)])
         } else {
             None
         };
-        let mut above = vec![None; 2 * n];
-        let mut left = vec![None; 2 * n];
         for i in 0..2 * n {
             let ax = x0 as i32 + i as i32;
-            if self.luma_avail(ax, y0 as i32 - 1) {
-                above[i] = Some(self.y[(y0 - 1) * self.w + ax as usize]);
-            }
+            above[i] = if self.luma_avail(ax, y0 as i32 - 1) {
+                Some(self.y[(y0 - 1) * self.w + ax as usize])
+            } else {
+                None
+            };
             let ly = y0 as i32 + i as i32;
-            if self.luma_avail(x0 as i32 - 1, ly) {
-                left[i] = Some(self.y[ly as usize * self.w + (x0 - 1)]);
-            }
+            left[i] = if self.luma_avail(x0 as i32 - 1, ly) {
+                Some(self.y[ly as usize * self.w + (x0 - 1)])
+            } else {
+                None
+            };
         }
-        (corner, above, left)
+        corner
     }
 
     fn reconstruct_luma(&mut self, x0: usize, y0: usize, log2_ts: u32, mode: u8, levels: &[i32]) {
@@ -1533,14 +1537,16 @@ impl<'a> FullDecoder<'a> {
     }
 
     fn predict_luma_block_into(&mut self, x0: usize, y0: usize, n: usize, mode: u8) {
-        let (corner, above, left) = self.gather_luma_refs(x0, y0, n);
+        let mut above = std::mem::take(&mut self.scratch.raw_above);
+        let mut left = std::mem::take(&mut self.scratch.raw_left);
+        let corner = self.gather_luma_refs_into(x0, y0, n, &mut above[..2 * n], &mut left[..2 * n]);
         let neutral = 1u16 << (self.bd - 1);
         let strong = self.strong_smoothing && self.sps.strong_intra_smoothing;
         let sc = &mut self.scratch;
         intra_full::substitute_refs_into(
             corner,
-            &above,
-            &left,
+            &above[..2 * n],
+            &left[..2 * n],
             n,
             neutral,
             &mut sc.sub_s,
@@ -1569,6 +1575,8 @@ impl<'a> FullDecoder<'a> {
             &mut sc.pred[..n * n],
             &mut sc.refs_ang,
         );
+        self.scratch.raw_above = above;
+        self.scratch.raw_left = left;
     }
 
     fn do_chroma(
@@ -1626,32 +1634,36 @@ impl<'a> FullDecoder<'a> {
         }
     }
 
-    fn gather_chroma_refs(
+    fn gather_chroma_refs_into(
         &self,
         is_cb: bool,
         cx0: usize,
         cy0: usize,
         n: usize,
-    ) -> (Option<u16>, Vec<Option<u16>>, Vec<Option<u16>>) {
+        above: &mut [Option<u16>],
+        left: &mut [Option<u16>],
+    ) -> Option<u16> {
         let plane = if is_cb { &self.cb } else { &self.cr };
         let corner = if self.chroma_avail(cx0 as i32 - 1, cy0 as i32 - 1) {
             Some(plane[(cy0 - 1) * self.cw + (cx0 - 1)])
         } else {
             None
         };
-        let mut above = vec![None; 2 * n];
-        let mut left = vec![None; 2 * n];
         for i in 0..2 * n {
             let ax = cx0 as i32 + i as i32;
-            if self.chroma_avail(ax, cy0 as i32 - 1) {
-                above[i] = Some(plane[(cy0 - 1) * self.cw + ax as usize]);
-            }
+            above[i] = if self.chroma_avail(ax, cy0 as i32 - 1) {
+                Some(plane[(cy0 - 1) * self.cw + ax as usize])
+            } else {
+                None
+            };
             let ly = cy0 as i32 + i as i32;
-            if self.chroma_avail(cx0 as i32 - 1, ly) {
-                left[i] = Some(plane[ly as usize * self.cw + (cx0 - 1)]);
-            }
+            left[i] = if self.chroma_avail(cx0 as i32 - 1, ly) {
+                Some(plane[ly as usize * self.cw + (cx0 - 1)])
+            } else {
+                None
+            };
         }
-        (corner, above, left)
+        corner
     }
 
     fn predict_chroma_block_into(
@@ -1662,13 +1674,22 @@ impl<'a> FullDecoder<'a> {
         n: usize,
         mode: u8,
     ) {
-        let (corner, above, left) = self.gather_chroma_refs(is_cb, cx0, cy0, n);
+        let mut above = std::mem::take(&mut self.scratch.raw_above);
+        let mut left = std::mem::take(&mut self.scratch.raw_left);
+        let corner = self.gather_chroma_refs_into(
+            is_cb,
+            cx0,
+            cy0,
+            n,
+            &mut above[..2 * n],
+            &mut left[..2 * n],
+        );
         let neutral = 1u16 << (self.bd_c - 1);
         let sc = &mut self.scratch;
         intra_full::substitute_refs_into(
             corner,
-            &above,
-            &left,
+            &above[..2 * n],
+            &left[..2 * n],
             n,
             neutral,
             &mut sc.sub_s,
@@ -1687,6 +1708,8 @@ impl<'a> FullDecoder<'a> {
             &mut sc.pred[..n * n],
             &mut sc.refs_ang,
         );
+        self.scratch.raw_above = above;
+        self.scratch.raw_left = left;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1712,9 +1735,9 @@ impl<'a> FullDecoder<'a> {
         let max = (1i32 << self.bd_c) - 1;
         // Copy scratch.pred out before mutable borrow of plane
         let n2 = n * n;
-        let pred_tmp: [u16; 256] = {
+        let pred_tmp: [u16; 1024] = {
             // max chroma TB = 16×16 = 256 samples
-            let mut buf = [0u16; 256];
+            let mut buf = [0u16; 1024];
             buf[..n2].copy_from_slice(&self.scratch.pred[..n2]);
             buf
         };
@@ -1731,8 +1754,8 @@ impl<'a> FullDecoder<'a> {
     fn predict_only_chroma(&mut self, is_cb: bool, cx0: usize, cy0: usize, n: usize, mode: u8) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
         let n2 = n * n;
-        let pred_tmp: [u16; 256] = {
-            let mut buf = [0u16; 256];
+        let pred_tmp: [u16; 1024] = {
+            let mut buf = [0u16; 1024];
             buf[..n2].copy_from_slice(&self.scratch.pred[..n2]);
             buf
         };
