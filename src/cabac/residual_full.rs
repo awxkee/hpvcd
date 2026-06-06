@@ -38,7 +38,7 @@ pub(crate) const SCAN_VERT: u8 = 2;
 
 /// Up-right diagonal / horizontal / vertical scan over a W×W grid.
 /// Returns (x, y) = (col, row) positions in scan order.
-fn scan_order(w: usize, scan_idx: u8) -> Vec<(usize, usize)> {
+fn build_scan_order(w: usize, scan_idx: u8) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(w * w);
     match scan_idx {
         SCAN_HORIZ => {
@@ -75,6 +75,33 @@ fn scan_order(w: usize, scan_idx: u8) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// Cached scan tables. Sub-block grids are at most 8×8 and the in-sub-block
+/// scan is always 4×4, so every (width, scan_idx) pair is precomputed once and
+/// returned as a slice — avoiding a per-transform-block heap allocation.
+fn scan_order(w: usize, scan_idx: u8) -> &'static [(usize, usize)] {
+    use std::sync::OnceLock;
+    #[allow(clippy::type_complexity)]
+    static TABLE: OnceLock<Vec<Vec<Vec<(usize, usize)>>>> = OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        (0..4)
+            .map(|lg| {
+                let w = 1usize << lg;
+                (0..3).map(|s| build_scan_order(w, s as u8)).collect()
+            })
+            .collect()
+    });
+    let lg = w.trailing_zeros() as usize;
+    &t[lg][scan_idx as usize]
+}
+
+/// Index of position `(px, py)` within a cached scan order.
+#[inline]
+fn scan_index(scan: &[(usize, usize)], px: usize, py: usize) -> usize {
+    scan.iter()
+        .position(|&(x, y)| x == px && y == py)
+        .unwrap_or(0)
 }
 
 /// sig_coeff_flag context (§9.3.4.2.5), all sizes.
@@ -271,17 +298,8 @@ pub(crate) fn residual_coding(
     // Find last scan position within its sub-block + which sub-block.
     let last_sbx = last_x >> 2;
     let last_sby = last_y >> 2;
-    let last_sb = sb_scan
-        .iter()
-        .position(|&(x, y)| x == last_sbx && y == last_sby)
-        .unwrap_or(0);
-    let last_in_sb = {
-        let (px, py) = (last_x & 3, last_y & 3);
-        pos_scan
-            .iter()
-            .position(|&(x, y)| x == px && y == py)
-            .unwrap_or(0)
-    };
+    let last_sb = scan_index(sb_scan, last_sbx, last_sby);
+    let last_in_sb = scan_index(pos_scan, last_x & 3, last_y & 3);
 
     // csbf neighbour tracking
     let mut csbf = vec![0u8; sb_w * sb_w];

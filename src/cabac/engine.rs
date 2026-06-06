@@ -71,8 +71,12 @@ pub(crate) struct CabacDecoder<'a> {
     pub(crate) range: u32,
     pub(crate) offset: u32,
     data: &'a [u8],
+    /// Index of the next byte in `data` not yet loaded into `bitbuf`.
     pub(crate) byte_pos: usize,
-    pub(crate) bit_pos: u32,
+    /// Bit reservoir, left-aligned: the next bit to consume is bit 63.
+    bitbuf: u64,
+    /// Number of valid (unconsumed) bits currently in `bitbuf`.
+    bitcnt: u32,
 }
 
 impl<'a> CabacDecoder<'a> {
@@ -87,34 +91,69 @@ impl<'a> CabacDecoder<'a> {
             offset: 0,
             data,
             byte_pos: 0,
-            bit_pos: 0,
+            bitbuf: 0,
+            bitcnt: 0,
         };
-        for _ in 0..9 {
-            dec.offset = (dec.offset << 1) | dec.next_bit();
-        }
+        dec.offset = dec.read_bits(9);
         Ok(dec)
     }
 
-    /// Read the next input bit (MSB-first). Returns stuffed 1s past end-of-input.
-    #[inline]
-    fn next_bit(&mut self) -> u32 {
-        if self.byte_pos >= self.data.len() {
-            return 1;
-        }
-        let bit = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
+    /// Refill the reservoir with whole bytes until at least 56 bits are buffered
+    /// (or the input is exhausted).
+    #[inline(always)]
+    fn refill(&mut self) {
+        while self.bitcnt <= 56 && self.byte_pos < self.data.len() {
+            self.bitbuf |= (self.data[self.byte_pos] as u64) << (56 - self.bitcnt);
+            self.bitcnt += 8;
             self.byte_pos += 1;
-            self.bit_pos = 0;
         }
-        bit as u32
+    }
+
+    /// Read the next input bit (MSB-first). Returns stuffed 1s past end-of-input.
+    #[inline(always)]
+    fn next_bit(&mut self) -> u32 {
+        if self.bitcnt == 0 {
+            self.refill();
+            if self.bitcnt == 0 {
+                return 1; // past end of input: bitstream stuffing
+            }
+        }
+        let bit = (self.bitbuf >> 63) as u32;
+        self.bitbuf <<= 1;
+        self.bitcnt -= 1;
+        bit
+    }
+
+    /// Read `n` (≤ 32) bits MSB-first, padding past end-of-input with 1s.
+    #[inline]
+    fn read_bits(&mut self, n: u32) -> u32 {
+        if self.bitcnt < n {
+            self.refill();
+        }
+        if self.bitcnt >= n {
+            // Fast path: all n bits are in the reservoir.
+            let v = (self.bitbuf >> (64 - n)) as u32;
+            self.bitbuf <<= n;
+            self.bitcnt -= n;
+            v
+        } else {
+            // Slow path near end of input: take what we have, stuff the rest.
+            let mut v = 0u32;
+            for _ in 0..n {
+                v = (v << 1) | self.next_bit();
+            }
+            v
+        }
     }
 
     #[inline]
     fn renorm(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | self.next_bit();
+        // range ∈ [1, 510]; shift left until bit 8 (value 256) is set, then pull
+        // the same number of fresh bits into offset in one batched read.
+        if self.range < 256 {
+            let shift = self.range.leading_zeros() - 23; // = 8 - floor(log2(range))
+            self.range <<= shift;
+            self.offset = (self.offset << shift) | self.read_bits(shift);
         }
     }
 
@@ -168,20 +207,22 @@ impl<'a> CabacDecoder<'a> {
 }
 
 impl<'a> CabacDecoder<'a> {
-    /// Byte-align: skip remaining bits in the current partial byte (WPP).
+    /// Byte-align: discard buffered bits so the next read starts on a byte
+    /// boundary (WPP). The raw bit-reader position (bits consumed from `data`)
+    /// is `byte_pos*8 - bitcnt`; rounding that up to the next byte boundary
+    /// gives `byte_pos - bitcnt/8` regardless of whether we are mid-byte.
     pub(crate) fn byte_align(&mut self) {
-        if self.bit_pos != 0 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
+        self.byte_pos -= (self.bitcnt / 8) as usize;
+        self.bitbuf = 0;
+        self.bitcnt = 0;
     }
 
     /// Re-prime the engine from the current byte position (WPP row start).
     pub(crate) fn reinit_engine(&mut self) {
         self.range = 510;
         self.offset = 0;
-        for _ in 0..9 {
-            self.offset = (self.offset << 1) | self.next_bit();
-        }
+        self.bitbuf = 0;
+        self.bitcnt = 0;
+        self.offset = self.read_bits(9);
     }
 }

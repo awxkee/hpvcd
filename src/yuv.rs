@@ -29,6 +29,14 @@
 use crate::color::{ColorEncoding, MatrixCoefficients};
 use crate::fmt::{BitDepth, ChromaFormat, ImageBuffer};
 
+const Q13: u32 = 13;
+const Q13_ONE: i64 = 1 << Q13; // 8192 == 1.0
+const Q13_ROUND: i64 = 1 << (Q13 - 1); // 4096 == 0.5
+/// Limited-range luma scale 255/219 ≈ 1.16438 in Q0.13.
+const Q13_KY_LIMITED: i64 = 9539;
+/// Limited-range chroma scale 255/224 ≈ 1.13839 in Q0.13.
+const Q13_KUV_LIMITED: i64 = 9326;
+
 /// Planar YCbCr image produced by the HEVC decoder.
 pub(crate) struct YuvPlanes {
     pub(crate) y: Vec<u16>,
@@ -54,14 +62,17 @@ pub(crate) fn yuv_to_rgb_with_color(
     dh: usize,
     color: &ColorEncoding,
 ) -> ImageBuffer {
-    // Monochrome: return luma plane directly — no colour conversion needed.
     if yuv.chroma.is_monochrome() {
         let y_black = if color.full_range {
             0i64
         } else {
             16i64 << yuv.bit_depth.minus8()
         };
-        let k_y: i64 = if color.full_range { 10000 } else { 11644 };
+        let k_y: i64 = if color.full_range {
+            Q13_ONE
+        } else {
+            Q13_KY_LIMITED
+        };
         let max_val = yuv.bit_depth.max_val() as i64;
         return if yuv.bit_depth == BitDepth::Eight {
             let mut out = vec![0u8; dw * dh];
@@ -70,7 +81,8 @@ pub(crate) fn yuv_to_rgb_with_color(
                     let row = y.min(yuv.height - 1);
                     let col = x.min(yuv.width - 1);
                     let luma = yuv.y[row * yuv.width + col] as i64;
-                    out[y * dw + x] = ((k_y * (luma - y_black) + 5000) / 10000).clamp(0, 255) as u8;
+                    out[y * dw + x] =
+                        ((k_y * (luma - y_black) + Q13_ROUND) >> Q13).clamp(0, 255) as u8;
                 }
             }
             ImageBuffer::Luma8(out)
@@ -82,7 +94,7 @@ pub(crate) fn yuv_to_rgb_with_color(
                     let col = x.min(yuv.width - 1);
                     let luma = yuv.y[row * yuv.width + col] as i64;
                     out[y * dw + x] =
-                        ((k_y * (luma - y_black) + 5000) / 10000).clamp(0, max_val) as u16;
+                        ((k_y * (luma - y_black) + Q13_ROUND) >> Q13).clamp(0, max_val) as u16;
                 }
             }
             ImageBuffer::Luma16(out)
@@ -96,21 +108,34 @@ pub(crate) fn yuv_to_rgb_with_color(
     let sub_h = yuv.chroma.sub_h();
     let cw = yuv.width.div_ceil(sub_w);
 
-    // ── Range handling ──────────────────────────────────────────────────────
+    // ── Range handling (Q0.13) ──────────────────────────────────────────────
     let y_black = if color.full_range { 0 } else { 16 * scale };
-    let k_y: i64 = if color.full_range { 10000 } else { 11644 };
     let neutral = 128 * scale;
-    let k_uv: i64 = if color.full_range { 10000 } else { 11384 };
-
-    // ── Matrix coefficients ─────────────────────────────────────────────────
-    let (cr_to_r, cb_to_g, cr_to_g, cb_to_b) = match color.matrix {
-        MatrixCoefficients::Bt470Bg | MatrixCoefficients::Smpte170m => {
-            (14020i64, -3441i64, -7141i64, 17720i64)
-        }
-        MatrixCoefficients::Bt2020Ncl => (14746i64, -1645i64, -5714i64, 21418i64),
-        MatrixCoefficients::Identity => (0, 0, 0, 0),
-        _ => (15748i64, -1873i64, -4681i64, 18556i64),
+    let k_y: i64 = if color.full_range {
+        Q13_ONE
+    } else {
+        Q13_KY_LIMITED
     };
+    let k_uv: i64 = if color.full_range {
+        Q13_ONE
+    } else {
+        Q13_KUV_LIMITED
+    };
+
+    let (cr_r0, cb_g0, cr_g0, cb_b0) = match color.matrix {
+        MatrixCoefficients::Bt470Bg | MatrixCoefficients::Smpte170m => {
+            (11485i64, -2819i64, -5851i64, 14516i64)
+        }
+        MatrixCoefficients::Bt2020Ncl => (12080i64, -1348i64, -4681i64, 17546i64),
+        MatrixCoefficients::Identity => (0, 0, 0, 0),
+        _ => (12901i64, -1534i64, -3835i64, 15201i64), // BT.709
+    };
+    // Fold the chroma range scale into the matrix once (not per pixel), keeping
+    // everything in Q0.13: effective = round(coeff * k_uv / 8192).
+    let cr_to_r = (cr_r0 * k_uv + Q13_ROUND) >> Q13;
+    let cb_to_g = (cb_g0 * k_uv + Q13_ROUND) >> Q13;
+    let cr_to_g = (cr_g0 * k_uv + Q13_ROUND) >> Q13;
+    let cb_to_b = (cb_b0 * k_uv + Q13_ROUND) >> Q13;
 
     let pixel = |y_pix: usize, x_pix: usize| -> (i64, i64, i64) {
         let y_row = y_pix.min(yuv.height - 1);
@@ -121,20 +146,63 @@ pub(crate) fn yuv_to_rgb_with_color(
         let luma_raw = yuv.y[y_row * yuv.width + x_col] as i64;
 
         if color.matrix == MatrixCoefficients::Identity {
-            let y_scaled = (k_y * (luma_raw - y_black) + 5000) / 10000;
+            let y_scaled = (k_y * (luma_raw - y_black) + Q13_ROUND) >> Q13;
             (y_scaled, y_scaled, y_scaled)
         } else {
             let cb_raw = yuv.cb[c_row * cw + c_col] as i64;
             let cr_raw = yuv.cr[c_row * cw + c_col] as i64;
-            let y = k_y * (luma_raw - y_black);
-            let cb = k_uv * (cb_raw - neutral);
-            let cr = k_uv * (cr_raw - neutral);
-            let r = (y + cr_to_r * cr / 10000 + 5000) / 10000;
-            let g = (y + cb_to_g * cb / 10000 + cr_to_g * cr / 10000 + 5000) / 10000;
-            let b = (y + cb_to_b * cb / 10000 + 5000) / 10000;
+            let y_term = k_y * (luma_raw - y_black);
+            let cb_c = cb_raw - neutral;
+            let cr_c = cr_raw - neutral;
+            let r = (y_term + cr_to_r * cr_c + Q13_ROUND) >> Q13;
+            let g = (y_term + cb_to_g * cb_c + cr_to_g * cr_c + Q13_ROUND) >> Q13;
+            let b = (y_term + cb_to_b * cb_c + Q13_ROUND) >> Q13;
             (r, g, b)
         }
     };
+
+    // Fast paths below assume the visible window fits inside the coded planes
+    // (always true: display dims ≤ coded dims), so the per-pixel `.min()` edge
+    // clamps in `pixel` are provably no-ops and are omitted. The arithmetic is
+    // otherwise identical to `pixel`, so output is bit-exact.
+    let fast = dw <= yuv.width && dh <= yuv.height;
+    let ch = yuv.height.div_ceil(sub_h);
+
+    if fast && color.matrix != MatrixCoefficients::Identity {
+        macro_rules! convert_loop {
+            ($T:ty, $clampmax:expr, $variant:path) => {{
+                let mut rgb = vec![0 as $T; dw * dh * 3];
+                for y_pix in 0..dh {
+                    let luma_base = y_pix * yuv.width;
+                    let c_base = (y_pix / sub_h) * cw;
+                    let row_out = &mut rgb[y_pix * dw * 3..];
+                    for x_pix in 0..dw {
+                        let luma_raw = yuv.y[luma_base + x_pix] as i64;
+                        let c_col = x_pix / sub_w;
+                        let cb_raw = yuv.cb[c_base + c_col] as i64;
+                        let cr_raw = yuv.cr[c_base + c_col] as i64;
+                        let yv = k_y * (luma_raw - y_black);
+                        let cb_c = cb_raw - neutral;
+                        let cr_c = cr_raw - neutral;
+                        let r = (yv + cr_to_r * cr_c + Q13_ROUND) >> Q13;
+                        let g = (yv + cb_to_g * cb_c + cr_to_g * cr_c + Q13_ROUND) >> Q13;
+                        let b = (yv + cb_to_b * cb_c + Q13_ROUND) >> Q13;
+                        let o = &mut row_out[x_pix * 3..];
+                        o[0] = r.clamp(0, $clampmax) as $T;
+                        o[1] = g.clamp(0, $clampmax) as $T;
+                        o[2] = b.clamp(0, $clampmax) as $T;
+                    }
+                }
+                return $variant(rgb);
+            }};
+        }
+        if yuv.bit_depth == BitDepth::Eight {
+            convert_loop!(u8, 255, ImageBuffer::Rgb8);
+        } else {
+            convert_loop!(u16, max_val, ImageBuffer::Rgb16);
+        }
+    }
+    let _ = ch;
 
     if yuv.bit_depth == BitDepth::Eight {
         let mut rgb = vec![0u8; dw * dh * 3];

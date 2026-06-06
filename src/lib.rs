@@ -248,8 +248,8 @@ fn decode_grid_yuv(
     let mut out_y = vec![0u16; out_w * out_h];
     let mut out_cb = vec![0u16; cw * ch];
     let mut out_cr = vec![0u16; cw * ch];
-    let mut bit_depth = fmt::BitDepth::Eight;
-    let mut chroma_fmt = fmt::ChromaFormat::Yuv420;
+    let mut bit_depth = BitDepth::Eight;
+    let mut chroma_fmt = ChromaFormat::Yuv420;
 
     for (tile_idx, tile) in grid.tiles.iter().enumerate() {
         let col = tile_idx % cols;
@@ -546,10 +546,10 @@ fn decode_grid(
             &fallback_hvcc
         };
         if let Ok((sps, _)) = config::parse_hvcc_full(hvcc_ref) {
-            color::ColorEncoding {
-                primaries: color::Primaries::from_u8(sps.colour_primaries),
-                transfer: color::TransferFunction::from_u8(sps.transfer_characteristics),
-                matrix: color::MatrixCoefficients::from_u8(sps.matrix_coefficients),
+            ColorEncoding {
+                primaries: Primaries::from_u8(sps.colour_primaries),
+                transfer: TransferFunction::from_u8(sps.transfer_characteristics),
+                matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
                 full_range: sps.video_full_range,
             }
         } else {
@@ -557,7 +557,7 @@ fn decode_grid(
                 .primary
                 .color
                 .cicp
-                .unwrap_or_else(color::ColorEncoding::srgb)
+                .unwrap_or_else(ColorEncoding::srgb)
         }
     };
 
@@ -771,26 +771,56 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation)
             out
         }
         Orientation::Rotate90 => {
-            // 90° CW: (r,c) → (c, h-1-r)
+            // 90° CW: (r,c) → (c, h-1-r). Blocked to keep both the source and
+            // the transposed destination regions cache-resident.
             let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                for c in 0..w {
-                    let s = (r * w + c) * 3;
-                    let d = (c * h + (h - 1 - r)) * 3;
-                    out[d..d + 3].copy_from_slice(&px[s..s + 3]);
+            const BS: usize = 32;
+            let mut rb = 0;
+            while rb < h {
+                let r_end = (rb + BS).min(h);
+                let mut cb = 0;
+                while cb < w {
+                    let c_end = (cb + BS).min(w);
+                    for r in rb..r_end {
+                        let s_row = r * w * 3;
+                        let d_col = h - 1 - r;
+                        for c in cb..c_end {
+                            let s = s_row + c * 3;
+                            let d = (c * h + d_col) * 3;
+                            out[d] = px[s];
+                            out[d + 1] = px[s + 1];
+                            out[d + 2] = px[s + 2];
+                        }
+                    }
+                    cb = c_end;
                 }
+                rb = r_end;
             }
             out
         }
         Orientation::Rotate270 => {
-            // 90° CCW: (r,c) → (w-1-c, r)
+            // 90° CCW: (r,c) → (w-1-c, r). Blocked transpose (see Rotate90).
             let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                for c in 0..w {
-                    let s = (r * w + c) * 3;
-                    let d = ((w - 1 - c) * h + r) * 3;
-                    out[d..d + 3].copy_from_slice(&px[s..s + 3]);
+            const BS: usize = 32;
+            let mut rb = 0;
+            while rb < h {
+                let r_end = (rb + BS).min(h);
+                let mut cb = 0;
+                while cb < w {
+                    let c_end = (cb + BS).min(w);
+                    for r in rb..r_end {
+                        let s_row = r * w * 3;
+                        for c in cb..c_end {
+                            let s = s_row + c * 3;
+                            let d = ((w - 1 - c) * h + r) * 3;
+                            out[d] = px[s];
+                            out[d + 1] = px[s + 1];
+                            out[d + 2] = px[s + 2];
+                        }
+                    }
+                    cb = c_end;
                 }
+                rb = r_end;
             }
             out
         }

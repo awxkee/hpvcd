@@ -33,8 +33,6 @@ pub(crate) struct CtxModel {
 }
 
 impl CtxModel {
-    /// Initialise from an HEVC init_value byte + QP, per spec §9.3.2.2.
-    /// Initialise from an HEVC init_value byte + QP (spec §9.3.2.2).
     /// Formula is identical to hpvca CabacEncoder.
     pub(crate) fn init(init_value: u8, qp: u8) -> Self {
         let slope_idx = (init_value >> 4) as i32;

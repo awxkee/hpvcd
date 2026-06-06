@@ -238,60 +238,65 @@ static DST4: [[i32; 4]; 4] = [
 
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
-/// Inverse integer transform (spec 8.6.4.2). Returns residual.
-pub(crate) fn inv_transform(coeff: &[i64], n: usize, bit_depth: u8) -> Vec<i32> {
-    match n {
-        4 => inv_transform_n::<4>(coeff, &T4, bit_depth),
-        8 => inv_transform_n::<8>(coeff, &T8, bit_depth),
-        16 => inv_transform_n::<16>(coeff, &T16, bit_depth),
-        32 => inv_transform_n::<32>(coeff, &T32, bit_depth),
-        _ => panic!("unsupported transform size {n}"),
-    }
-}
-
-/// Inverse 4×4 DST-VII (HEVC §8.6.4.1, used for 4×4 intra luma residual).
-pub(crate) fn inv_transform_dst(coeff: &[i64], bit_depth: u8) -> Vec<i32> {
-    inv_transform_n::<4>(coeff, &DST4, bit_depth)
-}
-
+/// Allocation-free inverse integer transform.
+///
+/// Two key optimisations over a naive dense matrix multiply:
+///   * **Sparse skip** — residual blocks are typically zero except for a few
+///     low-frequency coefficients, so each zero input contributes nothing and
+///     is skipped before the inner accumulation runs at all.
+///   * **Cache-friendly access** — the basis row `t[k]` is read contiguously
+///     while accumulating into all `N` outputs, instead of striding down the
+///     `m`-th column of `t` (stride `N`) for every output.
 #[inline]
-fn inv_transform_n<const N: usize>(coeff: &[i64], t: &[[i32; N]; N], bit_depth: u8) -> Vec<i32> {
-    let bd = bit_depth as i64;
-    // Stage 1 (columns): tmp[m*N+c] = clip(sum_k T[k][m]*coeff[k*N+c]) >> 7
-    let shift1 = 7i64;
-    let add1 = 1i64 << (shift1 - 1);
-    let mut tmp = vec![0i64; N * N];
-    let mut colv = [0i64; N];
-    for c in 0..N {
-        for (k, cv) in colv.iter_mut().enumerate() {
-            *cv = coeff[k * N + c];
-        }
-        for m in 0..N {
-            // column m of T: T[k][m]
-            let s: i64 = t
-                .iter()
-                .zip(&colv)
-                .map(|(trow, &v)| trow[m] as i64 * v)
-                .sum();
-            tmp[m * N + c] = ((s + add1) >> shift1).clamp(-32768, 32767);
-        }
-    }
-    // Stage 2 (rows): out[r*N+m] = (sum_k T[k][m]*tmp[r*N+k]) >> (20-bd)
+fn inv_transform_n_into<const N: usize>(
+    coeff: &[i64],
+    t: &[[i32; N]; N],
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    let bd = bit_depth as i32;
+    let shift1 = 7i32;
+    let add1 = 1i32 << (shift1 - 1);
     let shift2 = 20 - bd;
-    let add2 = 1i64 << (shift2 - 1);
-    let mut out = vec![0i32; N * N];
-    for r in 0..N {
-        let rowv = &tmp[r * N..r * N + N];
+    let add2 = 1i32 << (shift2 - 1);
+
+    let mut tmp = [0i32; 32 * 32];
+    let mut acc = [0i32; N];
+
+    for c in 0..N {
+        acc[..N].fill(0);
+        for k in 0..N {
+            let ck = coeff[k * N + c] as i32;
+            if ck == 0 {
+                continue; // sparse skip — most residual coeffs are zero
+            }
+            let trow = &t[k];
+            for m in 0..N {
+                acc[m] += trow[m] * ck;
+            }
+        }
         for m in 0..N {
-            let s: i64 = t
-                .iter()
-                .zip(rowv)
-                .map(|(trow, &v)| trow[m] as i64 * v)
-                .sum();
-            out[r * N + m] = ((s + add2) >> shift2) as i32;
+            tmp[m * N + c] = ((acc[m] + add1) >> shift1).clamp(-32768, 32767);
         }
     }
-    out
+
+    for r in 0..N {
+        acc[..N].fill(0);
+        let rowv = &tmp[r * N..r * N + N];
+        for k in 0..N {
+            let rk = rowv[k];
+            if rk == 0 {
+                continue;
+            }
+            let trow = &t[k];
+            for m in 0..N {
+                acc[m] += trow[m] * rk;
+            }
+        }
+        for m in 0..N {
+            out[r * N + m] = (acc[m] + add2) >> shift2;
+        }
+    }
 }
 
 /// Dequantize into `out[..n*n]` — avoids a heap allocation per transform block.
@@ -316,14 +321,18 @@ pub(crate) fn dequantize_i32_into(
     }
 }
 
-/// Inverse DCT into `out[..n*n]` — avoids a heap allocation per TU.
+/// Inverse DCT into `out[..n*n]` — no heap allocation.
 pub(crate) fn inv_transform_into(coeff: &[i64], n: usize, bit_depth: u8, out: &mut [i32]) {
-    let v = inv_transform(coeff, n, bit_depth);
-    out[..n * n].copy_from_slice(&v);
+    match n {
+        4 => inv_transform_n_into::<4>(coeff, &T4, bit_depth, out),
+        8 => inv_transform_n_into::<8>(coeff, &T8, bit_depth, out),
+        16 => inv_transform_n_into::<16>(coeff, &T16, bit_depth, out),
+        32 => inv_transform_n_into::<32>(coeff, &T32, bit_depth, out),
+        _ => panic!("unsupported transform size {n}"),
+    }
 }
 
-/// Inverse DST into `out[..16]`.
+/// Inverse 4×4 DST into `out[..16]` — no heap allocation.
 pub(crate) fn inv_transform_dst_into(coeff: &[i64], bit_depth: u8, out: &mut [i32]) {
-    let v = inv_transform_dst(coeff, bit_depth);
-    out[..16].copy_from_slice(&v);
+    inv_transform_n_into::<4>(coeff, &DST4, bit_depth, out);
 }
