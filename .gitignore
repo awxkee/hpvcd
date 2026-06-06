@@ -6,3 +6,4 @@ app/target
 *.jpg
 *.png
 *.heic
+Cargo.lock
