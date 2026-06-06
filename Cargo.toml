@@ -1,5 +1,5 @@
 [workspace]
-members = ["app"]
+members = ["app", "fuzz"]
 
 [package]
 name = "hpvcd"
