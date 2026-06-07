@@ -254,14 +254,19 @@ fn decode_grid_yuv(
         .map(|t| t.hvcc.clone())
         .unwrap_or_default();
 
-    // Tile size from SPS
+    // Tile size and chroma format from the SPS (all tiles in a grid share one).
     let hvcc_ref = if !grid.tiles[0].hvcc.is_empty() {
         &grid.tiles[0].hvcc
     } else {
         &fallback_hvcc
     };
-    let (tile_w, tile_h) = config::parse_hvcc_full(hvcc_ref)
-        .ok()
+    let parsed = config::parse_hvcc_full(hvcc_ref).ok();
+    let mut chroma_fmt = parsed
+        .as_ref()
+        .map(|(sps, _)| sps.chroma)
+        .unwrap_or(ChromaFormat::Yuv420);
+    let (tile_w, tile_h) = parsed
+        .as_ref()
         .and_then(|(sps, _)| {
             let w = sps.width.saturating_sub(sps.crop_left + sps.crop_right) as usize;
             let h = sps.height.saturating_sub(sps.crop_top + sps.crop_bottom) as usize;
@@ -269,17 +274,23 @@ fn decode_grid_yuv(
         })
         .unwrap_or_else(|| (out_w.div_ceil(cols), out_h.div_ceil(rows)));
 
-    // Chroma dimensions (assume 4:2:0)
-    let cw = out_w.div_ceil(2);
-    let ch = out_h.div_ceil(2);
-    let tile_cw = tile_w.div_ceil(2);
-    let tile_ch = tile_h.div_ceil(2);
+    // Chroma dimensions follow the actual subsampling, not a fixed 4:2:0.
+    // Monochrome has no chroma planes (zero-sized), matching the per-tile decoder.
+    let sub_w = chroma_fmt.sub_w();
+    let sub_h = chroma_fmt.sub_h();
+    let has_chroma = !chroma_fmt.is_monochrome();
+    let (cw, ch) = if has_chroma {
+        (out_w.div_ceil(sub_w), out_h.div_ceil(sub_h))
+    } else {
+        (0, 0)
+    };
+    let tile_cw = tile_w.div_ceil(sub_w);
+    let tile_ch = tile_h.div_ceil(sub_h);
 
     let mut out_y = vec![0u16; out_w * out_h];
     let mut out_cb = vec![0u16; cw * ch];
     let mut out_cr = vec![0u16; cw * ch];
     let mut bit_depth = BitDepth::Eight;
-    let mut chroma_fmt = ChromaFormat::Yuv420;
 
     for (tile_idx, tile) in grid.tiles.iter().enumerate() {
         let col = tile_idx % cols;
@@ -307,9 +318,11 @@ fn decode_grid_yuv(
             Err(_) => continue,
         };
         bit_depth = planes.bit_depth;
+        // Keep the buffers consistent with the format they were sized for; all
+        // tiles in a grid share one SPS, so this normally already matches.
         chroma_fmt = planes.chroma;
-        let p_cw = planes.width.div_ceil(2);
-        let p_ch = planes.height.div_ceil(2);
+        let p_cw = planes.width.div_ceil(sub_w);
+        let p_ch = planes.height.div_ceil(sub_h);
 
         let dst_x = col * tile_w;
         let dst_y = row * tile_h;
@@ -331,6 +344,12 @@ fn decode_grid_yuv(
             if let Some(&last) = src.last() {
                 pad.fill(last);
             }
+        }
+
+        // Chroma: skip entirely for monochrome (no chroma planes), and copy at
+        // the format's true subsampling for 4:2:0 / 4:2:2 / 4:4:4.
+        if !has_chroma || planes.cb.is_empty() {
+            continue;
         }
 
         let c_dst_x = col * tile_cw;
@@ -382,7 +401,7 @@ fn decode_grid_yuv(
 fn decode_hevc_item(
     sample: &[u8],
     hvcc: &[u8],
-) -> Result<(yuv::YuvPlanes, color::ColorEncoding), DecodeError> {
+) -> Result<(yuv::YuvPlanes, ColorEncoding), DecodeError> {
     use bitreader::unescape_rbsp;
     use config::parse_hvcc_full;
     use decode_full::{FullDecoder, parse_slice_header_full};

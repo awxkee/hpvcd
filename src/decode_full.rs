@@ -1027,8 +1027,8 @@ impl<'a> FullDecoder<'a> {
             chroma_mode,
             intra_split,
             max_depth,
-            false,
-            false,
+            [false; 2],
+            [false; 2],
         );
 
         // mark decoded
@@ -1122,17 +1122,33 @@ impl<'a> FullDecoder<'a> {
 
     fn decode_chroma_mode(&mut self, luma_mode: u8) -> u8 {
         let bin0 = self.cab.decode_bin(&mut self.ictx.intra_chroma_pred_mode);
-        if bin0 == 0 {
-            return luma_mode; // DM
+        let derived = if bin0 == 0 {
+            luma_mode // DM
+        } else {
+            let mut idx = 0u8;
+            for _ in 0..2 {
+                idx = (idx << 1) | self.cab.decode_bypass();
+            }
+            let cand = [0u8, 26, 10, 1][idx as usize];
+            if cand == luma_mode { 34 } else { cand }
+        };
+        // HEVC §8.4.3 / Table 8-3: for ChromaArrayType==2 (4:2:2) the derived chroma
+        // intra mode is remapped (the asymmetric sampling rotates the angle). This
+        // mode drives both the angular prediction and the mode-dependent coefficient
+        // scan, so it must match the encoder exactly.
+        if self.sps.chroma_idc == 2 {
+            MODE_422_MAP[derived as usize]
+        } else {
+            derived
         }
-        let mut idx = 0u8;
-        for _ in 0..2 {
-            idx = (idx << 1) | self.cab.decode_bypass();
-        }
-        let cand = [0u8, 26, 10, 1][idx as usize];
-        if cand == luma_mode { 34 } else { cand }
     }
 }
+
+/// HEVC Table 8-3: derived-chroma-mode remap for 4:2:2 (ChromaArrayType==2).
+static MODE_422_MAP: [u8; 35] = [
+    0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25,
+    26, 27, 27, 28, 28, 29, 29, 30, 31,
+];
 
 /// MPM candidate list (§8.4.2).
 fn mpm_list(mut cand_a: u8, cand_b: u8, y0: usize, log2_ctb: u32) -> [u8; 3] {
@@ -1183,8 +1199,8 @@ impl<'a> FullDecoder<'a> {
         chroma_mode: u8,
         intra_split: bool,
         max_depth: u32,
-        parent_cbf_cb: bool,
-        parent_cbf_cr: bool,
+        parent_cbf_cb: [bool; 2],
+        parent_cbf_cr: [bool; 2],
     ) {
         let split_allowed = log2_ts <= self.log2_max_tb
             && log2_ts > self.log2_min_tb
@@ -1198,23 +1214,30 @@ impl<'a> FullDecoder<'a> {
             log2_ts > self.log2_max_tb || (intra_split && depth == 0)
         };
 
-        // chroma cbf
+        // chroma cbf. For ChromaArrayType==2 (4:2:2) there are two stacked chroma
+        // TBs, each with its own cbf_cb / cbf_cr, signaled cb[0],cb[1],cr[0],cr[1]
+        // (HEVC §7.3.8.8). 4:2:0 / 4:4:4 have one of each.
         let chroma_present = !self.sps.chroma.is_monochrome();
         let _ = depth;
+        let n_tb = if self.sps.chroma_idc == 2 { 2 } else { 1 };
         let mut cbf_cb = parent_cbf_cb;
         let mut cbf_cr = parent_cbf_cr;
         if chroma_present && (log2_ts > 2 || self.sps.chroma_idc == 3) {
-            if depth == 0 || parent_cbf_cb {
-                cbf_cb = self
-                    .cab
-                    .decode_bin(&mut self.ctx.cbf_chroma[depth.min(4) as usize])
-                    != 0;
+            for t in 0..n_tb {
+                if depth == 0 || parent_cbf_cb[t] {
+                    cbf_cb[t] = self
+                        .cab
+                        .decode_bin(&mut self.ctx.cbf_chroma[depth.min(4) as usize])
+                        != 0;
+                }
             }
-            if depth == 0 || parent_cbf_cr {
-                cbf_cr = self
-                    .cab
-                    .decode_bin(&mut self.ctx.cbf_chroma[depth.min(4) as usize])
-                    != 0;
+            for t in 0..n_tb {
+                if depth == 0 || parent_cbf_cr[t] {
+                    cbf_cr[t] = self
+                        .cab
+                        .decode_bin(&mut self.ctx.cbf_chroma[depth.min(4) as usize])
+                        != 0;
+                }
             }
         }
 
@@ -1316,12 +1339,12 @@ impl<'a> FullDecoder<'a> {
         luma_modes: &[u8; 4],
         chroma_mode: u8,
         cbf_luma: bool,
-        cbf_cb: bool,
-        cbf_cr: bool,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
     ) {
         let chroma_present = !self.sps.chroma.is_monochrome();
         let _ = depth;
-        let any_chroma = cbf_cb || cbf_cr;
+        let any_chroma = cbf_cb.iter().any(|&b| b) || cbf_cr.iter().any(|&b| b);
         let need_qp = cbf_luma || any_chroma;
 
         // cu_qp_delta
@@ -1431,8 +1454,12 @@ fn luma_scan(mode: u8, log2_ts: u32) -> u8 {
     }
 }
 
-fn chroma_scan(mode: u8, log2_ts: u32) -> u8 {
-    if log2_ts == 2 {
+fn chroma_scan(mode: u8, log2_ts: u32, is_444: bool) -> u8 {
+    // HEVC §6.5.3: scan is mode-dependent for 4×4, and for 8×8 when it's luma
+    // (handled by luma_scan) or ChromaArrayType==3 (4:4:4). 4:2:0/4:2:2 chroma at
+    // 8×8 stays diagonal. Mirrors the encoder's dct::scan_idx_for.
+    let mode_dependent = log2_ts == 2 || (log2_ts == 3 && is_444);
+    if mode_dependent {
         if (6..=14).contains(&mode) {
             SCAN_VERT
         } else if (22..=30).contains(&mode) {
@@ -1585,52 +1612,59 @@ impl<'a> FullDecoder<'a> {
         ly: usize,
         luma_log2: u32,
         mode: u8,
-        cbf_cb: bool,
-        cbf_cr: bool,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
     ) {
-        let clog2 = if self.sps.chroma_idc == 3 {
-            luma_log2
-        } else {
-            luma_log2 - 1
-        };
+        let idc = self.sps.chroma_idc;
+        let clog2 = if idc == 3 { luma_log2 } else { luma_log2 - 1 };
         let cn = 1usize << clog2;
         let cx0 = lx / self.sub_w;
         let cy0 = ly / self.sub_h;
-        let scan = chroma_scan(mode, clog2);
+        // 4:2:2 stacks two square chroma TBs vertically per luma TB (ChromaArrayType
+        // 2); 4:2:0 and 4:4:4 have a single chroma TB. The bitstream codes them
+        // component-major: all Cb TBs, then all Cr TBs (HEVC §7.3.8.11). Each TB is
+        // reconstructed before the next so a lower stacked TB can use the upper one
+        // as its intra above-reference.
+        let n_tb = if idc == 2 { 2 } else { 1 };
+        let scan = chroma_scan(mode, clog2, idc == 3);
 
-        // Cb
-        let qp_cb = qpc(self.cur_qp + self.pps.cb_qp_offset, self.sps.chroma_idc);
-        if cbf_cb {
-            let (levels, _) = residual_coding(
-                &mut self.cab,
-                &mut self.ctx,
-                clog2,
-                false,
-                scan,
-                self.sign_hiding,
-                None,
-                false,
-            );
-            self.reconstruct_chroma(true, cx0, cy0, cn, mode, &levels, qp_cb);
-        } else {
-            self.predict_only_chroma(true, cx0, cy0, cn, mode);
+        let qp_cb = qpc(self.cur_qp + self.pps.cb_qp_offset, idc);
+        for (t, &cb) in cbf_cb[0..n_tb].iter().enumerate() {
+            let ty = cy0 + t * cn;
+            if cb {
+                let (levels, _) = residual_coding(
+                    &mut self.cab,
+                    &mut self.ctx,
+                    clog2,
+                    false,
+                    scan,
+                    self.sign_hiding,
+                    None,
+                    false,
+                );
+                self.reconstruct_chroma(true, cx0, ty, cn, mode, &levels, qp_cb);
+            } else {
+                self.predict_only_chroma(true, cx0, ty, cn, mode);
+            }
         }
-        // Cr
-        let qp_cr = qpc(self.cur_qp + self.pps.cr_qp_offset, self.sps.chroma_idc);
-        if cbf_cr {
-            let (levels, _) = residual_coding(
-                &mut self.cab,
-                &mut self.ctx,
-                clog2,
-                false,
-                scan,
-                self.sign_hiding,
-                None,
-                false,
-            );
-            self.reconstruct_chroma(false, cx0, cy0, cn, mode, &levels, qp_cr);
-        } else {
-            self.predict_only_chroma(false, cx0, cy0, cn, mode);
+        let qp_cr = qpc(self.cur_qp + self.pps.cr_qp_offset, idc);
+        for (t, &cr) in cbf_cr[..n_tb].iter().enumerate() {
+            let ty = cy0 + t * cn;
+            if cr {
+                let (levels, _) = residual_coding(
+                    &mut self.cab,
+                    &mut self.ctx,
+                    clog2,
+                    false,
+                    scan,
+                    self.sign_hiding,
+                    None,
+                    false,
+                );
+                self.reconstruct_chroma(false, cx0, ty, cn, mode, &levels, qp_cr);
+            } else {
+                self.predict_only_chroma(false, cx0, ty, cn, mode);
+            }
         }
     }
 
@@ -1697,17 +1731,45 @@ impl<'a> FullDecoder<'a> {
             &mut sc.above,
             &mut sc.left,
         );
-        // Chroma is not filtered for 4:2:0/4:2:2: skip filter step, use above/left directly
-        intra_full::predict_into(
-            mode,
-            &sc.above[..2 * n + 1],
-            &sc.left[..2 * n + 1],
-            n,
-            false,
-            self.bd_c,
-            &mut sc.pred[..n * n],
-            &mut sc.refs_ang,
-        );
+        // Reference filtering: 4:2:0/4:2:2 chroma TBs are 4×4 and never filtered.
+        // 4:4:4 chroma (≥8×8) filters references with the same [1 2 1] rule as luma
+        // (HEVC: cIdx>0 filters only when ChromaArrayType==3), but without the luma
+        // strong-intra-smoothing path. The DC/H/V prediction edge filter stays off
+        // for chroma (is_luma=false in predict_into).
+        if self.sps.chroma_idc == 3 {
+            intra_full::filter_refs_into(
+                &sc.above[..2 * n + 1],
+                &sc.left[..2 * n + 1],
+                n,
+                mode,
+                true,  // apply the luma [1 2 1] filtering decision
+                false, // no strong intra smoothing for chroma
+                self.bd_c,
+                &mut sc.fa,
+                &mut sc.fl,
+            );
+            intra_full::predict_into(
+                mode,
+                &sc.fa[..2 * n + 1],
+                &sc.fl[..2 * n + 1],
+                n,
+                false,
+                self.bd_c,
+                &mut sc.pred[..n * n],
+                &mut sc.refs_ang,
+            );
+        } else {
+            intra_full::predict_into(
+                mode,
+                &sc.above[..2 * n + 1],
+                &sc.left[..2 * n + 1],
+                n,
+                false,
+                self.bd_c,
+                &mut sc.pred[..n * n],
+                &mut sc.refs_ang,
+            );
+        }
         self.scratch.raw_above = above;
         self.scratch.raw_left = left;
     }
