@@ -777,7 +777,13 @@ fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation
 fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation) -> Vec<T> {
     match o {
         Orientation::Normal => px,
-        Orientation::Rotate180 => px.chunks(3).rev().flat_map(|c| c.iter().copied()).collect(),
+        Orientation::Rotate180 => px
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .rev()
+            .flat_map(|c| c.iter().copied())
+            .collect(),
         Orientation::FlipH => {
             let mut out = vec![T::default(); px.len()];
             for r in 0..h {
