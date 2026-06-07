@@ -88,7 +88,7 @@ pub struct DecodedImage {
     pub exif: Option<Vec<u8>>,
 }
 
-/// Raw YCbCr planes from a HEIF/HEIC file; no colour conversion applied.
+/// Raw YCbCr planes from a HEIF/HEIC file; no color conversion applied.
 pub struct DecodedYuv {
     pub y: SampleBuf,
     pub cb: SampleBuf,
