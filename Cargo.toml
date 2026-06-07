@@ -1,9 +1,21 @@
 [workspace]
-members = ["app", "fuzz"]
+members = ["app"]
+exclude = ["fuzz"]
 
 [package]
 name = "hpvcd"
 version = "0.1.0"
 edition = "2024"
+description = "HEVC/HEIC tiny image decoder"
+readme = "README.md"
+keywords = ["heic", "heif", "hevc", "decoder", "image"]
+license = "BSD-3-Clause OR Apache-2.0"
+authors = ["Radzivon Bartoshyk"]
+documentation = "https://docs.rs/hpvcd"
+categories = ["multimedia::images", "compression", "encoding"]
+homepage = "https://github.com/awxkee/hpvcd"
+repository = "https://github.com/awxkee/hpvcd"
+exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
+rust-version = "1.93.0"
 
 [dependencies]
