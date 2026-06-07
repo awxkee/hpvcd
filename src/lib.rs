@@ -442,7 +442,7 @@ pub fn decode_heic(file: &[u8]) -> Result<DecodedImage, DecodeError> {
     let dw = heif.primary.display_w as usize;
     let dh = heif.primary.display_h as usize;
 
-    // Colour encoding for the YCbCr→RGB step.
+    // Color encoding for the YCbCr→RGB step.
     // The VUI matrix/range values describe how the YCbCr was encoded; prefer
     // those.  If VUI says "unspecified" (matrix==2), fall back to the HEIF
     // `colr` box, and if that is an ICC profile (no explicit CICP), default
