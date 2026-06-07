@@ -93,15 +93,44 @@ pub struct DecodedYuv {
     pub y: SampleBuf,
     pub cb: SampleBuf,
     pub cr: SampleBuf,
+    /// Optional alpha plane (luma-only), decoded from the `auxl` auxiliary item.
+    /// Same dimensions and bit depth as the luma plane.
+    pub alpha: Option<SampleBuf>,
     /// Luma plane width (display-cropped; equals coded width minus conformance window).
     pub width: u32,
     /// Luma plane height.
     pub height: u32,
     pub bit_depth: BitDepth,
-    pub chroma: fmt::ChromaFormat,
+    pub chroma: ChromaFormat,
     pub color: ColorMetadata,
     pub orientation: Orientation,
     pub exif: Option<Vec<u8>>,
+}
+
+/// Decode the optional alpha auxiliary item (`auxl`) into a luma-only plane,
+/// cropped/limited to `dw*dh`. Returns `None` when there is no alpha item or it
+/// fails to decode. Shared by the single-tile and grid YUV paths.
+fn decode_alpha_plane(
+    file: &[u8],
+    heif: &heif::HeifFile,
+    dw: usize,
+    dh: usize,
+) -> Option<SampleBuf> {
+    let a = heif.alpha.as_ref()?;
+    if a.hvcc.is_empty() {
+        return None;
+    }
+    let astart = a.data_offset as usize;
+    let aend = astart.checked_add(a.data_length as usize)?;
+    if aend > file.len() {
+        return None;
+    }
+    decode_hevc_item(&file[astart..aend], &a.hvcc)
+        .ok()
+        .map(|(ap, _)| {
+            let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
+            plane_to_buf(plane, ap.bit_depth)
+        })
 }
 
 /// Decode a HEIF/HEIC file and return raw YCbCr planes (no colour conversion).
@@ -192,6 +221,7 @@ pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
         y: plane_to_buf(y_out, bd),
         cb: plane_to_buf(cb_out, bd),
         cr: plane_to_buf(cr_out, bd),
+        alpha: decode_alpha_plane(file, &heif, dw, dh),
         width: dw as u32,
         height: dh as u32,
         bit_depth: bd,
@@ -338,6 +368,7 @@ fn decode_grid_yuv(
         y: plane_to_buf(out_y, bit_depth),
         cb: plane_to_buf(out_cb, bit_depth),
         cr: plane_to_buf(out_cr, bit_depth),
+        alpha: decode_alpha_plane(file, heif_file, out_w, out_h),
         width: out_w as u32,
         height: out_h as u32,
         bit_depth,

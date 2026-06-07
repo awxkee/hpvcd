@@ -206,17 +206,13 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
 
     // Parse iloc: collect (item_id → (absolute_file_offset, length))
     let mut extents: std::collections::HashMap<u16, (u64, u64)> = std::collections::HashMap::new();
-    if let Some(iloc) = iloc_data
-        && let Some((version, _, rest)) = fullbox_header(iloc)
-    {
+    if let Some((version, _, rest)) = iloc_data.and_then(fullbox_header) {
         parse_iloc(rest, version, idat_file_offset, &mut extents);
     }
 
     // Parse iinf: item types
     let mut item_types: std::collections::HashMap<u16, [u8; 4]> = std::collections::HashMap::new();
-    if let Some(iinf) = iinf_data
-        && let Some((_, _, rest)) = fullbox_header(iinf)
-    {
+    if let Some((_, _, rest)) = iinf_data.and_then(fullbox_header) {
         let count = read_u16(rest, 0).unwrap_or(0) as usize;
         let mut pos = 2usize;
         for _ in 0..count {
@@ -240,14 +236,13 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
         }
     }
 
-    // Parse iref: find auxl (alpha), cdsc (EXIF), and dimg (grid tiles) references
-    let mut alpha_item: Option<u16> = None;
+    // Parse iref: find auxl (auxiliary images — alpha/depth/gainmap/etc.), cdsc
+    // (EXIF), and dimg (grid tiles) references
+    let mut auxl_items: Vec<u16> = Vec::new();
     let mut exif_item: Option<u16> = None;
     // dimg: from=grid_item_id → to=[tile1, tile2, ...]
     let mut dimg_map: std::collections::HashMap<u16, Vec<u16>> = std::collections::HashMap::new();
-    if let Some(iref) = iref_data
-        && let Some((_, _, rest)) = fullbox_header(iref)
-    {
+    if let Some((_, _, rest)) = iref_data.and_then(fullbox_header) {
         let mut pos = 0;
         while pos + 8 <= rest.len() {
             let bsz = read_u32(rest, pos).unwrap_or(0) as usize;
@@ -257,7 +252,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
             let fourcc = &rest[pos + 4..pos + 8];
             let from_id = read_u16(rest, pos + 8).unwrap_or(0);
             if fourcc == b"auxl" {
-                alpha_item = Some(from_id);
+                auxl_items.push(from_id);
             }
             if fourcc == b"cdsc" {
                 exif_item = Some(from_id);
@@ -298,6 +293,13 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
         let p = build_item(pitm, &extents, &props, &prop_assoc, false, file)?;
         (p, None)
     };
+    // Among all auxiliary items, keep only the one whose `auxC` type is genuine
+    // alpha. iPhone HEICs attach many `auxl` items (HDR gain map, depth, portrait
+    // matte, …); treating one of those as an alpha plane would corrupt the output.
+    let alpha_item = auxl_items
+        .iter()
+        .copied()
+        .find(|&id| item_is_alpha(id, &props, &prop_assoc));
     let alpha = if let Some(aid) = alpha_item {
         build_item(aid, &extents, &props, &prop_assoc, true, file).ok()
     } else {
@@ -470,6 +472,42 @@ fn parse_iprp(iprp: &[u8]) -> (Vec<Prop>, std::collections::HashMap<u16, Vec<u8>
         }
     }
     (props, assoc)
+}
+
+fn item_is_alpha(
+    item_id: u16,
+    props: &[Prop],
+    prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
+) -> bool {
+    let Some(indices) = prop_assoc.get(&item_id) else {
+        return false;
+    };
+    for &pidx in indices {
+        let pidx = pidx as usize;
+        if pidx == 0 || pidx >= props.len() {
+            continue;
+        }
+        let p = &props[pidx];
+        if &p.kind != b"auxC" {
+            continue;
+        }
+        // auxC payload: 1-byte version + 3-byte flags, then NUL-terminated URN.
+        if p.data.len() <= 4 {
+            continue;
+        }
+        let urn_bytes = &p.data[4..];
+        let end = urn_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(urn_bytes.len());
+        let urn = &urn_bytes[..end];
+        if urn == b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+            || urn == b"urn:mpeg:hevc:2015:auxid:1"
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read orientation (irot/imir) for a given item from ipco/ipma — without
