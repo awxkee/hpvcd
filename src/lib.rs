@@ -414,10 +414,10 @@ fn decode_hevc_item(
     let rbsp = unescape_rbsp(&nal);
     let (slice_qp, sao_luma, sao_chroma, cabac_off) =
         parse_slice_header_full(&rbsp, &sps, &pps, nal_type)?;
-    let vui_color = color::ColorEncoding {
-        primaries: color::Primaries::from_u8(sps.colour_primaries),
-        transfer: color::TransferFunction::from_u8(sps.transfer_characteristics),
-        matrix: color::MatrixCoefficients::from_u8(sps.matrix_coefficients),
+    let vui_color = ColorEncoding {
+        primaries: Primaries::from_u8(sps.colour_primaries),
+        transfer: TransferFunction::from_u8(sps.transfer_characteristics),
+        matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
         full_range: sps.video_full_range,
     };
     let mut dec = FullDecoder::new(&rbsp[cabac_off..], sps, pps, slice_qp, sao_luma, sao_chroma)?;
@@ -448,13 +448,10 @@ pub fn decode_heic(file: &[u8]) -> Result<DecodedImage, DecodeError> {
     // `colr` box, and if that is an ICC profile (no explicit CICP), default
     // to sRGB (full-range BT.709).
     // Priority: VUI (from HEVC SPS) > CICP from colr box > sRGB fallback
-    let color_enc = if vui_color.matrix != color::MatrixCoefficients::Unspecified {
+    let color_enc = if vui_color.matrix != MatrixCoefficients::Unspecified {
         vui_color
     } else {
-        heif.primary
-            .color
-            .cicp
-            .unwrap_or_else(color::ColorEncoding::srgb)
+        heif.primary.color.cicp.unwrap_or_else(ColorEncoding::srgb)
     };
     let rgb = yuv::yuv_to_rgb_with_color(&yuv_planes, dw, dh, &color_enc);
 

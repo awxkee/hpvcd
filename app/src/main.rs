@@ -4,17 +4,18 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let bytes = fs::read("./assets/aak444.heic").unwrap();
-    for i in 0..10 {
-        let instant = Instant::now();
-        let decoded = hpvcd::decode_heic(&bytes).unwrap();
-        println!("Decoded: {:?}", instant.elapsed());
-    }
+    let bytes = fs::read("./assets/IMG_0088.HEIC").unwrap();
     let instant = Instant::now();
     let decoded = hpvcd::decode_heic(&bytes).unwrap();
     let decoded_yuv = hpvcd::decode_heic_yuv(&bytes).unwrap();
+    println!("Decoded WxH {:?}x{:?}", decoded.width, decoded.height);
+    println!(
+        "Decoded YUV WxH {:?}x{:?}",
+        decoded_yuv.width, decoded_yuv.height
+    );
     println!("Decoded: {:?}", instant.elapsed());
     println!("Decoded: {:?}", decoded_yuv.bit_depth);
+    println!("Decoded: {:?}", decoded_yuv.orientation);
     println!(
         "bit depth {}, orient {:?}",
         decoded.bit_depth as u8, decoded.orientation
