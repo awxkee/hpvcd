@@ -329,14 +329,11 @@ fn decode_grid_yuv(
         let copy_w = tile_w.min(out_w.saturating_sub(dst_x));
         let copy_h = tile_h.min(out_h.saturating_sub(dst_y));
 
-        for (y, dst_row) in out_y[dst_y * out_w + dst_x..]
-            .chunks_exact_mut(out_w)
-            .take(copy_h)
-            .enumerate()
-        {
+        for y in 0..copy_h {
+            let dst_start = (dst_y + y) * out_w + dst_x;
+            let dst = &mut out_y[dst_start..dst_start + copy_w];
             let src_y = y.min(planes.height - 1);
             let src_row = &planes.y[src_y * planes.width..][..planes.width];
-            let dst = &mut dst_row[..copy_w];
             let src = &src_row[..copy_w.min(planes.width)];
 
             let (exact, pad) = dst.split_at_mut(src.len());
@@ -357,26 +354,25 @@ fn decode_grid_yuv(
         let c_copy_w = tile_cw.min(cw.saturating_sub(c_dst_x));
         let c_copy_h = tile_ch.min(ch.saturating_sub(c_dst_y));
 
-        for (y, (cb_row, cr_row)) in out_cb[c_dst_y * cw + c_dst_x..]
-            .chunks_exact_mut(cw)
-            .zip(out_cr[c_dst_y * cw + c_dst_x..].chunks_exact_mut(cw))
-            .take(c_copy_h)
-            .enumerate()
-        {
+        for y in 0..c_copy_h {
+            let cb_start = (c_dst_y + y) * cw + c_dst_x;
+            let cb_row = &mut out_cb[cb_start..cb_start + c_copy_w];
+            let cr_start = (c_dst_y + y) * cw + c_dst_x;
+            // out_cb and out_cr share the same geometry; index out_cr separately.
             let src_y = y.min(p_ch - 1);
             let src_cb_row = &planes.cb[src_y * p_cw..][..p_cw];
             let src_cr_row = &planes.cr[src_y * p_cw..][..p_cw];
 
             let copy = c_copy_w.min(p_cw);
-            let (cb_exact, cb_pad) = cb_row[..c_copy_w].split_at_mut(copy);
-            let (cr_exact, cr_pad) = cr_row[..c_copy_w].split_at_mut(copy);
-
+            let (cb_exact, cb_pad) = cb_row.split_at_mut(copy);
             cb_exact.copy_from_slice(&src_cb_row[..copy]);
-            cr_exact.copy_from_slice(&src_cr_row[..copy]);
-
             if let Some(&last_cb) = src_cb_row.last() {
                 cb_pad.fill(last_cb);
             }
+
+            let cr_row = &mut out_cr[cr_start..cr_start + c_copy_w];
+            let (cr_exact, cr_pad) = cr_row.split_at_mut(copy);
+            cr_exact.copy_from_slice(&src_cr_row[..copy]);
             if let Some(&last_cr) = src_cr_row.last() {
                 cr_pad.fill(last_cr);
             }
@@ -624,10 +620,23 @@ fn decode_grid(
             .unwrap_or(fmt::BitDepth::Eight)
     };
 
-    let mut out_buf = if bit_depth == fmt::BitDepth::Eight {
-        ImageBuffer::Rgb8(vec![0u8; out_w * out_h * 3])
-    } else {
-        ImageBuffer::Rgb16(vec![0u16; out_w * out_h * 3])
+    let is_mono = {
+        let hvcc_ref = if !grid.tiles[0].hvcc.is_empty() {
+            &grid.tiles[0].hvcc
+        } else {
+            &fallback_hvcc
+        };
+        config::parse_hvcc_full(hvcc_ref)
+            .ok()
+            .map(|(sps, _)| sps.chroma.is_monochrome())
+            .unwrap_or(false)
+    };
+
+    let mut out_buf = match (bit_depth == BitDepth::Eight, is_mono) {
+        (true, false) => ImageBuffer::Rgb8(vec![0u8; out_w * out_h * 3]),
+        (false, false) => ImageBuffer::Rgb16(vec![0u16; out_w * out_h * 3]),
+        (true, true) => ImageBuffer::Luma8(vec![0u8; out_w * out_h]),
+        (false, true) => ImageBuffer::Luma16(vec![0u16; out_w * out_h]),
     };
 
     for (tile_idx, tile) in grid.tiles.iter().enumerate() {
@@ -683,6 +692,20 @@ fn decode_grid(
                     let s = y * tile_w * 3;
                     let d = ((dst_y + y) * out_w + dst_x) * 3;
                     dst[d..d + copy_w * 3].copy_from_slice(&src[s..s + copy_w * 3]);
+                }
+            }
+            (ImageBuffer::Luma8(src), ImageBuffer::Luma8(dst)) => {
+                for y in 0..copy_h {
+                    let s = y * tile_w;
+                    let d = (dst_y + y) * out_w + dst_x;
+                    dst[d..d + copy_w].copy_from_slice(&src[s..s + copy_w]);
+                }
+            }
+            (ImageBuffer::Luma16(src), ImageBuffer::Luma16(dst)) => {
+                for y in 0..copy_h {
+                    let s = y * tile_w;
+                    let d = (dst_y + y) * out_w + dst_x;
+                    dst[d..d + copy_w].copy_from_slice(&src[s..s + copy_w]);
                 }
             }
             _ => {} // depth mismatch — skip (shouldn't happen within one grid)
