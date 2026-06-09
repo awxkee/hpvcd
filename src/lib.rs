@@ -44,7 +44,7 @@ mod yuv;
 pub use color::{ColorEncoding, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::DecodeError;
 pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
-pub use metadata::{ContentLightLevel, Metadata, Orientation};
+pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
 
 const MAX_IMG_DIM: usize = 16_384;
 const MAX_IMG_PIXELS: usize = 64 * 1024 * 1024;
@@ -85,6 +85,10 @@ pub struct DecodedImage {
     pub color: ColorMetadata,
     pub orientation: Orientation,
     pub content_light_level: Option<ContentLightLevel>,
+    /// Clean aperture (`clap` property) read from the item properties, if present.
+    pub clean_aperture: Option<CleanAperture>,
+    /// Pixel aspect ratio (`pasp` property). `None` means assume 1:1 (square pixels).
+    pub pixel_aspect_ratio: Option<PixelAspectRatio>,
     pub exif: Option<Vec<u8>>,
 }
 
@@ -104,6 +108,10 @@ pub struct DecodedYuv {
     pub chroma: ChromaFormat,
     pub color: ColorMetadata,
     pub orientation: Orientation,
+    /// Clean aperture (`clap` property) read from the item properties, if present.
+    pub clean_aperture: Option<CleanAperture>,
+    /// Pixel aspect ratio (`pasp` property). `None` means assume 1:1 (square pixels).
+    pub pixel_aspect_ratio: Option<PixelAspectRatio>,
     pub exif: Option<Vec<u8>>,
 }
 
@@ -228,6 +236,8 @@ pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
         chroma: planes.chroma,
         color: heif.primary.color,
         orientation: heif.primary.orientation,
+        clean_aperture: heif.primary.clap,
+        pixel_aspect_ratio: heif.primary.pasp,
         exif: heif.exif,
     })
 }
@@ -390,6 +400,8 @@ fn decode_grid_yuv(
         chroma: chroma_fmt,
         color: heif_file.primary.color.clone(),
         orientation: grid.orientation,
+        clean_aperture: heif_file.primary.clap,
+        pixel_aspect_ratio: heif_file.primary.pasp,
         exif: heif_file.exif.clone(),
     })
 }
@@ -503,6 +515,8 @@ pub fn decode_heic(file: &[u8]) -> Result<DecodedImage, DecodeError> {
         color: heif.primary.color,
         orientation: heif.primary.orientation,
         content_light_level: heif.primary.cll,
+        clean_aperture: heif.primary.clap,
+        pixel_aspect_ratio: heif.primary.pasp,
         exif: heif.exif,
     })
 }
@@ -726,6 +740,8 @@ fn decode_grid(
         // (pixels have already been rotated by apply_orientation above)
         orientation: grid.orientation,
         content_light_level: heif_file.primary.cll,
+        clean_aperture: heif_file.primary.clap,
+        pixel_aspect_ratio: heif_file.primary.pasp,
         exif: heif_file.exif.clone(),
     })
 }

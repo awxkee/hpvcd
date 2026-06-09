@@ -29,7 +29,7 @@
 
 use crate::color::{ColorEncoding, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 use crate::error::DecodeError;
-use crate::metadata::{ContentLightLevel, Orientation};
+use crate::metadata::{CleanAperture, ContentLightLevel, Orientation, PixelAspectRatio};
 
 /// Parsed image item — enough to decode one HEIF image item.
 #[derive(Debug, Clone)]
@@ -48,6 +48,10 @@ pub(crate) struct HeifItem {
     pub(crate) color: ColorMetadata,
     pub(crate) orientation: Orientation,
     pub(crate) cll: Option<ContentLightLevel>,
+    /// Clean aperture (`clap` property), if present.
+    pub(crate) clap: Option<CleanAperture>,
+    /// Pixel aspect ratio (`pasp` property), if present.
+    pub(crate) pasp: Option<PixelAspectRatio>,
     /// true = this item is the alpha auxiliary image.
     pub(crate) _is_alpha: bool,
 }
@@ -641,6 +645,8 @@ fn build_fallback_item(item_id: u16) -> HeifItem {
         color: ColorMetadata::default(),
         orientation: crate::metadata::Orientation::Normal,
         cll: None,
+        clap: None,
+        pasp: None,
         _is_alpha: false,
     }
 }
@@ -664,6 +670,8 @@ fn build_item(
     let mut color = ColorMetadata::default(); // starts empty; filled from colr box(es)
     let mut orientation = Orientation::Normal;
     let mut cll = None;
+    let mut clap: Option<CleanAperture> = None;
+    let mut pasp: Option<PixelAspectRatio> = None;
 
     if let Some(indices) = prop_assoc.get(&item_id) {
         for &pidx in indices {
@@ -698,6 +706,49 @@ fn build_item(
                     let maxfall = read_u16(&p.data, 2).unwrap_or(0);
                     cll = Some(ContentLightLevel::new(maxcll, maxfall));
                 }
+                b"clap" if p.data.len() >= 32 => {
+                    // CleanApertureBox (ISO 14496-12 §12.1.4.2):
+                    //   u32 cleanApertureWidthN
+                    //   u32 cleanApertureWidthD
+                    //   u32 cleanApertureHeightN
+                    //   u32 cleanApertureHeightD
+                    //   i32 horizOffN   (signed)
+                    //   u32 horizOffD
+                    //   i32 vertOffN    (signed)
+                    //   u32 vertOffD
+                    let width_n = read_u32(&p.data, 0).unwrap_or(0);
+                    let width_d = read_u32(&p.data, 4).unwrap_or(1);
+                    let height_n = read_u32(&p.data, 8).unwrap_or(0);
+                    let height_d = read_u32(&p.data, 12).unwrap_or(1);
+                    let horiz_off_n =
+                        i32::from_be_bytes(p.data[16..20].try_into().unwrap_or([0; 4]));
+                    let horiz_off_d = read_u32(&p.data, 20).unwrap_or(1);
+                    let vert_off_n =
+                        i32::from_be_bytes(p.data[24..28].try_into().unwrap_or([0; 4]));
+                    let vert_off_d = read_u32(&p.data, 28).unwrap_or(1);
+                    clap = Some(CleanAperture {
+                        width_n,
+                        width_d,
+                        height_n,
+                        height_d,
+                        horiz_off_n,
+                        horiz_off_d,
+                        vert_off_n,
+                        vert_off_d,
+                    });
+                }
+                b"pasp" if p.data.len() >= 8 => {
+                    // PixelAspectRatioBox (ISO 14496-12 §12.1.4.4):
+                    //   u32 hSpacing
+                    //   u32 vSpacing
+                    let h = read_u32(&p.data, 0).unwrap_or(1);
+                    let v = read_u32(&p.data, 4).unwrap_or(1);
+                    // Clamp zero to 1 so callers never divide by zero.
+                    pasp = Some(PixelAspectRatio {
+                        h_spacing: h.max(1),
+                        v_spacing: v.max(1),
+                    });
+                }
                 _ => {}
             }
         }
@@ -717,6 +768,8 @@ fn build_item(
         color,
         orientation,
         cll,
+        clap,
+        pasp,
         _is_alpha: is_alpha,
     })
 }

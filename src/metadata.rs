@@ -99,6 +99,58 @@ impl Orientation {
     }
 }
 
+/// Clean aperture (spatial crop) from the ISOBMFF `clap` property
+/// (ISO 14496-12 §12.1.4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanAperture {
+    /// Numerator of the clean aperture width (pixels).
+    pub width_n: u32,
+    /// Denominator of the clean aperture width.
+    pub width_d: u32,
+    /// Numerator of the clean aperture height (pixels).
+    pub height_n: u32,
+    /// Denominator of the clean aperture height.
+    pub height_d: u32,
+    /// Numerator of the horizontal center offset (signed, pixels).
+    pub horiz_off_n: i32,
+    /// Denominator of the horizontal center offset.
+    pub horiz_off_d: u32,
+    /// Numerator of the vertical center offset (signed, pixels).
+    pub vert_off_n: i32,
+    /// Denominator of the vertical center offset.
+    pub vert_off_d: u32,
+}
+
+impl CleanAperture {
+    /// Pixel width of the clean aperture, rounded down.
+    /// Returns `None` when the denominator is zero.
+    pub fn width_pixels(&self) -> Option<u32> {
+        self.width_n.checked_div(self.width_d)
+    }
+
+    /// Pixel height of the clean aperture, rounded down.
+    /// Returns `None` when the denominator is zero.
+    pub fn height_pixels(&self) -> Option<u32> {
+        self.height_n.checked_div(self.height_d)
+    }
+}
+
+/// Pixel aspect ratio from the ISOBMFF `pasp` property (ISO 14496-12 §12.1.4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelAspectRatio {
+    /// Horizontal spacing — numerator of pixel width relative to pixel height.
+    pub h_spacing: u32,
+    /// Vertical spacing — denominator.
+    pub v_spacing: u32,
+}
+
+impl PixelAspectRatio {
+    /// Returns `true` when pixels are square (no display rescaling required).
+    pub fn is_square(self) -> bool {
+        self.h_spacing == self.v_spacing
+    }
+}
+
 /// HDR content light level (CTA-861.3 / ISOBMFF `clli`): the maximum content light
 /// level (MaxCLL) and maximum frame-average light level (MaxFALL), both in cd/m²
 /// (nits). Written as the `ContentLightLevelBox`.
