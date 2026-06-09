@@ -345,15 +345,6 @@ fn inv_butterfly_32_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     }
 }
 
-/// Allocation-free inverse integer transform.
-///
-/// Two key optimizations over a naive dense matrix multiply:
-///   * **Sparse skip** — residual blocks are typically zero except for a few
-///     low-frequency coefficients, so each zero input contributes nothing and
-///     is skipped before the inner accumulation runs at all.
-///   * **Cache-friendly access** — the basis row `t[k]` is read contiguously
-///     while accumulating into all `N` outputs, instead of striding down the
-///     `m`-th column of `t` (stride `N`) for every output.
 #[inline]
 fn inv_transform_n_into<const N: usize>(
     coeff: &[i32],
