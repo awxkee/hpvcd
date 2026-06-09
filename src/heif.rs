@@ -520,7 +520,7 @@ fn read_item_orientation(
     item_id: u16,
     props: &[Prop],
     prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
-) -> crate::metadata::Orientation {
+) -> Orientation {
     use crate::metadata::Orientation;
     let mut orientation = Orientation::Normal;
     if let Some(indices) = prop_assoc.get(&item_id) {

@@ -232,10 +232,11 @@ pub(crate) fn predict_into(
             let tr = above[n + 1] as i32;
             let bl = left[n + 1] as i32;
             for y in 0..n {
-                for x in 0..n {
+                let out = &mut out[y * n..y * n + n];
+                for (x, dst) in out.iter_mut().enumerate() {
                     let h = (n - 1 - x) as i32 * left[y + 1] as i32 + (x + 1) as i32 * tr;
                     let v = (n - 1 - y) as i32 * above[x + 1] as i32 + (y + 1) as i32 * bl;
-                    out[y * n + x] = ((h + v + n as i32) >> (n.trailing_zeros() as i32 + 1)) as u16;
+                    *dst = ((h + v + n as i32) >> (n.trailing_zeros() as i32 + 1)) as u16;
                 }
             }
         }
@@ -252,11 +253,11 @@ pub(crate) fn predict_into(
             // Edge filter: luma only, and only for blocks smaller than 32×32
             if is_luma && n < 32 {
                 out[0] = ((left[1] as i32 + 2 * dc + above[1] as i32 + 2) >> 2) as u16;
-                for x in 1..n {
-                    out[x] = ((above[x + 1] as i32 + 3 * dc + 2) >> 2) as u16;
+                for (dst, &above) in out[1..n].iter_mut().zip(above[2..n + 1].iter()) {
+                    *dst = ((above as i32 + 3 * dc + 2) >> 2) as u16;
                 }
-                for y in 1..n {
-                    out[y * n] = ((left[y + 1] as i32 + 3 * dc + 2) >> 2) as u16;
+                for (y, &left) in (1..n).zip(left[2..n + 1].iter()) {
+                    out[y * n] = ((left as i32 + 3 * dc + 2) >> 2) as u16;
                 }
             }
         }
@@ -267,8 +268,8 @@ pub(crate) fn predict_into(
             let side = if vertical { left } else { above };
             let base = n as i32;
             let refs = &mut refs_ang[..3 * n + 1];
-            for k in 0..=2 * n as i32 {
-                refs[(k + base) as usize] = main[k as usize] as i32;
+            for (dst, &main) in refs[n..=3 * n].iter_mut().zip(main[..=2 * n].iter()) {
+                *dst = main as i32;
             }
             if angle < 0 {
                 let inv = INV_ANGLE[mode as usize - 11];
@@ -303,14 +304,14 @@ pub(crate) fn predict_into(
             if is_luma && n < 32 {
                 let max = ((1i32 << bit_depth) - 1).max(0);
                 if mode == 26 {
-                    for y in 0..n {
-                        let v = above[1] as i32 + ((left[y + 1] as i32 - above[0] as i32) >> 1);
+                    for (y, &left) in left[1..n + 1].iter().enumerate() {
+                        let v = above[1] as i32 + ((left as i32 - above[0] as i32) >> 1);
                         out[y * n] = v.clamp(0, max) as u16;
                     }
                 } else if mode == 10 {
-                    for x in 0..n {
-                        let v = left[1] as i32 + ((above[x + 1] as i32 - above[0] as i32) >> 1);
-                        out[x] = v.clamp(0, max) as u16;
+                    for (dst, &above_p1) in out.iter_mut().zip(above[1..n + 1].iter()) {
+                        let v = left[1] as i32 + ((above_p1 as i32 - above[0] as i32) >> 1);
+                        *dst = v.clamp(0, max) as u16;
                     }
                 }
             }
