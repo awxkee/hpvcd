@@ -101,6 +101,10 @@ pub(crate) fn yuv_to_rgb_with_color(
         };
     }
 
+    if color.matrix == MatrixCoefficients::YCgCo {
+        return ycgco_to_rgb(yuv, dw, dh);
+    }
+
     let max_val = yuv.bit_depth.max_val() as i64;
     let scale = 1i64 << (yuv.bit_depth.minus8());
 
@@ -108,7 +112,6 @@ pub(crate) fn yuv_to_rgb_with_color(
     let sub_h = yuv.chroma.sub_h();
     let cw = yuv.width.div_ceil(sub_w);
 
-    // ── Range handling (Q0.13) ──────────────────────────────────────────────
     let y_black = if color.full_range { 0 } else { 16 * scale };
     let neutral = 128 * scale;
     let k_y: i64 = if color.full_range {
@@ -228,5 +231,46 @@ pub(crate) fn yuv_to_rgb_with_color(
             }
         }
         ImageBuffer::Rgb16(rgb)
+    }
+}
+
+pub(crate) fn ycgco_to_rgb(yuv: &YuvPlanes, dw: usize, dh: usize) -> ImageBuffer {
+    let scale = 1i64 << yuv.bit_depth.minus8();
+    let neutral = 128 * scale; // 1 << (bit_depth - 1)
+    let max_val = yuv.bit_depth.max_val() as i64;
+    let sub_w = yuv.chroma.sub_w();
+    let sub_h = yuv.chroma.sub_h();
+    let cw = yuv.width.div_ceil(sub_w);
+    let ch = yuv.height.div_ceil(sub_h);
+
+    macro_rules! run {
+        ($T: ty, $cmax: expr, $variant: path) => {{
+            let mut rgb = vec![0 as $T; dw * dh * 3];
+            for y_pix in 0..dh {
+                let y_row = y_pix.min(yuv.height - 1);
+                let c_row = (y_pix / sub_h).min(ch - 1);
+                let l_base = y_row * yuv.width;
+                let c_base = c_row * cw;
+                let row_out = &mut rgb[y_pix * dw * 3..];
+                for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                    let x_col = x_pix.min(yuv.width - 1);
+                    let c_col = (x_pix / sub_w).min(cw - 1);
+                    let y = yuv.y[l_base + x_col] as i64;
+                    let cg = yuv.cb[c_base + c_col] as i64 - neutral;
+                    let co = yuv.cr[c_base + c_col] as i64 - neutral;
+                    let t = y - cg;
+                    dst[0] = (t + co).clamp(0, $cmax) as $T; // R
+                    dst[1] = (y + cg).clamp(0, $cmax) as $T; // G
+                    dst[2] = (t - co).clamp(0, $cmax) as $T; // B
+                }
+            }
+            $variant(rgb)
+        }};
+    }
+
+    if yuv.bit_depth == BitDepth::Eight {
+        run!(u8, 255, ImageBuffer::Rgb8)
+    } else {
+        run!(u16, max_val, ImageBuffer::Rgb16)
     }
 }

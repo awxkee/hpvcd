@@ -4,7 +4,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let bytes = fs::read("./assets/lossless.heic").unwrap();
+    let bytes = fs::read("./assets/results.heic").unwrap();
     let instant = Instant::now();
     let decoded = hpvcd::decode_heic(&bytes).unwrap();
     let decoded_yuv = hpvcd::decode_heic_yuv(&bytes).unwrap();
