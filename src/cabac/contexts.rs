@@ -96,6 +96,8 @@ pub(crate) struct ContextSet {
     pub(crate) transform_skip_flag: [CtxModel; 2],
     // cu_qp_delta_abs (2 ctx), initType0 = {154, 154}
     pub(crate) cu_qp_delta_abs: [CtxModel; 2],
+    // cu_transquant_bypass_flag (1 ctx), initValue 154 (all init types).
+    pub(crate) cu_transquant_bypass_flag: CtxModel,
 }
 
 impl ContextSet {
@@ -171,6 +173,7 @@ impl ContextSet {
 
             transform_skip_flag: arr([139, 139], qp),
             cu_qp_delta_abs: arr([154, 154], qp),
+            cu_transquant_bypass_flag: c(154, qp),
         }
     }
 }

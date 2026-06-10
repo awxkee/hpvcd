@@ -77,6 +77,8 @@ pub(crate) struct FullDecoder<'a> {
     // Per-4×4-luma intra mode and "decoded" availability.
     mode_y: Vec<u8>,
     decoded: Vec<bool>, // per 4×4 luma block
+    tqb: Vec<bool>,     // per 4×4 luma block: cu_transquant_bypass_flag (lossless)
+    cu_tqb: bool,       // current CU's cu_transquant_bypass_flag
     grid_w: usize,      // w/4
     #[allow(dead_code)]
     grid_h: usize, // h/4
@@ -186,6 +188,8 @@ impl<'a> FullDecoder<'a> {
             sub_h,
             mode_y: vec![MODE_DC; grid_w * grid_h],
             decoded: vec![false; grid_w * grid_h],
+            tqb: vec![false; grid_w * grid_h],
+            cu_tqb: false,
             ct_depth: vec![0; grid_w * grid_h],
             grid_w,
             grid_h,
@@ -439,6 +443,12 @@ impl<'a> FullDecoder<'a> {
                         let mid = scan + 1; // representative row
                         let qp_p = qp_at(&self.qp_y_map, edge - 1, mid);
                         let qp_q = qp_at(&self.qp_y_map, edge, mid);
+                        // Lossless (transquant-bypass) CUs are exempt from deblocking
+                        // (HEVC §8.7.2): if either side is bypass, skip this segment.
+                        if self.tqb_at(edge - 1, mid) || self.tqb_at(edge, mid) {
+                            scan += 4;
+                            continue;
+                        }
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
                         let beta_prime = (avg_qp + qp_bd_offset_y + beta_offset).clamp(0, 51);
                         let tc_prime = (avg_qp + qp_bd_offset_y + 2 + tc_offset).clamp(0, 53);
@@ -533,6 +543,10 @@ impl<'a> FullDecoder<'a> {
                         let mid = scan + 1;
                         let qp_p = qp_at(&self.qp_y_map, mid, edge - 1);
                         let qp_q = qp_at(&self.qp_y_map, mid, edge);
+                        if self.tqb_at(mid, edge - 1) || self.tqb_at(mid, edge) {
+                            scan += 4;
+                            continue;
+                        }
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
                         let beta_prime = (avg_qp + qp_bd_offset_y + beta_offset).clamp(0, 51);
                         let tc_prime = (avg_qp + qp_bd_offset_y + 2 + tc_offset).clamp(0, 53);
@@ -651,6 +665,26 @@ impl<'a> FullDecoder<'a> {
                     let tc_prime_c = (avg_qp_l + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
                     let tc_c = TC[tc_prime_c as usize];
                     if tc_c == 0 {
+                        scan += 4;
+                        continue;
+                    }
+                    // Lossless CUs are exempt from chroma deblocking too.
+                    let (px_p, py_p, px_q, py_q) = if pass == 0 {
+                        (
+                            (edge - 1) * self.sub_w,
+                            mid * self.sub_h,
+                            edge * self.sub_w,
+                            mid * self.sub_h,
+                        )
+                    } else {
+                        (
+                            mid * self.sub_w,
+                            (edge - 1) * self.sub_h,
+                            mid * self.sub_w,
+                            edge * self.sub_h,
+                        )
+                    };
+                    if self.tqb_at(px_p, py_p) || self.tqb_at(px_q, py_q) {
                         scan += 4;
                         continue;
                     }
@@ -946,8 +980,17 @@ impl<'a> FullDecoder<'a> {
             self.cur_qp = self.predict_qp(xqg, yqg);
         }
 
-        if self.pps.transquant_bypass_enabled {
-            // cu_transquant_bypass_flag — libheif disables; not expected.
+        // cu_transquant_bypass_flag (HEVC §7.3.8.5): first CU element, present only
+        // when the PPS enables transquant bypass. When set, transform + quantization
+        // are skipped and the parsed residual is used verbatim (lossless coding).
+        self.cu_tqb = if self.pps.transquant_bypass_enabled {
+            self.cab.decode_bin(&mut self.ctx.cu_transquant_bypass_flag) != 0
+        } else {
+            false
+        };
+        if self.cu_tqb {
+            let cb = 1usize << log2_cb;
+            self.set_tqb(x0, y0, cb);
         }
 
         let cb_size = 1usize << log2_cb;
@@ -1091,6 +1134,24 @@ impl<'a> FullDecoder<'a> {
                 }
             }
         }
+    }
+
+    fn set_tqb(&mut self, x0: usize, y0: usize, size: usize) {
+        for yy in (y0..y0 + size).step_by(4) {
+            for xx in (x0..x0 + size).step_by(4) {
+                if xx < self.w && yy < self.h {
+                    self.tqb[(yy / 4) * self.grid_w + xx / 4] = true;
+                }
+            }
+        }
+    }
+
+    /// cu_transquant_bypass_flag at a luma pixel (4×4 grid). Out-of-range → false.
+    fn tqb_at(&self, px: usize, py: usize) -> bool {
+        if px >= self.w || py >= self.h {
+            return false;
+        }
+        self.tqb[(py / 4) * self.grid_w + px / 4]
     }
 
     fn derive_luma_mode(&self, x0: usize, y0: usize, prev: bool, val: u8) -> u8 {
@@ -1376,7 +1437,7 @@ impl<'a> FullDecoder<'a> {
                 scan,
                 self.sign_hiding,
                 ts_ctx,
-                false,
+                self.cu_tqb,
             );
             self.reconstruct_luma(x0, y0, log2_ts, luma_mode, &levels);
         } else {
@@ -1525,21 +1586,27 @@ impl<'a> FullDecoder<'a> {
     fn reconstruct_luma(&mut self, x0: usize, y0: usize, log2_ts: u32, mode: u8, levels: &[i32]) {
         let n = 1usize << log2_ts;
         self.predict_luma_block_into(x0, y0, n, mode);
-        let qp = self.cur_qp.clamp(0, 51) as u8;
-        transform::dequantize_i32_into(levels, n, qp, self.bd, &mut self.deq_scratch[..n * n]);
-        if n == 4 {
-            transform::inv_transform_dst_into(
-                &self.deq_scratch[..n * n],
-                self.bd,
-                &mut self.res_scratch[..n * n],
-            );
+        if self.cu_tqb {
+            // Lossless: residual is the parsed level array verbatim (row-major),
+            // no scaling or inverse transform (HEVC §8.6.5).
+            self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
         } else {
-            transform::inv_transform_into(
-                &self.deq_scratch[..n * n],
-                n,
-                self.bd,
-                &mut self.res_scratch[..n * n],
-            );
+            let qp = self.cur_qp.clamp(0, 51) as u8;
+            transform::dequantize_i32_into(levels, n, qp, self.bd, &mut self.deq_scratch[..n * n]);
+            if n == 4 {
+                transform::inv_transform_dst_into(
+                    &self.deq_scratch[..n * n],
+                    self.bd,
+                    &mut self.res_scratch[..n * n],
+                );
+            } else {
+                transform::inv_transform_into(
+                    &self.deq_scratch[..n * n],
+                    n,
+                    self.bd,
+                    &mut self.res_scratch[..n * n],
+                );
+            }
         }
         let max = (1i32 << self.bd) - 1;
         for yy in 0..n {
@@ -1640,7 +1707,7 @@ impl<'a> FullDecoder<'a> {
                     scan,
                     self.sign_hiding,
                     None,
-                    false,
+                    self.cu_tqb,
                 );
                 self.reconstruct_chroma(true, cx0, ty, cn, mode, &levels, qp_cb);
             } else {
@@ -1659,7 +1726,7 @@ impl<'a> FullDecoder<'a> {
                     scan,
                     self.sign_hiding,
                     None,
-                    false,
+                    self.cu_tqb,
                 );
                 self.reconstruct_chroma(false, cx0, ty, cn, mode, &levels, qp_cr);
             } else {
@@ -1786,14 +1853,25 @@ impl<'a> FullDecoder<'a> {
         qp: i32,
     ) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
-        let qp_c = qp.clamp(0, 51) as u8;
-        transform::dequantize_i32_into(levels, n, qp_c, self.bd_c, &mut self.deq_scratch[..n * n]);
-        transform::inv_transform_into(
-            &self.deq_scratch[..n * n],
-            n,
-            self.bd_c,
-            &mut self.res_scratch[..n * n],
-        );
+        if self.cu_tqb {
+            // Lossless: chroma residual is the parsed levels verbatim.
+            self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
+        } else {
+            let qp_c = qp.clamp(0, 51) as u8;
+            transform::dequantize_i32_into(
+                levels,
+                n,
+                qp_c,
+                self.bd_c,
+                &mut self.deq_scratch[..n * n],
+            );
+            transform::inv_transform_into(
+                &self.deq_scratch[..n * n],
+                n,
+                self.bd_c,
+                &mut self.res_scratch[..n * n],
+            );
+        }
         let max = (1i32 << self.bd_c) - 1;
         // Copy scratch.pred out before mutable borrow of plane
         let n2 = n * n;

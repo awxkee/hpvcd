@@ -170,9 +170,12 @@ pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
     // Crop Y to display size
     let coded_cw = planes.width.div_ceil(sub_w);
     let coded_ch = planes.height.div_ceil(sub_h);
+    let mono = planes.chroma.is_monochrome();
     let mut y_out = vec![0u16; dw * dh];
-    let mut cb_out = vec![0u16; cw * ch];
-    let mut cr_out = vec![0u16; cw * ch];
+    // Monochrome has no chroma planes; keep the output chroma buffers empty so we
+    // never index the (empty) decoded cb/cr planes below.
+    let mut cb_out = vec![0u16; if mono { 0 } else { cw * ch }];
+    let mut cr_out = vec![0u16; if mono { 0 } else { cw * ch }];
 
     {
         let src_h = planes.height;
@@ -191,7 +194,7 @@ pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
         }
     }
 
-    {
+    if !mono {
         for (r, (cb_row, cr_row)) in cb_out
             .chunks_exact_mut(cw)
             .zip(cr_out.chunks_exact_mut(cw))
