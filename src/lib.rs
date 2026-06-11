@@ -32,11 +32,11 @@ mod bitreader;
 mod cabac;
 mod color;
 mod config;
-mod decode_full;
+mod decode;
 mod error;
 mod fmt;
 mod heif;
-mod intra_full;
+mod intra;
 mod metadata;
 mod transform;
 mod yuv;
@@ -415,7 +415,7 @@ fn decode_hevc_item(
 ) -> Result<(yuv::YuvPlanes, ColorEncoding), DecodeError> {
     use bitreader::unescape_rbsp;
     use config::parse_hvcc_full;
-    use decode_full::{FullDecoder, parse_slice_header_full};
+    use decode::{FullDecoder, parse_slice_header_full};
 
     let (sps, pps) = parse_hvcc_full(hvcc)?;
 

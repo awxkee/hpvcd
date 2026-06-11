@@ -33,7 +33,7 @@ use crate::cabac::{SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding};
 use crate::config::{Pps, Sps};
 use crate::error::DecodeError;
 use crate::fmt::BitDepth;
-use crate::intra_full;
+use crate::intra;
 use crate::transform;
 use crate::yuv::YuvPlanes;
 
@@ -107,7 +107,7 @@ pub(crate) struct FullDecoder<'a> {
 
     /// Pre-allocated scratch memory reused every TU to avoid per-block
     /// heap allocations on the hot path (~4–6 allocs per TU eliminated).
-    scratch: intra_full::IntraScratch,
+    scratch: intra::IntraScratch,
     /// Dequantised coefficient scratch (max 32×32 = 1024 values, clamped to ±32768 → i32)
     deq_scratch: Vec<i32>,
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
@@ -208,7 +208,7 @@ impl<'a> FullDecoder<'a> {
             sign_hiding: pps.sign_data_hiding_enabled,
             wpp_ctx_snap: vec![None; ctb_rows],
             wpp_ictx_snap: vec![None; ctb_rows],
-            scratch: intra_full::IntraScratch::new(),
+            scratch: intra::IntraScratch::new(),
             deq_scratch: vec![0i32; 1024],
             res_scratch: vec![0i32; 1024],
             strong_smoothing: std::env::var("NOSTRONG").is_err(),
@@ -913,7 +913,7 @@ impl<'a> FullDecoder<'a> {
         let in_pic = x0 + cb_size <= self.w && y0 + cb_size <= self.h;
         let can_split = log2_cb > self.log2_min_cb;
         let split = if x0 + cb_size <= self.w && y0 + cb_size <= self.h && can_split {
-            // read split_cu_flag with neighbour-depth context
+            // read split_cu_flag with neighbor-depth context
             let ctx_inc = self.split_cu_ctx(x0, y0, depth);
             self.cab.decode_bin(&mut self.ctx.split_cu_flag[ctx_inc]) != 0
         } else {
@@ -1244,7 +1244,6 @@ fn mpm_list(mut cand_a: u8, cand_b: u8, y0: usize, log2_ctb: u32) -> [u8; 3] {
     }
 }
 
-// ── transform tree + unit (impl continued) ─────────────────────────────────
 impl<'a> FullDecoder<'a> {
     #[allow(clippy::too_many_arguments)]
     fn transform_tree(
@@ -1637,7 +1636,7 @@ impl<'a> FullDecoder<'a> {
         let neutral = 1u16 << (self.bd - 1);
         let strong = self.strong_smoothing && self.sps.strong_intra_smoothing;
         let sc = &mut self.scratch;
-        intra_full::substitute_refs_into(
+        intra::substitute_refs_into(
             corner,
             &above[..2 * n],
             &left[..2 * n],
@@ -1648,7 +1647,7 @@ impl<'a> FullDecoder<'a> {
             &mut sc.above,
             &mut sc.left,
         );
-        intra_full::filter_refs_into(
+        intra::filter_refs_into(
             &sc.above[..2 * n + 1],
             &sc.left[..2 * n + 1],
             n,
@@ -1659,7 +1658,7 @@ impl<'a> FullDecoder<'a> {
             &mut sc.fa,
             &mut sc.fl,
         );
-        intra_full::predict_into(
+        intra::predict_into(
             mode,
             &sc.fa[..2 * n + 1],
             &sc.fl[..2 * n + 1],
@@ -1787,7 +1786,7 @@ impl<'a> FullDecoder<'a> {
         );
         let neutral = 1u16 << (self.bd_c - 1);
         let sc = &mut self.scratch;
-        intra_full::substitute_refs_into(
+        intra::substitute_refs_into(
             corner,
             &above[..2 * n],
             &left[..2 * n],
@@ -1804,7 +1803,7 @@ impl<'a> FullDecoder<'a> {
         // strong-intra-smoothing path. The DC/H/V prediction edge filter stays off
         // for chroma (is_luma=false in predict_into).
         if self.sps.chroma_idc == 3 {
-            intra_full::filter_refs_into(
+            intra::filter_refs_into(
                 &sc.above[..2 * n + 1],
                 &sc.left[..2 * n + 1],
                 n,
@@ -1815,7 +1814,7 @@ impl<'a> FullDecoder<'a> {
                 &mut sc.fa,
                 &mut sc.fl,
             );
-            intra_full::predict_into(
+            intra::predict_into(
                 mode,
                 &sc.fa[..2 * n + 1],
                 &sc.fl[..2 * n + 1],
@@ -1826,7 +1825,7 @@ impl<'a> FullDecoder<'a> {
                 &mut sc.refs_ang,
             );
         } else {
-            intra_full::predict_into(
+            intra::predict_into(
                 mode,
                 &sc.above[..2 * n + 1],
                 &sc.left[..2 * n + 1],
