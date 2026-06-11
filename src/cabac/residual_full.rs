@@ -283,13 +283,6 @@ pub(crate) fn residual_coding(
     if scan_idx == SCAN_VERT {
         std::mem::swap(&mut last_x, &mut last_y);
     }
-    if std::env::var("DBG2").is_ok() {
-        eprintln!(
-            "  resid log2={} luma={} scan={} last=({},{}) xp={} yp={}",
-            log2_ts, is_luma, scan_idx, last_x, last_y, xp, yp
-        );
-    }
-
     // Scan tables
     let sb_w = (n / 4).max(1);
     let sb_scan = scan_order(sb_w, scan_idx); // sub-block grid scan
@@ -309,7 +302,6 @@ pub(crate) fn residual_coding(
     for i in (0..=last_sb).rev() {
         let (sbx, sby) = sb_scan[i];
         let sb_grid = sbx + sby * sb_w;
-        let dbg3 = std::env::var("DBG3").is_ok() && log2_ts == 5 && is_luma;
 
         // coded_sub_block_flag
         let mut infer_dc = false;
@@ -442,17 +434,11 @@ pub(crate) fn residual_coding(
             }
         }
         c1_carry = c1;
-        if dbg3 {
-            eprintln!(
-                "   sb[{}]=({},{}) sig={:?} gr1={:?} lastg1={:?}",
-                i, sbx, sby, sig_scan, gr1, last_gr1_idx
-            );
-        }
 
         // ── greater2 (only on first greater1 coeff) ──
         let mut gr2 = false;
         if let Some(j) = last_gr1_idx {
-            let ci = ((ctx_set) as usize + if is_luma { 0 } else { 4 })
+            let ci = (ctx_set as usize + if is_luma { 0 } else { 4 })
                 .min(ctx.coeff_abs_level_greater2.len() - 1);
             gr2 = dec.decode_bin(&mut ctx.coeff_abs_level_greater2[ci]) != 0;
             let _ = j;

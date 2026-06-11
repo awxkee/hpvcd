@@ -966,10 +966,6 @@ impl<'a> FullDecoder<'a> {
     }
 
     fn coding_unit(&mut self, x0: usize, y0: usize, log2_cb: u32) {
-        let dbg = std::env::var("DBG").is_ok() && y0 < 64;
-        if dbg {
-            eprintln!("CU ({},{}) log2={}", x0, y0, log2_cb);
-        }
         // QG handling
         let qg_mask = !((1usize << self.log2_qg) - 1);
         let xqg = x0 & qg_mask;
@@ -1036,16 +1032,6 @@ impl<'a> FullDecoder<'a> {
             let mode = self.derive_luma_mode(pux, puy, prev_flags[i], mpm_or_rem[i]);
             luma_modes[i] = mode;
             self.set_mode(pux, puy, pu_size, mode);
-        }
-        if dbg {
-            eprintln!(
-                "  nxn x={} y={} prev={:?} mpm_rem={:?} modes={:?}",
-                x0,
-                y0,
-                &prev_flags[..npu * npu],
-                &mpm_or_rem[..npu * npu],
-                &luma_modes[..npu * npu]
-            );
         }
 
         // intra_chroma_pred_mode (1 per CU for 4:2:0/4:2:2)
