@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::color::{ColorEncoding, MatrixCoefficients};
+use crate::color::{Cicp, MatrixCoefficients};
 use crate::fmt::{BitDepth, ChromaFormat, ImageBuffer};
 
 const Q13: u32 = 13;
@@ -60,7 +60,7 @@ pub(crate) fn yuv_to_rgb_with_color(
     yuv: &YuvPlanes,
     dw: usize,
     dh: usize,
-    color: &ColorEncoding,
+    color: &Cicp,
 ) -> ImageBuffer {
     if yuv.chroma.is_monochrome() {
         let y_black = if color.full_range {

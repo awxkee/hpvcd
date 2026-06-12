@@ -41,7 +41,7 @@ mod metadata;
 mod transform;
 mod yuv;
 
-pub use color::{ColorEncoding, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
+pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::DecodeError;
 pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
 pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
@@ -409,10 +409,7 @@ fn decode_grid_yuv(
     })
 }
 
-fn decode_hevc_item(
-    sample: &[u8],
-    hvcc: &[u8],
-) -> Result<(yuv::YuvPlanes, ColorEncoding), DecodeError> {
+fn decode_hevc_item(sample: &[u8], hvcc: &[u8]) -> Result<(yuv::YuvPlanes, Cicp), DecodeError> {
     use bitreader::unescape_rbsp;
     use config::parse_hvcc_full;
     use decode::{FullDecoder, parse_slice_header_full};
@@ -444,7 +441,7 @@ fn decode_hevc_item(
     let rbsp = unescape_rbsp(&nal);
     let (slice_qp, sao_luma, sao_chroma, cabac_off) =
         parse_slice_header_full(&rbsp, &sps, &pps, nal_type)?;
-    let vui_color = ColorEncoding {
+    let vui_color = Cicp {
         primaries: Primaries::from_u8(sps.colour_primaries),
         transfer: TransferFunction::from_u8(sps.transfer_characteristics),
         matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
@@ -481,7 +478,7 @@ pub fn decode_heic(file: &[u8]) -> Result<DecodedImage, DecodeError> {
     let color_enc = if vui_color.matrix != MatrixCoefficients::Unspecified {
         vui_color
     } else {
-        heif.primary.color.cicp.unwrap_or_else(ColorEncoding::srgb)
+        heif.primary.color.cicp.unwrap_or_else(Cicp::srgb)
     };
     let rgb = yuv::yuv_to_rgb_with_color(&yuv_planes, dw, dh, &color_enc);
 
@@ -606,18 +603,14 @@ fn decode_grid(
             &fallback_hvcc
         };
         if let Ok((sps, _)) = config::parse_hvcc_full(hvcc_ref) {
-            ColorEncoding {
+            Cicp {
                 primaries: Primaries::from_u8(sps.colour_primaries),
                 transfer: TransferFunction::from_u8(sps.transfer_characteristics),
                 matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
                 full_range: sps.video_full_range,
             }
         } else {
-            heif_file
-                .primary
-                .color
-                .cicp
-                .unwrap_or_else(ColorEncoding::srgb)
+            heif_file.primary.color.cicp.unwrap_or_else(Cicp::srgb)
         }
     };
 
@@ -775,27 +768,30 @@ fn apply_orientation(
     o: Orientation,
 ) -> (u32, u32, ImageBuffer, Option<SampleBuf>) {
     let (nw, nh) = match o {
-        Orientation::Rotate90 | Orientation::Rotate270 => (h as usize, w as usize),
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Transverse
+        | Orientation::Transpose => (h as usize, w as usize),
         _ => (w as usize, h as usize),
     };
     let buf2 = match buf {
-        ImageBuffer::Luma8(px) => ImageBuffer::Luma8(rotate_luma(w as usize, h as usize, px, o)),
-        ImageBuffer::Luma16(px) => ImageBuffer::Luma16(rotate_luma(w as usize, h as usize, px, o)),
-        ImageBuffer::Rgb8(px) => ImageBuffer::Rgb8(rotate_buf(w as usize, h as usize, px, o)),
-        ImageBuffer::Rgb16(px) => ImageBuffer::Rgb16(rotate_buf(w as usize, h as usize, px, o)),
+        ImageBuffer::Luma8(px) => ImageBuffer::Luma8(rotate_luma(w as usize, h as usize, &px, o)),
+        ImageBuffer::Luma16(px) => ImageBuffer::Luma16(rotate_luma(w as usize, h as usize, &px, o)),
+        ImageBuffer::Rgb8(px) => ImageBuffer::Rgb8(rotate_buf(w as usize, h as usize, &px, o)),
+        ImageBuffer::Rgb16(px) => ImageBuffer::Rgb16(rotate_buf(w as usize, h as usize, &px, o)),
     };
     let alpha2 = alpha.map(|a| match a {
-        SampleBuf::U8(v) => SampleBuf::U8(rotate_luma(w as usize, h as usize, v, o)),
-        SampleBuf::U16(v) => SampleBuf::U16(rotate_luma(w as usize, h as usize, v, o)),
+        SampleBuf::U8(v) => SampleBuf::U8(rotate_luma(w as usize, h as usize, &v, o)),
+        SampleBuf::U16(v) => SampleBuf::U16(rotate_luma(w as usize, h as usize, &v, o)),
     });
     (nw as u32, nh as u32, buf2, alpha2)
 }
 
 /// Single-channel rotation for luma-only buffers (stride = 1, not 3).
-fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation) -> Vec<T> {
+fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -> Vec<T> {
     match o {
-        Orientation::Normal => px,
-        Orientation::Rotate180 => px.into_iter().rev().collect(),
+        Orientation::Normal => px.to_vec(),
+        Orientation::Rotate180 => px.iter().map(|&x| x).rev().collect::<Vec<_>>(),
         Orientation::FlipH => {
             let mut out = vec![T::default(); px.len()];
             for r in 0..h {
@@ -830,14 +826,14 @@ fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation
             }
             out
         }
-        _ => px,
+        _ => px.to_vec(),
     }
 }
 
 /// Generic pixel-buffer rotation; works for both `u8` and `u16` samples.
-fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation) -> Vec<T> {
+fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -> Vec<T> {
     match o {
-        Orientation::Normal => px,
+        Orientation::Normal => px.to_vec(),
         Orientation::Rotate180 => px
             .as_chunks::<3>()
             .0
@@ -919,6 +915,6 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: Vec<T>, o: Orientation)
             }
             out
         }
-        _ => px,
+        _ => px.to_vec(),
     }
 }

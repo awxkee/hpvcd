@@ -864,10 +864,10 @@ impl<'a> FullDecoder<'a> {
                     for x in x0..x_end {
                         let s = src[y * w + x] as i32;
 
-                        // Neighbour 1 (forward direction)
+                        // Neighbor 1 (forward direction)
                         let x1 = x as i32 + dx;
                         let y1 = y as i32 + dy;
-                        // Neighbour 2 (backward direction)
+                        // Neighbor 2 (backward direction)
                         let x2 = x as i32 - dx;
                         let y2 = y as i32 - dy;
 
@@ -1026,11 +1026,18 @@ impl<'a> FullDecoder<'a> {
                 *dst = v;
             }
         }
-        for i in 0..npu * npu {
+
+        let npu_sqr = npu * npu;
+        for (i, ((luma_mode, &prev_flag), &mpm_or_rem)) in luma_modes[..npu_sqr]
+            .iter_mut()
+            .zip(prev_flags[..npu_sqr].iter())
+            .zip(mpm_or_rem[..npu_sqr].iter())
+            .enumerate()
+        {
             let pux = x0 + (i % npu) * pu_size;
             let puy = y0 + (i / npu) * pu_size;
-            let mode = self.derive_luma_mode(pux, puy, prev_flags[i], mpm_or_rem[i]);
-            luma_modes[i] = mode;
+            let mode = self.derive_luma_mode(pux, puy, prev_flag, mpm_or_rem);
+            *luma_mode = mode;
             self.set_mode(pux, puy, pu_size, mode);
         }
 
@@ -1077,13 +1084,13 @@ impl<'a> FullDecoder<'a> {
             return self.slice_qp;
         }
 
-        // qPY_A: left neighbour, must be in same CTB
+        // qPY_A: left neighbor, must be in same CTB
         let qp_a = if xqg >= 1 && (xqg - 1) >= ctb_x {
             self.qp_y_map[(yqg / 4) * self.grid_w + (xqg - 1) / 4] as i32
         } else {
             self.qp_y_prev
         };
-        // qPY_B: above neighbour, must be in same CTB
+        // qPY_B: above neighbor, must be in same CTB
         let qp_b = if yqg >= 1 && (yqg - 1) >= ctb_y {
             self.qp_y_map[((yqg - 1) / 4) * self.grid_w + xqg / 4] as i32
         } else {
@@ -1518,7 +1525,6 @@ fn chroma_scan(mode: u8, log2_ts: u32, is_444: bool) -> u8 {
     }
 }
 
-// ── reconstruction helpers ──────────────────────────────────────────────────
 impl<'a> FullDecoder<'a> {
     fn luma_avail(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
@@ -1551,15 +1557,15 @@ impl<'a> FullDecoder<'a> {
         } else {
             None
         };
-        for i in 0..2 * n {
+        for (i, (above, left)) in above[..2 * n].iter_mut().zip(left.iter_mut()).enumerate() {
             let ax = x0 as i32 + i as i32;
-            above[i] = if self.luma_avail(ax, y0 as i32 - 1) {
+            *above = if self.luma_avail(ax, y0 as i32 - 1) {
                 Some(self.y[(y0 - 1) * self.w + ax as usize])
             } else {
                 None
             };
             let ly = y0 as i32 + i as i32;
-            left[i] = if self.luma_avail(x0 as i32 - 1, ly) {
+            *left = if self.luma_avail(x0 as i32 - 1, ly) {
                 Some(self.y[ly as usize * self.w + (x0 - 1)])
             } else {
                 None

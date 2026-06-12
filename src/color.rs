@@ -159,14 +159,14 @@ impl MatrixCoefficients {
 
 /// CICP encoding used for both HEIF `colr` (nclx) boxes and HEVC VUI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColorEncoding {
+pub struct Cicp {
     pub primaries: Primaries,
     pub transfer: TransferFunction,
     pub matrix: MatrixCoefficients,
     pub full_range: bool,
 }
 
-impl ColorEncoding {
+impl Cicp {
     pub const fn srgb() -> Self {
         Self {
             primaries: Primaries::Bt709,
@@ -204,7 +204,7 @@ impl ColorEncoding {
     }
 }
 
-impl Default for ColorEncoding {
+impl Default for Cicp {
     fn default() -> Self {
         Self::srgb()
     }
@@ -218,13 +218,13 @@ impl Default for ColorEncoding {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ColorMetadata {
     /// CICP code points from an `nclx` `colr` box.
-    pub cicp: Option<ColorEncoding>,
+    pub cicp: Option<Cicp>,
     /// Raw ICC profile bytes from a `prof` or `rICC` `colr` box.
     pub icc: Option<Vec<u8>>,
 }
 
 impl ColorMetadata {
-    pub fn from_cicp(enc: ColorEncoding) -> Self {
+    pub fn from_cicp(enc: Cicp) -> Self {
         Self {
             cicp: Some(enc),
             icc: None,
@@ -238,8 +238,8 @@ impl ColorMetadata {
     }
 
     /// CICP encoding for driving the YCbCr→RGB conversion; falls back to sRGB.
-    pub fn color_encoding(&self) -> ColorEncoding {
-        self.cicp.unwrap_or_else(ColorEncoding::srgb)
+    pub fn color_encoding(&self) -> Cicp {
+        self.cicp.unwrap_or_else(Cicp::srgb)
     }
     pub fn is_empty(&self) -> bool {
         self.cicp.is_none() && self.icc.is_none()
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn nclx_payload_layout() {
-        let p = ColorEncoding::bt709().nclx_payload();
+        let p = Cicp::bt709().nclx_payload();
         assert_eq!(&p[0..4], b"nclx");
         assert_eq!(u16::from_be_bytes([p[4], p[5]]), 1);
         assert_eq!(u16::from_be_bytes([p[6], p[7]]), 1);
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn pq_encoding_values() {
-        let e = ColorEncoding::bt2020_pq();
+        let e = Cicp::bt2020_pq();
         assert_eq!(e.primaries as u8, 9);
         assert_eq!(e.transfer as u8, 16);
         assert_eq!(e.matrix as u8, 9);

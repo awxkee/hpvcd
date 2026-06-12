@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::color::{ColorEncoding, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
+use crate::color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 use crate::error::DecodeError;
 use crate::metadata::{CleanAperture, ContentLightLevel, Orientation, PixelAspectRatio};
 
@@ -782,7 +782,7 @@ fn parse_colr_into(mut color: ColorMetadata, data: &[u8]) -> ColorMetadata {
     }
     match &data[..4] {
         b"nclx" if data.len() >= 11 => {
-            color.cicp = Some(ColorEncoding {
+            color.cicp = Some(Cicp {
                 primaries: Primaries::from_u8(read_u16(data, 4).unwrap_or(2) as u8),
                 transfer: TransferFunction::from_u8(read_u16(data, 6).unwrap_or(2) as u8),
                 matrix: MatrixCoefficients::from_u8(read_u16(data, 8).unwrap_or(2) as u8),
