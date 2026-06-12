@@ -791,7 +791,7 @@ fn apply_orientation(
 fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -> Vec<T> {
     match o {
         Orientation::Normal => px.to_vec(),
-        Orientation::Rotate180 => px.iter().map(|&x| x).rev().collect::<Vec<_>>(),
+        Orientation::Rotate180 => px.iter().copied().rev().collect::<Vec<_>>(),
         Orientation::FlipH => {
             let mut out = vec![T::default(); px.len()];
             for r in 0..h {
