@@ -36,6 +36,7 @@ mod decode;
 mod error;
 mod fmt;
 mod heif;
+mod info;
 mod intra;
 mod metadata;
 mod transform;
@@ -44,6 +45,7 @@ mod yuv;
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use error::DecodeError;
 pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
+pub use info::{ImageInfo, read_heic_info};
 pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
 
 const MAX_IMG_DIM: usize = 16_384;
