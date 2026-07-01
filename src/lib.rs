@@ -33,23 +33,25 @@ mod cabac;
 mod color;
 mod config;
 mod decode;
+mod decoder;
 mod error;
 mod fmt;
 mod heif;
 mod info;
 mod intra;
+mod limits;
 mod metadata;
+mod threadpool;
 mod transform;
 mod yuv;
 
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
+pub use decoder::Decoder;
 pub use error::DecodeError;
 pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
-pub use info::{ImageInfo, read_heic_info};
+pub use info::{ImageInfo, read_heic_info, read_heic_info_with_limits};
+pub use limits::ParseLimits;
 pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
-
-const MAX_IMG_DIM: usize = 16_384;
-const MAX_IMG_PIXELS: usize = 64 * 1024 * 1024;
 
 /// Convert a decoded u16 YUV plane to the appropriate typed buffer.
 /// 8-bit images produce `SampleBuf::U8` (direct cast, no precision loss).
@@ -58,21 +60,6 @@ fn plane_to_buf(plane: Vec<u16>, bd: BitDepth) -> SampleBuf {
         SampleBuf::U8(plane.into_iter().map(|v| v as u8).collect())
     } else {
         SampleBuf::U16(plane)
-    }
-}
-
-fn check_dims(w: usize, h: usize) -> Result<(), DecodeError> {
-    if w == 0
-        || h == 0
-        || w > MAX_IMG_DIM
-        || h > MAX_IMG_DIM
-        || w.saturating_mul(h) > MAX_IMG_PIXELS
-    {
-        Err(DecodeError::Bitstream(format!(
-            "image dimensions {w}×{h} exceed maximum"
-        )))
-    } else {
-        Ok(())
     }
 }
 
@@ -143,13 +130,21 @@ fn decode_alpha_plane(
         })
 }
 
-/// Decode a HEIF/HEIC file and return raw YCbCr planes (no colour conversion).
-/// For a display-ready 8-bit image use [`decode_heic_rgb8`].
+/// Decode a HEIF/HEIC file and return raw YCbCr planes (no color conversion),
+/// using a default [`Decoder`]. For a display-ready 8-bit image use
+/// [`decode_heic_rgb8`].
 pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
-    let heif = heif::parse(file)?;
+    Decoder::default().decode_yuv(file)
+}
+
+pub(crate) fn decode_heic_yuv_with(
+    decoder: &Decoder,
+    file: &[u8],
+) -> Result<DecodedYuv, DecodeError> {
+    let heif = heif::parse(file, decoder.limits())?;
 
     if let Some(grid) = &heif.grid {
-        return decode_grid_yuv(file, grid, &heif);
+        return decode_grid_yuv(decoder, file, grid, &heif);
     }
 
     // Single-tile path
@@ -163,7 +158,7 @@ pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
     let (planes, _) = decode_hevc_item(&file[start..end], &heif.primary.hvcc)?;
     let dw = heif.primary.display_w as usize;
     let dh = heif.primary.display_h as usize;
-    check_dims(dw, dh)?;
+    decoder.check_dims(dw, dh)?;
     let sub_w = planes.chroma.sub_w();
     let sub_h = planes.chroma.sub_h();
     let cw = dw.div_ceil(sub_w);
@@ -247,15 +242,195 @@ pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
     })
 }
 
+/// Immutable per-grid context for the YUV band workers.
+struct YuvGridCtx<'a> {
+    file: &'a [u8],
+    tiles: &'a [heif::HeifItem],
+    fallback_hvcc: &'a [u8],
+    cols: usize,
+    out_w: usize,
+    out_h: usize,
+    cw: usize,
+    ch: usize,
+    tile_w: usize,
+    tile_h: usize,
+    tile_cw: usize,
+    tile_ch: usize,
+    sub_w: usize,
+    sub_h: usize,
+    has_chroma: bool,
+}
+
+/// Stitch all tiles of grid-row `band_row` into the three plane bands. Each band
+/// is that grid-row's contiguous slice of its plane; local row 0 maps to the
+/// band's first global row, so vertical offsets within a band are just `y`.
+/// Edge tiles are right/bottom-padded with their last sample (matching the
+/// original serial behavior).
+fn stitch_yuv_band(
+    ctx: &YuvGridCtx<'_>,
+    band_row: usize,
+    y_band: &mut [u16],
+    cb_band: &mut [u16],
+    cr_band: &mut [u16],
+) {
+    for col in 0..ctx.cols {
+        let tile_idx = band_row * ctx.cols + col;
+        let tile = match ctx.tiles.get(tile_idx) {
+            Some(t) => t,
+            None => break,
+        };
+        let start = tile.data_offset as usize;
+        let end = start + tile.data_length as usize;
+        if end > ctx.file.len() {
+            continue;
+        }
+        let hvcc = if !tile.hvcc.is_empty() {
+            &tile.hvcc
+        } else {
+            ctx.fallback_hvcc
+        };
+        if hvcc.is_empty() {
+            continue;
+        }
+        let (planes, _) = match decode_hevc_item(&ctx.file[start..end], hvcc) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let p_cw = planes.width.div_ceil(ctx.sub_w);
+        let p_ch = planes.height.div_ceil(ctx.sub_h);
+
+        let dst_x = col * ctx.tile_w;
+        let dst_y_base = band_row * ctx.tile_h;
+        let copy_w = ctx.tile_w.min(ctx.out_w.saturating_sub(dst_x));
+        let copy_h = ctx.tile_h.min(ctx.out_h.saturating_sub(dst_y_base));
+
+        for y in 0..copy_h {
+            let dst_start = y * ctx.out_w + dst_x;
+            let dst = &mut y_band[dst_start..dst_start + copy_w];
+            let src_y = y.min(planes.height - 1);
+            let src_row = &planes.y[src_y * planes.width..][..planes.width];
+            let src = &src_row[..copy_w.min(planes.width)];
+            let (exact, pad) = dst.split_at_mut(src.len());
+            exact.copy_from_slice(src);
+            if let Some(&last) = src.last() {
+                pad.fill(last);
+            }
+        }
+
+        if !ctx.has_chroma || planes.cb.is_empty() {
+            continue;
+        }
+
+        let c_dst_x = col * ctx.tile_cw;
+        let c_dst_y_base = band_row * ctx.tile_ch;
+        let c_copy_w = ctx.tile_cw.min(ctx.cw.saturating_sub(c_dst_x));
+        let c_copy_h = ctx.tile_ch.min(ctx.ch.saturating_sub(c_dst_y_base));
+
+        for y in 0..c_copy_h {
+            let c_start = y * ctx.cw + c_dst_x;
+            let src_y = y.min(p_ch - 1);
+            let src_cb_row = &planes.cb[src_y * p_cw..][..p_cw];
+            let src_cr_row = &planes.cr[src_y * p_cw..][..p_cw];
+            let copy = c_copy_w.min(p_cw);
+
+            let cb_row = &mut cb_band[c_start..c_start + c_copy_w];
+            let (cb_exact, cb_pad) = cb_row.split_at_mut(copy);
+            cb_exact.copy_from_slice(&src_cb_row[..copy]);
+            if let Some(&last_cb) = src_cb_row.last() {
+                cb_pad.fill(last_cb);
+            }
+
+            let cr_row = &mut cr_band[c_start..c_start + c_copy_w];
+            let (cr_exact, cr_pad) = cr_row.split_at_mut(copy);
+            cr_exact.copy_from_slice(&src_cr_row[..copy]);
+            if let Some(&last_cr) = src_cr_row.last() {
+                cr_pad.fill(last_cr);
+            }
+        }
+    }
+}
+
+/// Allocate the three YUV planes and fill them band-by-band. Grid rows are
+/// stitched concurrently via the decoder's work-stealing pool, each band getting
+/// exclusive `&mut` regions from three [`threadpool::DisjointMut`] wrappers (one
+/// per plane). Single-threaded pools and single-band images take a serial path
+/// that skips pool dispatch; the output is byte-identical either way.
+fn fill_grid_yuv_bands(
+    decoder: &Decoder,
+    y_total: usize,
+    c_total: usize,
+    rows: usize,
+    ctx: &YuvGridCtx<'_>,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let y_stride = ctx.tile_h * ctx.out_w;
+    let c_stride = ctx.tile_ch * ctx.cw;
+
+    let pool = decoder.pool();
+    if pool.threads() > 1 && rows > 1 {
+        let y_dm = threadpool::DisjointMut::new(vec![0u16; y_total]);
+        let cb_dm = threadpool::DisjointMut::new(vec![0u16; c_total]);
+        let cr_dm = threadpool::DisjointMut::new(vec![0u16; c_total]);
+        threadpool::parallel_for(pool, rows, |r| {
+            let y_lo = r * y_stride;
+            let y_hi = ((r + 1) * y_stride).min(y_total);
+            let c_lo = r * c_stride;
+            let c_hi = ((r + 1) * c_stride).min(c_total);
+            if y_lo >= y_hi {
+                return;
+            }
+            let mut y_band = y_dm.slice_mut(y_lo..y_hi);
+            if c_total > 0 && c_lo < c_hi {
+                let mut cb_band = cb_dm.slice_mut(c_lo..c_hi);
+                let mut cr_band = cr_dm.slice_mut(c_lo..c_hi);
+                stitch_yuv_band(ctx, r, &mut y_band, &mut cb_band, &mut cr_band);
+            } else {
+                stitch_yuv_band(ctx, r, &mut y_band, &mut [], &mut []);
+            }
+        });
+        return (y_dm.into_inner(), cb_dm.into_inner(), cr_dm.into_inner());
+    }
+
+    // Serial path — used for single-threaded pools or single-band images, where
+    // dispatching to the pool would only add overhead.
+    let mut out_y = vec![0u16; y_total];
+    let mut out_cb = vec![0u16; c_total];
+    let mut out_cr = vec![0u16; c_total];
+    for r in 0..rows {
+        let y_lo = r * y_stride;
+        let y_hi = ((r + 1) * y_stride).min(y_total);
+        let c_lo = r * c_stride;
+        let c_hi = ((r + 1) * c_stride).min(c_total);
+        if y_lo >= y_hi {
+            continue;
+        }
+        if c_total > 0 && c_lo < c_hi {
+            stitch_yuv_band(
+                ctx,
+                r,
+                &mut out_y[y_lo..y_hi],
+                &mut out_cb[c_lo..c_hi],
+                &mut out_cr[c_lo..c_hi],
+            );
+        } else {
+            let empty: &mut [u16] = &mut [];
+            let empty2: &mut [u16] = &mut [];
+            stitch_yuv_band(ctx, r, &mut out_y[y_lo..y_hi], empty, empty2);
+        }
+    }
+    (out_y, out_cb, out_cr)
+}
+
 /// Composite a tiled grid into a single YUV image (no RGB conversion).
 fn decode_grid_yuv(
+    decoder: &Decoder,
     file: &[u8],
     grid: &heif::GridInfo,
     heif_file: &heif::HeifFile,
 ) -> Result<DecodedYuv, DecodeError> {
     let out_w = grid.output_width as usize;
     let out_h = grid.output_height as usize;
-    check_dims(out_w, out_h)?;
+    decoder.check_dims(out_w, out_h)?;
     if grid.tiles.is_empty() {
         return Err(DecodeError::Bitstream("grid has no tiles".into()));
     }
@@ -276,7 +451,7 @@ fn decode_grid_yuv(
         &fallback_hvcc
     };
     let parsed = config::parse_hvcc_full(hvcc_ref).ok();
-    let mut chroma_fmt = parsed
+    let chroma_fmt = parsed
         .as_ref()
         .map(|(sps, _)| sps.chroma)
         .unwrap_or(ChromaFormat::Yuv420);
@@ -302,97 +477,41 @@ fn decode_grid_yuv(
     let tile_cw = tile_w.div_ceil(sub_w);
     let tile_ch = tile_h.div_ceil(sub_h);
 
-    let mut out_y = vec![0u16; out_w * out_h];
-    let mut out_cb = vec![0u16; cw * ch];
-    let mut out_cr = vec![0u16; cw * ch];
-    let mut bit_depth = BitDepth::Eight;
+    // All tiles in a grid share one SPS, so the sample bit depth is fixed for
+    // the whole grid; derive it once from the reference hvcC instead of reading
+    // it back inside the (possibly parallel) stitch loop.
+    let bit_depth = parsed
+        .as_ref()
+        .map(|(sps, _)| match sps.bit_depth_luma {
+            10 => BitDepth::Ten,
+            12 => BitDepth::Twelve,
+            _ => BitDepth::Eight,
+        })
+        .unwrap_or(BitDepth::Eight);
 
-    for (tile_idx, tile) in grid.tiles.iter().enumerate() {
-        let col = tile_idx % cols;
-        let row = tile_idx / cols;
-        if row >= rows {
-            break;
-        }
+    // Shared, immutable context for the band workers.
+    let yctx = YuvGridCtx {
+        file,
+        tiles: &grid.tiles,
+        fallback_hvcc: &fallback_hvcc,
+        cols,
+        out_w,
+        out_h,
+        cw,
+        ch,
+        tile_w,
+        tile_h,
+        tile_cw,
+        tile_ch,
+        sub_w,
+        sub_h,
+        has_chroma,
+    };
 
-        let start = tile.data_offset as usize;
-        let end = start + tile.data_length as usize;
-        if end > file.len() {
-            continue;
-        }
-        let hvcc = if !tile.hvcc.is_empty() {
-            &tile.hvcc
-        } else {
-            &fallback_hvcc
-        };
-        if hvcc.is_empty() {
-            continue;
-        }
-
-        let (planes, _) = match decode_hevc_item(&file[start..end], hvcc) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        bit_depth = planes.bit_depth;
-        // Keep the buffers consistent with the format they were sized for; all
-        // tiles in a grid share one SPS, so this normally already matches.
-        chroma_fmt = planes.chroma;
-        let p_cw = planes.width.div_ceil(sub_w);
-        let p_ch = planes.height.div_ceil(sub_h);
-
-        let dst_x = col * tile_w;
-        let dst_y = row * tile_h;
-        let copy_w = tile_w.min(out_w.saturating_sub(dst_x));
-        let copy_h = tile_h.min(out_h.saturating_sub(dst_y));
-
-        for y in 0..copy_h {
-            let dst_start = (dst_y + y) * out_w + dst_x;
-            let dst = &mut out_y[dst_start..dst_start + copy_w];
-            let src_y = y.min(planes.height - 1);
-            let src_row = &planes.y[src_y * planes.width..][..planes.width];
-            let src = &src_row[..copy_w.min(planes.width)];
-
-            let (exact, pad) = dst.split_at_mut(src.len());
-            exact.copy_from_slice(src);
-            if let Some(&last) = src.last() {
-                pad.fill(last);
-            }
-        }
-
-        // Chroma: skip entirely for monochrome (no chroma planes), and copy at
-        // the format's true subsampling for 4:2:0 / 4:2:2 / 4:4:4.
-        if !has_chroma || planes.cb.is_empty() {
-            continue;
-        }
-
-        let c_dst_x = col * tile_cw;
-        let c_dst_y = row * tile_ch;
-        let c_copy_w = tile_cw.min(cw.saturating_sub(c_dst_x));
-        let c_copy_h = tile_ch.min(ch.saturating_sub(c_dst_y));
-
-        for y in 0..c_copy_h {
-            let cb_start = (c_dst_y + y) * cw + c_dst_x;
-            let cb_row = &mut out_cb[cb_start..cb_start + c_copy_w];
-            let cr_start = (c_dst_y + y) * cw + c_dst_x;
-            // out_cb and out_cr share the same geometry; index out_cr separately.
-            let src_y = y.min(p_ch - 1);
-            let src_cb_row = &planes.cb[src_y * p_cw..][..p_cw];
-            let src_cr_row = &planes.cr[src_y * p_cw..][..p_cw];
-
-            let copy = c_copy_w.min(p_cw);
-            let (cb_exact, cb_pad) = cb_row.split_at_mut(copy);
-            cb_exact.copy_from_slice(&src_cb_row[..copy]);
-            if let Some(&last_cb) = src_cb_row.last() {
-                cb_pad.fill(last_cb);
-            }
-
-            let cr_row = &mut out_cr[cr_start..cr_start + c_copy_w];
-            let (cr_exact, cr_pad) = cr_row.split_at_mut(copy);
-            cr_exact.copy_from_slice(&src_cr_row[..copy]);
-            if let Some(&last_cr) = src_cr_row.last() {
-                cr_pad.fill(last_cr);
-            }
-        }
-    }
+    // Band `r` (grid-row r) owns contiguous, disjoint ranges of each plane:
+    //   luma:   [r*tile_h*out_w, ..)     spanning tile_h output rows
+    //   chroma: [r*tile_ch*cw, ..)       spanning tile_ch chroma rows
+    let (out_y, out_cb, out_cr) = fill_grid_yuv_bands(decoder, out_w * out_h, cw * ch, rows, &yctx);
 
     Ok(DecodedYuv {
         y: plane_to_buf(out_y, bit_depth),
@@ -418,46 +537,77 @@ fn decode_hevc_item(sample: &[u8], hvcc: &[u8]) -> Result<(yuv::YuvPlanes, Cicp)
 
     let (sps, pps) = parse_hvcc_full(hvcc)?;
 
-    // Find the first IDR/CRA NAL in the length-prefixed sample.
-    let mut pos = 0;
-    let mut nal = Vec::new();
-    let mut nal_type = 0u8;
-    while pos + 4 <= sample.len() {
-        let nlen = u32::from_be_bytes(sample[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + nlen > sample.len() {
-            break;
-        }
-        let t = (sample[pos] >> 1) & 0x3f;
-        if matches!(t, 19..=21) {
-            nal = sample[pos..pos + nlen].to_vec();
-            nal_type = t;
-            break;
-        }
-        pos += nlen;
-    }
-    if nal.is_empty() {
-        return Err(DecodeError::Bitstream("no IDR/CRA NAL found".into()));
-    }
-
-    let rbsp = unescape_rbsp(&nal);
-    let (slice_qp, sao_luma, sao_chroma, cabac_off) =
-        parse_slice_header_full(&rbsp, &sps, &pps, nal_type)?;
     let vui_color = Cicp {
-        primaries: Primaries::from_u8(sps.colour_primaries),
+        primaries: Primaries::from_u8(sps.color_primaries),
         transfer: TransferFunction::from_u8(sps.transfer_characteristics),
         matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
         full_range: sps.video_full_range,
     };
-    let mut dec = FullDecoder::new(&rbsp[cabac_off..], sps, pps, slice_qp, sao_luma, sao_chroma)?;
-    Ok((dec.decode()?, vui_color))
+
+    // Collect every VCL NAL (types 0..=31) in stream order. A coded still image
+    // is one access unit, which may be split into several slice segments; each
+    // segment is its own VCL NAL and must be reconstructed into the same planes.
+    // Non-VCL NALs (VPS/SPS/PPS/SEI, types >= 32) are skipped — parameter sets
+    // come from the hvcC box.
+    let mut dec: Option<FullDecoder> = None;
+    let mut pos = 0;
+    while pos + 4 <= sample.len() {
+        let nlen = u32::from_be_bytes(sample[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + nlen > sample.len() || nlen < 2 {
+            break;
+        }
+        let nal_bytes = &sample[pos..pos + nlen];
+        pos += nlen;
+        let nal_type = (nal_bytes[0] >> 1) & 0x3f;
+        if nal_type > 31 {
+            continue; // non-VCL
+        }
+
+        let rbsp = unescape_rbsp(nal_bytes);
+        let hdr = match parse_slice_header_full(&rbsp, &sps, &pps, nal_type) {
+            Ok(h) => h,
+            Err(_) => continue, // skip a slice we can't parse rather than failing whole image
+        };
+        let cabac = &rbsp[hdr.cabac_offset.min(rbsp.len())..];
+
+        match dec.as_mut() {
+            None => {
+                // The first VCL NAL must be an independent, first-in-picture
+                // segment; otherwise the bitstream is malformed for a still image.
+                if !hdr.first_slice_in_pic {
+                    continue;
+                }
+                let mut d = FullDecoder::new(cabac, sps.clone(), pps.clone(), &hdr)?;
+                d.decode_slice(hdr.slice_segment_address)?;
+                dec = Some(d);
+            }
+            Some(d) => {
+                // Subsequent segment of the same picture.
+                d.decode_segment(cabac, &hdr)?;
+            }
+        }
+    }
+
+    match dec {
+        Some(mut d) => Ok((d.finish(), vui_color)),
+        None => Err(DecodeError::Bitstream("no VCL slice NAL found".into())),
+    }
 }
 
+/// Decode a HEIF/HEIC file to display-ready pixels using a default [`Decoder`].
 pub fn decode_heic(file: &[u8]) -> Result<DecodedImage, DecodeError> {
-    let heif = heif::parse(file)?;
+    Decoder::default().decode(file)
+}
+
+pub(crate) fn decode_heic_with(
+    decoder: &Decoder,
+    file: &[u8],
+) -> Result<DecodedImage, DecodeError> {
+    let heif = heif::parse(file, decoder.limits())?;
 
     if let Some(grid) = &heif.grid {
-        return decode_grid(file, grid, &heif);
+        return decode_grid(decoder, file, grid, &heif);
     }
 
     let start = heif.primary.data_offset as usize;
@@ -523,8 +673,119 @@ pub fn decode_heic(file: &[u8]) -> Result<DecodedImage, DecodeError> {
     })
 }
 
+/// Immutable per-grid context shared by every band worker. Holding only shared
+/// references keeps it `Sync`, so it can be borrowed across the thread pool.
+struct GridCtx<'a> {
+    file: &'a [u8],
+    tiles: &'a [heif::HeifItem],
+    fallback_hvcc: &'a [u8],
+    color_enc: &'a Cicp,
+    cols: usize,
+    out_w: usize,
+    out_h: usize,
+    tile_w: usize,
+    tile_h: usize,
+    channels: usize,
+}
+
+/// Decode every tile in grid-row `band_row` and stitch it into `band`, the
+/// contiguous output slice for rows `[band_row*tile_h, ..)`. The band's local
+/// row 0 is global row `band_row*tile_h`, so the vertical destination within the
+/// band is simply `y`. `pick` pulls the matching-depth samples out of the
+/// per-tile RGB/luma buffer. `T` is `u8` (8-bit) or `u16` (10/12-bit).
+fn stitch_grid_band<T: Copy>(
+    ctx: &GridCtx<'_>,
+    band_row: usize,
+    band: &mut [T],
+    pick: &(dyn Fn(&ImageBuffer) -> Option<&[T]> + Sync),
+) {
+    let dst_y_base = band_row * ctx.tile_h;
+    for col in 0..ctx.cols {
+        let tile_idx = band_row * ctx.cols + col;
+        let tile = match ctx.tiles.get(tile_idx) {
+            Some(t) => t,
+            None => break,
+        };
+        let start = tile.data_offset as usize;
+        let end = start + tile.data_length as usize;
+        if end > ctx.file.len() {
+            continue;
+        }
+        let hvcc = if !tile.hvcc.is_empty() {
+            &tile.hvcc
+        } else {
+            ctx.fallback_hvcc
+        };
+        if hvcc.is_empty() {
+            continue;
+        }
+        let (yuv, _) = match decode_hevc_item(&ctx.file[start..end], hvcc) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let dst_x = col * ctx.tile_w;
+        let copy_w = ctx.tile_w.min(ctx.out_w.saturating_sub(dst_x));
+        let copy_h = ctx.tile_h.min(ctx.out_h.saturating_sub(dst_y_base));
+        if copy_w == 0 || copy_h == 0 {
+            continue;
+        }
+
+        let tile_buf = yuv::yuv_to_rgb_with_color(&yuv, ctx.tile_w, ctx.tile_h, ctx.color_enc);
+        let src = match pick(&tile_buf) {
+            Some(s) => s,
+            None => continue, // depth mismatch — shouldn't happen within one grid
+        };
+        let ch = ctx.channels;
+        for y in 0..copy_h {
+            let s = y * ctx.tile_w * ch;
+            let d = (y * ctx.out_w + dst_x) * ch;
+            band[d..d + copy_w * ch].copy_from_slice(&src[s..s + copy_w * ch]);
+        }
+    }
+}
+
+/// Allocate the output plane and fill each of the `rows` horizontal bands.
+fn fill_grid_bands<T: Copy + Default + Send>(
+    decoder: &Decoder,
+    total: usize,
+    rows: usize,
+    band_stride: usize,
+    ctx: &GridCtx<'_>,
+    pick: &(dyn Fn(&ImageBuffer) -> Option<&[T]> + Sync),
+) -> Vec<T> {
+    let pool = decoder.pool();
+    if pool.threads() > 1 && rows > 1 {
+        let dm = threadpool::DisjointMut::new(vec![T::default(); total]);
+        threadpool::parallel_for(pool, rows, |r| {
+            let lo = r * band_stride;
+            let hi = ((r + 1) * band_stride).min(total);
+            if lo >= hi {
+                return;
+            }
+            let mut band = dm.slice_mut(lo..hi);
+            stitch_grid_band(ctx, r, &mut band, pick);
+        });
+        return dm.into_inner();
+    }
+
+    // Serial path — used for single-threaded pools or single-band images, where
+    // dispatching to the pool would only add overhead.
+    let mut out = vec![T::default(); total];
+    for r in 0..rows {
+        let lo = r * band_stride;
+        let hi = ((r + 1) * band_stride).min(total);
+        if lo >= hi {
+            continue;
+        }
+        stitch_grid_band(ctx, r, &mut out[lo..hi], pick);
+    }
+    out
+}
+
 /// Decode a tiled (grid) HEIC: decode each tile independently then stitch.
 fn decode_grid(
+    decoder: &Decoder,
     file: &[u8],
     grid: &heif::GridInfo,
     heif_file: &heif::HeifFile,
@@ -536,6 +797,7 @@ fn decode_grid(
             "grid has zero size or no tiles".into(),
         ));
     }
+    decoder.check_dims(out_w, out_h)?;
 
     let cols = grid.cols as usize;
     let rows = grid.rows as usize;
@@ -606,7 +868,7 @@ fn decode_grid(
         };
         if let Ok((sps, _)) = config::parse_hvcc_full(hvcc_ref) {
             Cicp {
-                primaries: Primaries::from_u8(sps.colour_primaries),
+                primaries: Primaries::from_u8(sps.color_primaries),
                 transfer: TransferFunction::from_u8(sps.transfer_characteristics),
                 matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
                 full_range: sps.video_full_range,
@@ -625,11 +887,11 @@ fn decode_grid(
         config::parse_hvcc_full(hvcc_ref)
             .ok()
             .map(|(sps, _)| match sps.bit_depth_luma {
-                10 => fmt::BitDepth::Ten,
-                12 => fmt::BitDepth::Twelve,
-                _ => fmt::BitDepth::Eight,
+                10 => BitDepth::Ten,
+                12 => BitDepth::Twelve,
+                _ => BitDepth::Eight,
             })
-            .unwrap_or(fmt::BitDepth::Eight)
+            .unwrap_or(BitDepth::Eight)
     };
 
     let is_mono = {
@@ -644,85 +906,64 @@ fn decode_grid(
             .unwrap_or(false)
     };
 
-    let mut out_buf = match (bit_depth == BitDepth::Eight, is_mono) {
-        (true, false) => ImageBuffer::Rgb8(vec![0u8; out_w * out_h * 3]),
-        (false, false) => ImageBuffer::Rgb16(vec![0u16; out_w * out_h * 3]),
-        (true, true) => ImageBuffer::Luma8(vec![0u8; out_w * out_h]),
-        (false, true) => ImageBuffer::Luma16(vec![0u16; out_w * out_h]),
+    let channels = if is_mono { 1 } else { 3 };
+
+    // Bundle everything a band needs so the (possibly parallel) worker closures
+    // stay small and capture only a shared `&`.
+    let ctx = GridCtx {
+        file,
+        tiles: &grid.tiles,
+        fallback_hvcc: &fallback_hvcc,
+        color_enc: &color_enc,
+        cols,
+        out_w,
+        out_h,
+        tile_w,
+        tile_h,
+        channels,
     };
 
-    for (tile_idx, tile) in grid.tiles.iter().enumerate() {
-        let col = tile_idx % cols;
-        let row = tile_idx / cols;
-        if row >= rows {
-            break;
-        }
+    // Rows are split into `rows` horizontal bands; band `r` owns the contiguous
+    // output range `[r*band_stride, (r+1)*band_stride)`. Bands are disjoint, so
+    // they can be filled concurrently. The `pick` closure selects the source
+    // samples of the matching depth from each per-tile RGB/luma buffer.
+    let band_stride = tile_h * out_w * channels;
 
-        let start = tile.data_offset as usize;
-        let end = start + tile.data_length as usize;
-        if end > file.len() {
-            continue;
-        }
-
-        let hvcc = if !tile.hvcc.is_empty() {
-            &tile.hvcc
+    let out_buf = if bit_depth == BitDepth::Eight {
+        let v = fill_grid_bands::<u8>(
+            decoder,
+            out_w * out_h * channels,
+            rows,
+            band_stride,
+            &ctx,
+            &|b| match b {
+                ImageBuffer::Rgb8(s) | ImageBuffer::Luma8(s) => Some(s.as_slice()),
+                _ => None,
+            },
+        );
+        if is_mono {
+            ImageBuffer::Luma8(v)
         } else {
-            &fallback_hvcc
-        };
-        if hvcc.is_empty() {
-            continue;
+            ImageBuffer::Rgb8(v)
         }
-
-        let (yuv, _) = match decode_hevc_item(&file[start..end], hvcc) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let dst_x = col * tile_w;
-        let dst_y = row * tile_h;
-        let copy_w = tile_w.min(out_w.saturating_sub(dst_x));
-        let copy_h = tile_h.min(out_h.saturating_sub(dst_y));
-        if copy_w == 0 || copy_h == 0 {
-            continue;
+    } else {
+        let v = fill_grid_bands::<u16>(
+            decoder,
+            out_w * out_h * channels,
+            rows,
+            band_stride,
+            &ctx,
+            &|b| match b {
+                ImageBuffer::Rgb16(s) | ImageBuffer::Luma16(s) => Some(s.as_slice()),
+                _ => None,
+            },
+        );
+        if is_mono {
+            ImageBuffer::Luma16(v)
+        } else {
+            ImageBuffer::Rgb16(v)
         }
-
-        let tile_buf = yuv::yuv_to_rgb_with_color(&yuv, tile_w, tile_h, &color_enc);
-
-        // Copy this tile into the output buffer.  Both tile and output share
-        // the same depth (guaranteed by decoding from the same SPS), so the
-        // variants always match.
-        match (&tile_buf, &mut out_buf) {
-            (ImageBuffer::Rgb8(src), ImageBuffer::Rgb8(dst)) => {
-                for y in 0..copy_h {
-                    let s = y * tile_w * 3;
-                    let d = ((dst_y + y) * out_w + dst_x) * 3;
-                    dst[d..d + copy_w * 3].copy_from_slice(&src[s..s + copy_w * 3]);
-                }
-            }
-            (ImageBuffer::Rgb16(src), ImageBuffer::Rgb16(dst)) => {
-                for y in 0..copy_h {
-                    let s = y * tile_w * 3;
-                    let d = ((dst_y + y) * out_w + dst_x) * 3;
-                    dst[d..d + copy_w * 3].copy_from_slice(&src[s..s + copy_w * 3]);
-                }
-            }
-            (ImageBuffer::Luma8(src), ImageBuffer::Luma8(dst)) => {
-                for y in 0..copy_h {
-                    let s = y * tile_w;
-                    let d = (dst_y + y) * out_w + dst_x;
-                    dst[d..d + copy_w].copy_from_slice(&src[s..s + copy_w]);
-                }
-            }
-            (ImageBuffer::Luma16(src), ImageBuffer::Luma16(dst)) => {
-                for y in 0..copy_h {
-                    let s = y * tile_w;
-                    let d = (dst_y + y) * out_w + dst_x;
-                    dst[d..d + copy_w].copy_from_slice(&src[s..s + copy_w]);
-                }
-            }
-            _ => {} // depth mismatch — skip (shouldn't happen within one grid)
-        }
-    }
+    };
 
     let (width, height, buf2, _alpha) =
         apply_orientation(out_w as u32, out_h as u32, out_buf, None, grid.orientation);
@@ -744,13 +985,21 @@ fn decode_grid(
     })
 }
 
-/// Decode to 8-bit-per-channel RGB `Vec<u8>` (always 3 bytes/pixel).
-/// Monochrome images are expanded to gray RGB. Zero-copy for 8-bit colour sources.
+/// Decode to 8-bit-per-channel RGB `Vec<u8>` (always 3 bytes/pixel) using a
+/// default [`Decoder`]. Monochrome images are expanded to gray RGB. Zero-copy
+/// for 8-bit color sources.
 pub fn decode_heic_rgb8(file: &[u8]) -> Result<(Vec<u8>, u32, u32), DecodeError> {
-    let img = decode_heic(file)?;
+    Decoder::default().decode_rgb8(file)
+}
+
+pub(crate) fn decode_heic_rgb8_with(
+    decoder: &Decoder,
+    file: &[u8],
+) -> Result<(Vec<u8>, u32, u32), DecodeError> {
+    let img = decode_heic_with(decoder, file)?;
     let shift = img.bit_depth.minus8();
     let pixels = match img.pixels {
-        ImageBuffer::Rgb8(v) => v, // 8-bit colour: direct move
+        ImageBuffer::Rgb8(v) => v, // 8-bit color: direct move
         ImageBuffer::Rgb16(v) => v.into_iter().map(|x| (x >> shift) as u8).collect(),
         ImageBuffer::Luma8(v) => v.into_iter().flat_map(|l| [l, l, l]).collect(),
         ImageBuffer::Luma16(v) => v

@@ -147,7 +147,7 @@ impl ChromaFormat {
 ///
 /// Variants encode both bit depth and channel count:
 /// - `Luma8` / `Luma16` — monochrome (4:0:0); one sample per pixel.
-/// - `U8` / `U16`       — colour (4:2:0/2:2/4:4:4); R₀G₀B₀ R₁G₁B₁ … interleaved.
+/// - `U8` / `U16`       — color (4:2:0/2:2/4:4:4); R₀G₀B₀ R₁G₁B₁ … interleaved.
 #[derive(Clone, Debug)]
 pub enum ImageBuffer {
     Luma8(Vec<u8>),   // 8-bit grayscale

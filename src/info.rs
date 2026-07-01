@@ -56,7 +56,7 @@ pub struct ImageInfo {
     pub bit_depth: BitDepth,
     /// Chroma subsampling of the coded image (4:0:0 / 4:2:0 / 4:2:2 / 4:4:4).
     pub chroma: ChromaFormat,
-    /// Colour metadata (CICP code points and/or ICC profile) from the container.
+    /// color metadata (CICP code points and/or ICC profile) from the container.
     pub color: ColorMetadata,
     /// Display orientation (`irot` / `imir`). `Normal` means the stored pixels
     /// are already upright.
@@ -102,9 +102,18 @@ impl ImageInfo {
     }
 }
 
-/// Read image metadata from a HEIF/HEIC file without decoding pixels.
+/// Read image metadata from a HEIF/HEIC file without decoding pixels, using
+/// default [`crate::ParseLimits`].
 pub fn read_heic_info(file: &[u8]) -> Result<ImageInfo, DecodeError> {
-    let heif = heif::parse(file)?;
+    read_heic_info_with_limits(file, &crate::limits::ParseLimits::default())
+}
+
+/// Read image metadata under caller-supplied parse limits.
+pub fn read_heic_info_with_limits(
+    file: &[u8],
+    limits: &crate::limits::ParseLimits,
+) -> Result<ImageInfo, DecodeError> {
+    let heif = heif::parse(file, limits)?;
 
     let (coded_w, coded_h, orientation, hvcc): (u32, u32, Orientation, &[u8]) =
         if let Some(grid) = &heif.grid {
@@ -206,7 +215,7 @@ mod tests {
 
     #[test]
     fn alpha_adds_one_plane() {
-        // 4:4:4 8-bit with alpha = 3 colour + 1 alpha planes = 32 bpp.
+        // 4:4:4 8-bit with alpha = 3 color + 1 alpha planes = 32 bpp.
         assert_eq!(
             info(ChromaFormat::Yuv444, BitDepth::Eight, true).bits_per_pixel(),
             32.0

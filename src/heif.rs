@@ -29,6 +29,7 @@
 
 use crate::color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 use crate::error::DecodeError;
+use crate::limits::ParseLimits;
 use crate::metadata::{CleanAperture, ContentLightLevel, Orientation, PixelAspectRatio};
 
 /// Parsed image item — enough to decode one HEIF image item.
@@ -44,7 +45,7 @@ pub(crate) struct HeifItem {
     /// Declared display dimensions from ispe.
     pub(crate) display_w: u32,
     pub(crate) display_h: u32,
-    /// Colour metadata.
+    /// color metadata.
     pub(crate) color: ColorMetadata,
     pub(crate) orientation: Orientation,
     pub(crate) cll: Option<ContentLightLevel>,
@@ -105,11 +106,19 @@ fn read_u64(b: &[u8], off: usize) -> Option<u64> {
 struct Boxes<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Reject any box whose declared size exceeds this many bytes. `u64::MAX`
+    /// disables the cap (used where a limit is not threaded through).
+    max_box_size: u64,
 }
 
 impl<'a> Boxes<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Boxes { data, pos: 0 }
+    /// Like [`Boxes::new`] but rejects boxes larger than `max_box_size` bytes.
+    fn with_limit(data: &'a [u8], max_box_size: u64) -> Self {
+        Boxes {
+            data,
+            pos: 0,
+            max_box_size,
+        }
     }
 }
 
@@ -128,6 +137,11 @@ impl<'a> Iterator for Boxes<'a> {
         if size < 8 || self.pos + size > self.data.len() {
             return None;
         }
+        // Granular box-size limit: a box claiming to be larger than the
+        // configured cap is treated as invalid and stops iteration.
+        if size as u64 > self.max_box_size {
+            return None;
+        }
         let fourcc: [u8; 4] = self.data[self.pos + 4..self.pos + 8].try_into().ok()?;
         let payload = &self.data[self.pos + 8..self.pos + size];
         self.pos += size;
@@ -144,10 +158,11 @@ fn fullbox_header(payload: &[u8]) -> Option<(u8, u32, &[u8])> {
     Some((version, flags, &payload[4..]))
 }
 
-pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
+pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, DecodeError> {
+    let mbs = limits.max_box_size;
     // Verify ftyp
     let mut has_heic = false;
-    for b in Boxes::new(file) {
+    for b in Boxes::with_limit(file, mbs) {
         if &b.fourcc == b"ftyp" {
             let brands: Vec<_> = b
                 .payload
@@ -165,7 +180,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
     }
 
     // Find meta box
-    let meta_payload = Boxes::new(file)
+    let meta_payload = Boxes::with_limit(file, mbs)
         .find(|b| &b.fourcc == b"meta")
         .map(|b| b.payload)
         .ok_or(DecodeError::MissingBox("meta"))?;
@@ -184,7 +199,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
     // Track `idat` so we can resolve construction_method=1 iloc entries.
     let mut idat_file_offset: u64 = 0;
 
-    for b in Boxes::new(meta) {
+    for b in Boxes::with_limit(meta, mbs) {
         match &b.fourcc {
             b"pitm" => {
                 if let Some((_, _, rest)) = fullbox_header(b.payload) {
@@ -211,13 +226,13 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
     // Parse iloc: collect (item_id → (absolute_file_offset, length))
     let mut extents: std::collections::HashMap<u16, (u64, u64)> = std::collections::HashMap::new();
     if let Some((version, _, rest)) = iloc_data.and_then(fullbox_header) {
-        parse_iloc(rest, version, idat_file_offset, &mut extents);
+        parse_iloc(rest, version, idat_file_offset, &mut extents, limits);
     }
 
     // Parse iinf: item types
     let mut item_types: std::collections::HashMap<u16, [u8; 4]> = std::collections::HashMap::new();
     if let Some((_, _, rest)) = iinf_data.and_then(fullbox_header) {
-        let count = read_u16(rest, 0).unwrap_or(0) as usize;
+        let count = (read_u16(rest, 0).unwrap_or(0) as usize).min(limits.max_items);
         let mut pos = 2usize;
         for _ in 0..count {
             if pos + 8 > rest.len() {
@@ -274,7 +289,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
 
     // Parse iprp: extract properties per item
     let (props, prop_assoc) = if let Some(iprp) = iprp_data {
-        parse_iprp(iprp)
+        parse_iprp(iprp, limits)
     } else {
         (vec![], std::collections::HashMap::new())
     };
@@ -286,7 +301,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
     // Build primary and optional grid.
     // For grid files `primary` is the first tile so single-image code still works.
     let (primary, grid) = if is_grid {
-        let g = parse_grid_item(pitm, &extents, &dimg_map, &props, &prop_assoc, file);
+        let g = parse_grid_item(pitm, &extents, &dimg_map, &props, &prop_assoc, file, limits)?;
         let first = g
             .tiles
             .first()
@@ -294,7 +309,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
             .unwrap_or_else(|| build_fallback_item(pitm));
         (first, Some(g))
     } else {
-        let p = build_item(pitm, &extents, &props, &prop_assoc, false, file)?;
+        let p = build_item(pitm, &extents, &props, &prop_assoc, false, file, limits)?;
         (p, None)
     };
     // Among all auxiliary items, keep only the one whose `auxC` type is genuine
@@ -305,7 +320,7 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
         .copied()
         .find(|&id| item_is_alpha(id, &props, &prop_assoc));
     let alpha = if let Some(aid) = alpha_item {
-        build_item(aid, &extents, &props, &prop_assoc, true, file).ok()
+        build_item(aid, &extents, &props, &prop_assoc, true, file, limits).ok()
     } else {
         None
     };
@@ -316,6 +331,14 @@ pub(crate) fn parse(file: &[u8]) -> Result<HeifFile, DecodeError> {
             let sum = off.saturating_add(len);
             let start = off as usize;
             let end = sum as usize;
+            // Enforce the EXIF size cap (len includes the 4-byte header prefix).
+            if len.saturating_sub(4) > limits.max_exif_size as u64 {
+                return Err(DecodeError::LimitExceeded {
+                    what: "exif payload",
+                    value: len.saturating_sub(4),
+                    limit: limits.max_exif_size as u64,
+                });
+            }
             if sum <= file.len() as u64 && len > 4 {
                 let raw = &file[start + 4..end];
                 Some(raw.to_vec())
@@ -342,6 +365,7 @@ fn parse_iloc(
     version: u8,
     idat_file_offset: u64,
     out: &mut std::collections::HashMap<u16, (u64, u64)>,
+    limits: &ParseLimits,
 ) {
     if data.len() < 4 {
         return;
@@ -360,8 +384,8 @@ fn parse_iloc(
         (read_u16(data, 2).unwrap_or(0) as usize, 4usize)
     };
     // Cap item_count to avoid O(N) loops on malformed data where pos never
-    // advances (e.g. all sizes are 0).
-    let item_count = item_count.min(4096);
+    // advances (e.g. all sizes are 0), and to honour the configured limit.
+    let item_count = item_count.min(limits.max_items);
     for _ in 0..item_count {
         if pos >= data.len() {
             break;
@@ -390,7 +414,7 @@ fn parse_iloc(
         pos += base_offset_size;
         let extent_count = read_u16(data, pos).unwrap_or(0);
         pos += 2;
-        let extent_count = extent_count.min(64); // sanity cap
+        let extent_count = (extent_count as usize).min(limits.max_extents_per_item);
         for _ in 0..extent_count {
             if pos >= data.len() {
                 break;
@@ -435,13 +459,22 @@ struct Prop {
     data: Vec<u8>,
 }
 
-fn parse_iprp(iprp: &[u8]) -> (Vec<Prop>, std::collections::HashMap<u16, Vec<u8>>) {
+fn parse_iprp(
+    iprp: &[u8],
+    limits: &ParseLimits,
+) -> (Vec<Prop>, std::collections::HashMap<u16, Vec<u8>>) {
     let mut props: Vec<Prop> = vec![Prop::default()]; // 1-indexed
     let mut assoc: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
+    let mbs = limits.max_box_size;
 
-    for b in Boxes::new(iprp) {
+    for b in Boxes::with_limit(iprp, mbs) {
         if &b.fourcc == b"ipco" {
-            for pb in Boxes::new(b.payload) {
+            for pb in Boxes::with_limit(b.payload, mbs) {
+                // Bound the number of properties we accumulate; treat max_items
+                // as the ceiling since each item can associate several.
+                if props.len() >= limits.max_items.saturating_mul(4).max(64) {
+                    break;
+                }
                 props.push(Prop {
                     kind: pb.fourcc,
                     data: pb.payload.to_vec(),
@@ -566,7 +599,8 @@ fn parse_grid_item(
     props: &[Prop],
     prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
     file: &[u8],
-) -> GridInfo {
+    limits: &ParseLimits,
+) -> Result<GridInfo, DecodeError> {
     // Read the grid descriptor blob
     let (rows, cols, ow, oh) = if let Some(&(off, len)) = extents.get(&grid_id) {
         let start = off as usize;
@@ -611,11 +645,26 @@ fn parse_grid_item(
         (1, 1, 0, 0)
     };
 
-    // Build a HeifItem for each tile (in row-major order from dimg references)
-    let tile_ids = dimg_map.get(&grid_id).cloned().unwrap_or_default();
+    // Reject oversized grid geometry up front (image-size limit).
+    limits.check_image(ow, oh)?;
+
+    // Build a HeifItem for each tile (in row-major order from dimg references),
+    // capping the number of tiles enumerated.
+    let mut tile_ids = dimg_map.get(&grid_id).cloned().unwrap_or_default();
+    if tile_ids.len() > limits.max_tiles {
+        return Err(DecodeError::LimitExceeded {
+            what: "grid tiles",
+            value: tile_ids.len() as u64,
+            limit: limits.max_tiles as u64,
+        });
+    }
+    // A grid never needs more tiles than rows*cols; drop any stragglers so a
+    // bogus dimg list can't inflate work beyond the declared layout.
+    let max_needed = (rows as usize).saturating_mul(cols as usize);
+    tile_ids.truncate(max_needed);
     let tiles: Vec<HeifItem> = tile_ids
         .iter()
-        .filter_map(|&tid| build_item(tid, extents, props, prop_assoc, false, file).ok())
+        .filter_map(|&tid| build_item(tid, extents, props, prop_assoc, false, file, limits).ok())
         .collect();
 
     // Read the grid item's orientation directly from its ipma/ipco associations.
@@ -623,14 +672,14 @@ fn parse_grid_item(
     // and build_item() returns Err for items without hvcC.
     let orientation = read_item_orientation(grid_id, props, prop_assoc);
 
-    GridInfo {
+    Ok(GridInfo {
         rows,
         cols,
         output_width: ow,
         output_height: oh,
         tiles,
         orientation,
-    }
+    })
 }
 
 /// A zeroed-out placeholder HeifItem used when a tile or grid item is missing.
@@ -659,11 +708,21 @@ fn build_item(
     prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
     is_alpha: bool,
     _file: &[u8],
+    limits: &ParseLimits,
 ) -> Result<HeifItem, DecodeError> {
     let &(offset, length) = extents
         .get(&item_id)
         .ok_or(DecodeError::MissingBox("iloc entry for item"))?;
 
+    // Tag/data-size limit: reject an item whose declared coded size is absurd
+    // before anyone tries to slice the file with it.
+    if length > limits.max_item_size {
+        return Err(DecodeError::LimitExceeded {
+            what: "item data size",
+            value: length,
+            limit: limits.max_item_size,
+        });
+    }
     let mut hvcc = Vec::new();
     let mut display_w = 0u32;
     let mut display_h = 0u32;
@@ -681,11 +740,22 @@ fn build_item(
             }
             let p = &props[pidx];
             match &p.kind {
-                b"hvcC" => hvcc = p.data.clone(),
+                b"hvcC" => {
+                    if p.data.len() > limits.max_hvcc_size {
+                        return Err(DecodeError::LimitExceeded {
+                            what: "hvcC size",
+                            value: p.data.len() as u64,
+                            limit: limits.max_hvcc_size as u64,
+                        });
+                    }
+                    hvcc = p.data.clone();
+                }
                 b"ispe" => {
                     if p.data.len() >= 12 {
                         display_w = read_u32(&p.data, 4).unwrap_or(0);
                         display_h = read_u32(&p.data, 8).unwrap_or(0);
+                        // Reject oversized declared geometry at parse time.
+                        limits.check_image(display_w, display_h)?;
                     }
                 }
                 b"colr" => {
@@ -814,5 +884,56 @@ fn imir_to_orientation(axis: u8, prev: Orientation) -> Orientation {
         (Orientation::Normal, 0) => Orientation::FlipH, // vertical axis
         (Orientation::Normal, 1) => Orientation::FlipV, // horizontal axis
         _ => prev,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build one ISOBMFF box: 4-byte big-endian size, 4-byte fourcc, `payload`.
+    fn boxed(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = 8 + payload.len();
+        let mut v = (size as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(fourcc);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn box_size_limit_stops_iteration() {
+        // First box is 12 bytes; with a 10-byte cap it is rejected immediately.
+        let data = boxed(b"ftyp", b"heic"); // 8 + 4 = 12 bytes
+        let seen: Vec<_> = Boxes::with_limit(&data, 10).collect();
+        assert!(seen.is_empty(), "oversized box should be rejected");
+        // With a generous cap the same box is accepted.
+        let seen2: Vec<_> = Boxes::with_limit(&data, 4096).collect();
+        assert_eq!(seen2.len(), 1);
+    }
+
+    #[test]
+    fn non_heif_input_is_rejected() {
+        let limits = ParseLimits::default();
+        let junk = boxed(b"ftyp", b"mp42");
+        assert!(matches!(parse(&junk, &limits), Err(DecodeError::NotHeif)));
+    }
+
+    #[test]
+    fn item_size_limit_rejects_large_item() {
+        // build_item should reject an item whose iloc length exceeds the cap.
+        let mut limits = ParseLimits::default();
+        limits.max_item_size = 100;
+        let mut extents = std::collections::HashMap::new();
+        extents.insert(1u16, (0u64, 200u64)); // 200 > 100
+        let props: Vec<Prop> = vec![Prop::default()];
+        let assoc = std::collections::HashMap::new();
+        let r = build_item(1, &extents, &props, &assoc, false, &[], &limits);
+        assert!(matches!(
+            r,
+            Err(DecodeError::LimitExceeded {
+                what: "item data size",
+                ..
+            })
+        ));
     }
 }

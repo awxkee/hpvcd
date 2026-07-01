@@ -67,10 +67,10 @@ pub(crate) static TRANS_IDX_LPS: [u8; 64] = [
 
 /// CABAC decoder. Feed it EBSP-unescaped slice payload bytes.
 /// Initialises by consuming 9 seed bits.
-pub(crate) struct CabacDecoder<'a> {
+pub(crate) struct CabacDecoder {
     pub(crate) range: u32,
     pub(crate) offset: u32,
-    data: &'a [u8],
+    data: Box<[u8]>,
     /// Index of the next byte in `data` not yet loaded into `bitbuf`.
     pub(crate) byte_pos: usize,
     /// Bit reservoir, left-aligned: the next bit to consume is bit 63.
@@ -79,8 +79,8 @@ pub(crate) struct CabacDecoder<'a> {
     bitcnt: u32,
 }
 
-impl<'a> CabacDecoder<'a> {
-    pub(crate) fn new(data: &'a [u8]) -> Result<Self, crate::error::DecodeError> {
+impl CabacDecoder {
+    pub(crate) fn new(data: &[u8]) -> Result<Self, crate::error::DecodeError> {
         if data.len() < 2 {
             return Err(crate::error::DecodeError::Bitstream(
                 "CABAC payload too short to initialise".into(),
@@ -89,13 +89,31 @@ impl<'a> CabacDecoder<'a> {
         let mut dec = CabacDecoder {
             range: 510,
             offset: 0,
-            data,
+            data: data.into(),
             byte_pos: 0,
             bitbuf: 0,
             bitcnt: 0,
         };
         dec.offset = dec.read_bits(9);
         Ok(dec)
+    }
+
+    /// Reset the engine onto a new byte buffer (e.g. the next slice segment's
+    /// CABAC data) and prime it, reusing this decoder instance.
+    pub(crate) fn reset_with(&mut self, data: &[u8]) -> Result<(), crate::error::DecodeError> {
+        if data.len() < 2 {
+            return Err(crate::error::DecodeError::Bitstream(
+                "CABAC payload too short to initialise".into(),
+            ));
+        }
+        self.data = data.into();
+        self.range = 510;
+        self.offset = 0;
+        self.byte_pos = 0;
+        self.bitbuf = 0;
+        self.bitcnt = 0;
+        self.offset = self.read_bits(9);
+        Ok(())
     }
 
     /// Refill the reservoir with whole bytes until at least 56 bits are buffered
@@ -206,7 +224,7 @@ impl<'a> CabacDecoder<'a> {
     }
 }
 
-impl<'a> CabacDecoder<'a> {
+impl CabacDecoder {
     /// Byte-align: discard buffered bits so the next read starts on a byte
     /// boundary (WPP). The raw bit-reader position (bits consumed from `data`)
     /// is `byte_pos*8 - bitcnt`; rounding that up to the next byte boundary

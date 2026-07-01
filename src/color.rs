@@ -210,11 +210,11 @@ impl Default for Cicp {
     }
 }
 
-/// Combined colour metadata from a HEIF item.
+/// Combined color metadata from a HEIF item.
 ///
 /// Both `cicp` and `icc` can be present simultaneously — Apple HEIC files
 /// typically include an `nclx` box for YCbCr parameters and a `prof`/`rICC`
-/// box for display colour management.
+/// box for display color management.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ColorMetadata {
     /// CICP code points from an `nclx` `colr` box.

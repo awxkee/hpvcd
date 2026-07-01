@@ -35,7 +35,7 @@ use crate::fmt::{BitDepth, ChromaFormat};
 pub(crate) struct Sps {
     pub(crate) chroma_idc: u8,
     pub(crate) chroma: ChromaFormat,
-    pub(crate) separate_colour_plane: bool,
+    pub(crate) separate_color_plane: bool,
     pub(crate) width: u32,
     pub(crate) height: u32,
     /// Conformance-window crop offsets in *luma* samples (left, right, top, bottom).
@@ -62,14 +62,14 @@ pub(crate) struct Sps {
     pub(crate) _pcm_loop_filter_disabled: bool,
     pub(crate) strong_intra_smoothing: bool,
     pub(crate) video_full_range: bool,
-    pub(crate) colour_primaries: u8, // ISO/IEC 23091-2 Table 2; 2 = unspecified
+    pub(crate) color_primaries: u8, // ISO/IEC 23091-2 Table 2; 2 = unspecified
     pub(crate) transfer_characteristics: u8, // ISO/IEC 23091-2 Table 3; 2 = unspecified
     pub(crate) matrix_coefficients: u8, // ISO/IEC 23091-2 Table 4; 2 = unspecified
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Pps {
-    pub(crate) _dependent_slice_segments_enabled: bool,
+    pub(crate) dependent_slice_segments_enabled: bool,
     pub(crate) output_flag_present: bool,
     pub(crate) num_extra_slice_header_bits: u32,
     pub(crate) sign_data_hiding_enabled: bool,
@@ -231,8 +231,8 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let _sps_id = r.read_ue().map_err(|_| e("sps_id"))?;
     let chroma_idc = r.read_ue().map_err(|_| e("chroma_idc"))? as u8;
-    let separate_colour_plane = if chroma_idc == 3 {
-        r.read_flag().map_err(|_| e("separate_colour_plane"))?
+    let separate_color_plane = if chroma_idc == 3 {
+        r.read_flag().map_err(|_| e("separate_color_plane"))?
     } else {
         false
     };
@@ -314,7 +314,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let strong_intra_smoothing = r.read_flag().map_err(|_| e("strong_intra_smoothing"))?;
     // VUI parameters — extract matrix_coefficients and video_full_range_flag.
     let mut video_full_range = false;
-    let mut colour_primaries = 2u8; // unspecified
+    let mut color_primaries = 2u8; // unspecified
     let mut transfer_characteristics = 2u8; // unspecified
     let mut matrix_coefficients = 2u8; // unspecified
     if r.read_flag().map_err(|_| e("vui_present"))? {
@@ -335,9 +335,9 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         if r.read_flag().map_err(|_| e("vst_present"))? {
             r.read_bits(3).map_err(|_| e("video_format"))?; // video_format
             video_full_range = r.read_flag().map_err(|_| e("full_range"))?;
-            // colour_description_present_flag
-            if r.read_flag().map_err(|_| e("colour_desc"))? {
-                colour_primaries = r.read_bits(8).map_err(|_| e("colour_primaries"))? as u8;
+            // color_description_present_flag
+            if r.read_flag().map_err(|_| e("color_desc"))? {
+                color_primaries = r.read_bits(8).map_err(|_| e("color_primaries"))? as u8;
                 transfer_characteristics = r.read_bits(8).map_err(|_| e("transfer_char"))? as u8;
                 matrix_coefficients = r.read_bits(8).map_err(|_| e("matrix_coeff"))? as u8;
             }
@@ -356,7 +356,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     Ok(Sps {
         chroma_idc,
         chroma,
-        separate_colour_plane,
+        separate_color_plane,
         width,
         height,
         crop_left,
@@ -382,7 +382,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         _pcm_loop_filter_disabled: pcm_loop_filter_disabled,
         strong_intra_smoothing,
         video_full_range,
-        colour_primaries,
+        color_primaries,
         transfer_characteristics,
         matrix_coefficients,
     })
@@ -453,7 +453,7 @@ pub(crate) fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let slice_segment_header_extension_present = r.read_flag().map_err(|_| e("slice_hdr_ext"))?;
 
     Ok(Pps {
-        _dependent_slice_segments_enabled: dependent_slice_segments_enabled,
+        dependent_slice_segments_enabled,
         output_flag_present,
         num_extra_slice_header_bits,
         sign_data_hiding_enabled,

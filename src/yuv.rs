@@ -52,7 +52,7 @@ pub(crate) struct YuvPlanes {
 /// Matrix coefficients supported (ISO/IEC 23091-2):
 /// * 1  – BT.709 (default for HD content)
 /// * 9  – BT.2020 NCL (HDR, recent iPhones)
-/// * 0  – Identity (GBR, no colour transform)
+/// * 0  – Identity (GBR, no color transform)
 /// * other – fall back to BT.709
 ///
 /// Output length = `dw * dh * 3`, each channel at `bit_depth`'s native scale.

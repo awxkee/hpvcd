@@ -48,8 +48,8 @@ struct SaoCtb {
     eo_class: [u8; 3],
 }
 
-pub(crate) struct FullDecoder<'a> {
-    cab: CabacDecoder<'a>,
+pub(crate) struct FullDecoder {
+    cab: CabacDecoder,
     ctx: ContextSet,
     ictx: IntraModeContexts,
     sps: Sps,
@@ -99,6 +99,17 @@ pub(crate) struct FullDecoder<'a> {
     sao_luma: bool,
     sao_chroma: bool,
 
+    // Slice-level chroma QP offsets, added to the PPS offsets during chroma QP
+    // derivation (§8.6.1).
+    slice_cb_qp_offset: i32,
+    slice_cr_qp_offset: i32,
+
+    // Effective per-slice deblocking state (PPS values unless the slice header
+    // overrode them).
+    deblocking_disabled: bool,
+    beta_offset_div2: i32,
+    tc_offset_div2: i32,
+
     sign_hiding: bool,
 
     // WPP context snapshots
@@ -116,19 +127,20 @@ pub(crate) struct FullDecoder<'a> {
     strong_smoothing: bool,
 }
 
-impl<'a> FullDecoder<'a> {
+impl FullDecoder {
     /// Maximum allowed dimension per axis and pixel count.
     pub(crate) const MAX_DIM: usize = 16_384;
     pub(crate) const MAX_PIXELS: usize = 64 * 1024 * 1024; // 64 MP
 
     pub(crate) fn new(
-        cabac: &'a [u8],
+        cabac: &[u8],
         sps: Sps,
         pps: Pps,
-        slice_qp: i32,
-        sao_luma: bool,
-        sao_chroma: bool,
+        hdr: &SliceHeader,
     ) -> Result<Self, DecodeError> {
+        let slice_qp = hdr.slice_qp;
+        let sao_luma = hdr.sao_luma;
+        let sao_chroma = hdr.sao_chroma;
         // Reject dimensions that would cause enormous allocations.
         let w = sps.width as usize;
         let h = sps.height as usize;
@@ -205,27 +217,75 @@ impl<'a> FullDecoder<'a> {
             ctb_rows,
             sao_luma,
             sao_chroma,
+            slice_cb_qp_offset: hdr.cb_qp_offset,
+            slice_cr_qp_offset: hdr.cr_qp_offset,
+            deblocking_disabled: hdr.deblocking_disabled,
+            beta_offset_div2: hdr.beta_offset_div2,
+            tc_offset_div2: hdr.tc_offset_div2,
             sign_hiding: pps.sign_data_hiding_enabled,
             wpp_ctx_snap: vec![None; ctb_rows],
             wpp_ictx_snap: vec![None; ctb_rows],
             scratch: intra::IntraScratch::new(),
             deq_scratch: vec![0i32; 1024],
             res_scratch: vec![0i32; 1024],
-            strong_smoothing: std::env::var("NOSTRONG").is_err(),
+            strong_smoothing: true,
             sps,
             pps,
         })
     }
 
-    pub(crate) fn decode(&mut self) -> Result<YuvPlanes, DecodeError> {
+    pub(crate) fn decode_segment(
+        &mut self,
+        cabac: &[u8],
+        hdr: &SliceHeader,
+    ) -> Result<(), DecodeError> {
+        self.cab.reset_with(cabac)?;
+        if !hdr.dependent_slice_segment {
+            // Independent segment: reset entropy contexts and slice-level state.
+            self.slice_qp = hdr.slice_qp;
+            self.qp_y_prev = hdr.slice_qp;
+            self.cur_qp = hdr.slice_qp;
+            self.cu_qp_delta_val = 0;
+            self.is_cu_qp_delta_coded = false;
+            self.sao_luma = hdr.sao_luma;
+            self.sao_chroma = hdr.sao_chroma;
+            self.slice_cb_qp_offset = hdr.cb_qp_offset;
+            self.slice_cr_qp_offset = hdr.cr_qp_offset;
+            self.deblocking_disabled = hdr.deblocking_disabled;
+            self.beta_offset_div2 = hdr.beta_offset_div2;
+            self.tc_offset_div2 = hdr.tc_offset_div2;
+            let qp = hdr.slice_qp.clamp(0, 51) as u8;
+            self.ctx = ContextSet::init_islice(qp);
+            self.ictx = IntraModeContexts::init_islice(qp);
+        } else {
+            // Dependent segment inherits contexts/state; only the QP predictor
+            // resets at the segment's first quantization group (handled by the
+            // QG logic), so continue with the retained context.
+        }
+        self.decode_slice(hdr.slice_segment_address)
+    }
+
+    /// Reconstruct CTBs starting at raster address `start_ctb`, stopping at the
+    /// slice's `end_of_slice_segment_flag`. Does not run loop filters — call
+    /// [`finish`] once, after all segments of the picture are decoded.
+    pub(crate) fn decode_slice(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
         let ctb = 1usize << self.log2_ctb;
         let wpp = self.pps.entropy_coding_sync_enabled;
+        let total = self.ctb_cols * self.ctb_rows;
+        let start_ctb = start_ctb.min(total);
 
-        for ry in 0..self.ctb_rows {
+        let start_ry = start_ctb.checked_div(self.ctb_cols).unwrap_or(0);
+        let start_rx0 = if self.ctb_cols == 0 {
+            0
+        } else {
+            start_ctb % self.ctb_cols
+        };
+
+        for ry in start_ry..self.ctb_rows {
             // WPP: at start of every non-first row, restore saved contexts and
             // reinitialize the CABAC engine from the current stream position
             // (which the previous row's sub-stream end already byte-aligned to).
-            if wpp && ry > 0 {
+            if wpp && ry > start_ry {
                 if let (Some(ctx), Some(ictx)) = (
                     self.wpp_ctx_snap[ry - 1].take(),
                     self.wpp_ictx_snap[ry - 1].take(),
@@ -236,7 +296,12 @@ impl<'a> FullDecoder<'a> {
                 self.cab.reinit_engine();
             }
 
-            for rx in 0..self.ctb_cols {
+            // Only the first row of this segment starts at its column offset;
+            // subsequent rows start at column 0.
+            let rx_start = if ry == start_ry { start_rx0 } else { 0 };
+
+            let mut terminated = false;
+            for rx in rx_start..self.ctb_cols {
                 if self.sps.sao_enabled {
                     self.parse_sao(rx, ry);
                 }
@@ -251,10 +316,14 @@ impl<'a> FullDecoder<'a> {
 
                 let end = self.cab.decode_terminate();
                 if end != 0 {
-                    // end_of_slice_segment_flag (or end_of_sub_stream if WPP
-                    // miscounted) — just finish gracefully.
+                    // end_of_slice_segment_flag: this slice segment is complete.
+                    terminated = true;
                     break;
                 }
+            }
+
+            if terminated {
+                break;
             }
 
             // WPP: after the last CTB of each non-final row, the stream contains
@@ -267,11 +336,22 @@ impl<'a> FullDecoder<'a> {
                 // Engine reinit happens at the top of the next loop iteration.
             }
         }
-        if self.sps.sao_enabled {
+        Ok(())
+    }
+
+    /// Apply in-loop filters (deblocking then SAO) over the fully-reconstructed
+    /// picture and return the planes. Call once, after all slice segments.
+    pub(crate) fn finish(&mut self) -> YuvPlanes {
+        // In-loop filters run in HEVC order: deblocking first, then SAO. They
+        // are independently gated: deblocking runs unless it is disabled (PPS or
+        // a slice-level override), while SAO runs only when the SPS enables it.
+        if !self.deblocking_disabled {
             self.apply_deblocking();
+        }
+        if self.sps.sao_enabled {
             self.apply_sao();
         }
-        Ok(YuvPlanes {
+        YuvPlanes {
             y: std::mem::take(&mut self.y),
             cb: std::mem::take(&mut self.cb),
             cr: std::mem::take(&mut self.cr),
@@ -279,7 +359,7 @@ impl<'a> FullDecoder<'a> {
             height: self.h,
             chroma: self.sps.chroma,
             bit_depth: self.sps.bit_depth().unwrap_or(BitDepth::Eight),
-        })
+        }
     }
 
     fn parse_sao(&mut self, rx: usize, ry: usize) {
@@ -399,9 +479,10 @@ impl<'a> FullDecoder<'a> {
             18,20,22,24,
         ];
 
-        // Slice-level offsets (default 0 for libheif)
-        let beta_offset = self.pps.beta_offset_div2 * 2;
-        let tc_offset = self.pps.tc_offset_div2 * 2;
+        // Slice-effective deblocking offsets (PPS values unless the slice
+        // header overrode them).
+        let beta_offset = self.beta_offset_div2 * 2;
+        let tc_offset = self.tc_offset_div2 * 2;
         // HEVC §8.7.2.3: table indices use QP′ = QP + QpBdOffset where
         // QpBdOffset = 6*(BitDepth−8).  For 8-bit this is 0; for 10-bit it's 12.
         let qp_bd_offset_y = 6 * (self.bd as i32 - 8);
@@ -1237,7 +1318,7 @@ fn mpm_list(mut cand_a: u8, cand_b: u8, y0: usize, log2_ctb: u32) -> [u8; 3] {
     }
 }
 
-impl<'a> FullDecoder<'a> {
+impl FullDecoder {
     #[allow(clippy::too_many_arguments)]
     fn transform_tree(
         &mut self,
@@ -1525,7 +1606,7 @@ fn chroma_scan(mode: u8, log2_ts: u32, is_444: bool) -> u8 {
     }
 }
 
-impl<'a> FullDecoder<'a> {
+impl FullDecoder {
     fn luma_avail(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
             return false;
@@ -1686,7 +1767,10 @@ impl<'a> FullDecoder<'a> {
         let n_tb = if idc == 2 { 2 } else { 1 };
         let scan = chroma_scan(mode, clog2, idc == 3);
 
-        let qp_cb = qpc(self.cur_qp + self.pps.cb_qp_offset, idc);
+        let qp_cb = qpc(
+            self.cur_qp + self.pps.cb_qp_offset + self.slice_cb_qp_offset,
+            idc,
+        );
         for (t, &cb) in cbf_cb[0..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cb {
@@ -1705,7 +1789,10 @@ impl<'a> FullDecoder<'a> {
                 self.predict_only_chroma(true, cx0, ty, cn, mode);
             }
         }
-        let qp_cr = qpc(self.cur_qp + self.pps.cr_qp_offset, idc);
+        let qp_cr = qpc(
+            self.cur_qp + self.pps.cr_qp_offset + self.slice_cr_qp_offset,
+            idc,
+        );
         for (t, &cr) in cbf_cr[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cr {
@@ -1919,24 +2006,100 @@ fn qpc(qpi: i32, chroma_idc: u8) -> i32 {
 
 // ── Top-level entry point for lib.rs ────────────────────────────────────────
 
+/// Parsed slice-segment header fields the reconstruction path needs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SliceHeader {
+    /// SliceQpY = init_qp + slice_qp_delta.
+    pub(crate) slice_qp: i32,
+    /// Per-slice SAO enable for luma / chroma.
+    pub(crate) sao_luma: bool,
+    pub(crate) sao_chroma: bool,
+    /// Byte offset in the RBSP where CABAC slice data begins.
+    pub(crate) cabac_offset: usize,
+    /// slice_cb_qp_offset / slice_cr_qp_offset (0 when not present). Added to the
+    /// PPS chroma offsets during chroma QP derivation.
+    pub(crate) cb_qp_offset: i32,
+    pub(crate) cr_qp_offset: i32,
+    /// Effective deblocking state for this slice: the PPS values unless the slice
+    /// header overrides them (`deblocking_filter_override_flag`).
+    pub(crate) deblocking_disabled: bool,
+    pub(crate) beta_offset_div2: i32,
+    pub(crate) tc_offset_div2: i32,
+    /// CTB raster address where this slice segment starts (0 for the first).
+    pub(crate) slice_segment_address: usize,
+    /// True when this is the first slice segment of the picture.
+    pub(crate) first_slice_in_pic: bool,
+    /// True for a dependent slice segment (inherits the previous segment's
+    /// header state and CABAC contexts rather than re-initialising).
+    pub(crate) dependent_slice_segment: bool,
+}
+
 /// Parse a slice header from the RBSP (after 2-byte NAL header has been consumed
 /// by the caller or is still in the byte slice — we consume it here).
-/// Returns (slice_qp, sao_luma, sao_chroma, cabac_byte_offset).
 pub(crate) fn parse_slice_header_full(
     rbsp: &[u8],
     sps: &crate::config::Sps,
     pps: &crate::config::Pps,
     nal_type: u8,
-) -> Result<(i32, bool, bool, usize), crate::error::DecodeError> {
+) -> Result<SliceHeader, crate::error::DecodeError> {
     let mut r = crate::bitreader::BitReader::new(rbsp);
     let e = |s: &'static str| crate::error::DecodeError::Bitstream(s.into());
     r.read_bits(16).map_err(|_| e("NAL header"))?; // consume 2-byte NAL header
-    let _first = r.read_flag().map_err(|_| e("first_slice"))?;
+    let first_slice = r.read_flag().map_err(|_| e("first_slice"))?;
     let is_irap = (16..=23).contains(&nal_type);
     if is_irap {
         r.read_flag().map_err(|_| e("no_prior_pics"))?;
     }
     let _pps_id = r.read_ue().map_err(|_| e("pps_id"))?;
+
+    // Number of CTBs in the picture, used to size slice_segment_address.
+    let ctb = 1usize << sps.log2_ctb;
+    let ctb_cols = (sps.width as usize).div_ceil(ctb);
+    let ctb_rows = (sps.height as usize).div_ceil(ctb);
+    let pic_size_in_ctbs = ctb_cols * ctb_rows;
+
+    let mut dependent_slice_segment = false;
+    let mut slice_segment_address = 0usize;
+    if !first_slice {
+        if pps.dependent_slice_segments_enabled {
+            dependent_slice_segment = r.read_flag().map_err(|_| e("dep_slice_flag"))?;
+        }
+        // slice_segment_address is Ceil(Log2(PicSizeInCtbsY)) bits.
+        let addr_bits = ceil_log2(pic_size_in_ctbs as u64);
+        slice_segment_address = r.read_bits(addr_bits).map_err(|_| e("slice_addr"))? as usize;
+    }
+
+    // A dependent slice segment inherits all header state from the preceding
+    // independent segment; its header carries only the (optional) extension and
+    // the byte-alignment. The reconstruction fields returned here are filled by
+    // the caller from the retained independent-segment header.
+    if dependent_slice_segment {
+        if pps.slice_segment_header_extension_present {
+            let l = r.read_ue().map_err(|_| e("ext_len"))?;
+            for _ in 0..l {
+                r.read_bits(8).map_err(|_| e("ext_byte"))?;
+            }
+        }
+        r.read_bit().map_err(|_| e("alignment_bit"))?;
+        while !r.bit_pos().is_multiple_of(8) {
+            r.read_bit().map_err(|_| e("alignment_pad"))?;
+        }
+        return Ok(SliceHeader {
+            slice_qp: pps.init_qp,
+            sao_luma: false,
+            sao_chroma: false,
+            cabac_offset: r.bit_pos() / 8,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
+            deblocking_disabled: pps.deblocking_filter_disabled,
+            beta_offset_div2: pps.beta_offset_div2,
+            tc_offset_div2: pps.tc_offset_div2,
+            slice_segment_address,
+            first_slice_in_pic: false,
+            dependent_slice_segment: true,
+        });
+    }
+
     for _ in 0..pps.num_extra_slice_header_bits {
         r.read_bit().map_err(|_| e("extra_bits"))?;
     }
@@ -1944,8 +2107,8 @@ pub(crate) fn parse_slice_header_full(
     if pps.output_flag_present {
         r.read_flag().map_err(|_| e("pic_output_flag"))?;
     }
-    if sps.separate_colour_plane {
-        r.read_bits(2).map_err(|_| e("colour_plane"))?;
+    if sps.separate_color_plane {
+        r.read_bits(2).map_err(|_| e("color_plane"))?;
     }
     let is_idr = nal_type == 19 || nal_type == 20;
     if !is_idr { /* skip poc/ref-pic-set — not for IDR */ }
@@ -1959,23 +2122,30 @@ pub(crate) fn parse_slice_header_full(
     }
     let slice_qp_delta = r.read_se().map_err(|_| e("qp_delta"))?;
     let slice_qp = pps.init_qp + slice_qp_delta;
+    // slice_cb_qp_offset / slice_cr_qp_offset (§7.3.6.1): added to the PPS-level
+    // offsets when deriving chroma QP. Previously parsed and dropped.
+    let mut cb_qp_offset = 0;
+    let mut cr_qp_offset = 0;
     if pps.slice_chroma_qp_offsets_present {
-        r.read_se().map_err(|_| e("cb_qp_off"))?;
-        r.read_se().map_err(|_| e("cr_qp_off"))?;
+        cb_qp_offset = r.read_se().map_err(|_| e("cb_qp_off"))?;
+        cr_qp_offset = r.read_se().map_err(|_| e("cr_qp_off"))?;
     }
+    // Deblocking: default to the PPS state, overridden per-slice if signalled.
+    let mut deblocking_disabled = pps.deblocking_filter_disabled;
+    let mut beta_offset_div2 = pps.beta_offset_div2;
+    let mut tc_offset_div2 = pps.tc_offset_div2;
     let mut deblock_override = false;
     if pps.deblocking_filter_override_enabled {
         deblock_override = r.read_flag().map_err(|_| e("deblock_override"))?;
     }
     if deblock_override {
-        let disabled = r.read_flag().map_err(|_| e("deblock_disabled"))?;
-        if !disabled {
-            r.read_se().map_err(|_| e("beta_off"))?;
-            r.read_se().map_err(|_| e("tc_off"))?;
+        deblocking_disabled = r.read_flag().map_err(|_| e("deblock_disabled"))?;
+        if !deblocking_disabled {
+            beta_offset_div2 = r.read_se().map_err(|_| e("beta_off"))?;
+            tc_offset_div2 = r.read_se().map_err(|_| e("tc_off"))?;
         }
     }
-    if pps.loop_filter_across_slices && (sao_luma || sao_chroma || !pps.deblocking_filter_disabled)
-    {
+    if pps.loop_filter_across_slices && (sao_luma || sao_chroma || !deblocking_disabled) {
         r.read_flag()
             .map_err(|_| e("loop_filter_across_slices_flag"))?;
     }
@@ -1998,5 +2168,49 @@ pub(crate) fn parse_slice_header_full(
     while !r.bit_pos().is_multiple_of(8) {
         r.read_bit().map_err(|_| e("alignment_pad"))?;
     }
-    Ok((slice_qp, sao_luma, sao_chroma, r.bit_pos() / 8))
+    Ok(SliceHeader {
+        slice_qp,
+        sao_luma,
+        sao_chroma,
+        cabac_offset: r.bit_pos() / 8,
+        cb_qp_offset,
+        cr_qp_offset,
+        deblocking_disabled,
+        beta_offset_div2,
+        tc_offset_div2,
+        slice_segment_address,
+        first_slice_in_pic: first_slice,
+        dependent_slice_segment: false,
+    })
+}
+
+/// Ceil(log2(n)) — the number of bits needed to represent values 0..n-1.
+/// Returns 0 for n <= 1 (a single-CTB picture needs no address bits).
+fn ceil_log2(n: u64) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        64 - (n - 1).leading_zeros()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ceil_log2;
+
+    #[test]
+    fn ceil_log2_matches_slice_address_widths() {
+        // Bits needed to hold values 0..n-1 (== slice_segment_address width).
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0); // single CTB: no address bits
+        assert_eq!(ceil_log2(2), 1); // 0..1
+        assert_eq!(ceil_log2(3), 2); // 0..2 needs 2 bits
+        assert_eq!(ceil_log2(4), 2);
+        assert_eq!(ceil_log2(5), 3);
+        assert_eq!(ceil_log2(8), 3);
+        assert_eq!(ceil_log2(9), 4);
+        assert_eq!(ceil_log2(1023), 10);
+        assert_eq!(ceil_log2(1024), 10);
+        assert_eq!(ceil_log2(1025), 11);
+    }
 }

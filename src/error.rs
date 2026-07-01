@@ -36,8 +36,18 @@ pub enum DecodeError {
     CabacDesync,
     UnsupportedChroma(u8),
     UnsupportedBitDepth(u8),
-    BadDimensions { w: u32, h: u32 },
+    BadDimensions {
+        w: u32,
+        h: u32,
+    },
     ParamSet(String),
+    /// A configured parse limit was exceeded (e.g. box, item, or image size).
+    /// The field names the limit and carries the offending vs. allowed values.
+    LimitExceeded {
+        what: &'static str,
+        value: u64,
+        limit: u64,
+    },
 }
 
 impl std::fmt::Display for DecodeError {
@@ -57,6 +67,10 @@ impl std::fmt::Display for DecodeError {
                 write!(f, "Image dimensions {w}×{h} are zero or exceed limits")
             }
             Self::ParamSet(msg) => write!(f, "SPS/PPS parse error: {msg}"),
+            Self::LimitExceeded { what, value, limit } => write!(
+                f,
+                "parse limit exceeded: {what} = {value} exceeds configured limit {limit}"
+            ),
         }
     }
 }
