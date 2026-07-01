@@ -243,13 +243,11 @@ pub(crate) fn predict_into(
         DC => {
             // Mirror predict_dc exactly: N samples from above + N from left.
             let mut sum = 0i32;
-            for i in 0..n {
-                sum += above[i + 1] as i32 + left[i + 1] as i32;
+            for (&above, &left) in above[1..=n].iter().zip(left[1..=n].iter()) {
+                sum += above as i32 + left as i32;
             }
             let dc = (sum + n as i32) >> ((n as u32).trailing_zeros() + 1);
-            for v in out.iter_mut() {
-                *v = dc as u16;
-            }
+            out.fill(dc as u16);
             // Edge filter: luma only, and only for blocks smaller than 32×32
             if is_luma && n < 32 {
                 out[0] = ((left[1] as i32 + 2 * dc + above[1] as i32 + 2) >> 2) as u16;
@@ -282,22 +280,38 @@ pub(crate) fn predict_into(
                 }
             }
             let max_v = ((1i32 << bit_depth) - 1).max(0);
-            for row in 0..n as i32 {
-                let pos = (row + 1) * angle;
-                let i_idx = pos >> 5;
-                let frac = pos & 31;
-                for col in 0..n as i32 {
-                    let r0 = refs[(col + i_idx + 1 + base) as usize];
-                    let v = if frac == 0 {
-                        r0
-                    } else {
-                        let r1 = refs[(col + i_idx + 2 + base) as usize];
-                        ((32 - frac) * r0 + frac * r1 + 16) >> 5
-                    };
-                    if vertical {
-                        out[row as usize * n + col as usize] = v.clamp(0, max_v) as u16;
-                    } else {
-                        out[col as usize * n + row as usize] = v.clamp(0, max_v) as u16;
+            if vertical {
+                for (row, out_row) in out.chunks_exact_mut(n).enumerate() {
+                    let pos = (row as i32 + 1) * angle;
+                    let i_idx = pos >> 5;
+                    let frac = pos & 31;
+                    for (col, dst) in out_row.iter_mut().enumerate() {
+                        let col = col as i32;
+                        let r0 = refs[(col + i_idx + 1 + base) as usize];
+                        let v = if frac == 0 {
+                            r0
+                        } else {
+                            let r1 = refs[(col + i_idx + 2 + base) as usize];
+                            ((32 - frac) * r0 + frac * r1 + 16) >> 5
+                        };
+                        *dst = v.clamp(0, max_v) as u16;
+                    }
+                }
+            } else {
+                for (col, out_row) in out.chunks_exact_mut(n).enumerate() {
+                    let col = col as i32;
+                    for (row, dst) in out_row.iter_mut().enumerate() {
+                        let pos = (row as i32 + 1) * angle;
+                        let i_idx = pos >> 5;
+                        let frac = pos & 31;
+                        let r0 = refs[(col + i_idx + 1 + base) as usize];
+                        let v = if frac == 0 {
+                            r0
+                        } else {
+                            let r1 = refs[(col + i_idx + 2 + base) as usize];
+                            ((32 - frac) * r0 + frac * r1 + 16) >> 5
+                        };
+                        *dst = v.clamp(0, max_v) as u16;
                     }
                 }
             }
@@ -309,7 +323,7 @@ pub(crate) fn predict_into(
                         out[y * n] = v.clamp(0, max) as u16;
                     }
                 } else if mode == 10 {
-                    for (dst, &above_p1) in out.iter_mut().zip(above[1..n + 1].iter()) {
+                    for (dst, &above_p1) in out[..n].iter_mut().zip(above[1..n + 1].iter()) {
                         let v = left[1] as i32 + ((above_p1 as i32 - above[0] as i32) >> 1);
                         *dst = v.clamp(0, max) as u16;
                     }

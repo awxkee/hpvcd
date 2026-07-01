@@ -246,9 +246,9 @@ fn idct_raw_4(c: [i32; 4]) -> [i32; 4] {
         if cj == 0 {
             continue;
         }
-        let trow = T4[j];
-        for k in 0..4 {
-            e[k] += trow[k] * cj;
+        let trow = &T4[j];
+        for (dst, &tk) in e.iter_mut().zip(trow.iter()) {
+            *dst += tk * cj;
         }
     }
     e
@@ -263,15 +263,15 @@ fn idct_raw_8(c: [i32; 8]) -> [i32; 8] {
         if co == 0 {
             continue;
         }
-        let trow = T8[2 * j + 1]; // odd row of T8, anti-sym: first 4 cols used
-        for k in 0..4 {
-            oo[k] += trow[k] * co;
+        let trow = &T8[2 * j + 1][..4]; // odd row of T8, anti-sym: first 4 cols used
+        for (dst, &tk) in oo.iter_mut().zip(trow.iter()) {
+            *dst += tk * co;
         }
     }
     let mut out = [0i32; 8];
-    for k in 0..4 {
-        out[k] = ee[k] + oo[k];
-        out[7 - k] = ee[k] - oo[k];
+    for (k, (&ee, &oo)) in ee.iter().zip(oo.iter()).enumerate() {
+        out[k] = ee + oo;
+        out[7 - k] = ee - oo;
     }
     out
 }
@@ -285,15 +285,15 @@ fn idct_raw_16(c: [i32; 16]) -> [i32; 16] {
         if co == 0 {
             continue;
         }
-        let trow = T16[2 * j + 1]; // odd row of T16, first 8 cols used
-        for k in 0..8 {
-            oo[k] += trow[k] * co;
+        let trow = &T16[2 * j + 1][..8]; // odd row of T16, first 8 cols used
+        for (dst, &tk) in oo.iter_mut().zip(trow.iter()) {
+            *dst += tk * co;
         }
     }
     let mut out = [0i32; 16];
-    for k in 0..8 {
-        out[k] = ee[k] + oo[k];
-        out[15 - k] = ee[k] - oo[k];
+    for (k, (&ee, &oo)) in ee.iter().zip(oo.iter()).enumerate() {
+        out[k] = ee + oo;
+        out[15 - k] = ee - oo;
     }
     out
 }
@@ -307,15 +307,15 @@ fn idct_raw_32(c: [i32; 32]) -> [i32; 32] {
         if co == 0 {
             continue;
         }
-        let trow = T32[2 * j + 1];
-        for k in 0..16 {
-            oo[k] += trow[k] * co;
+        let trow = &T32[2 * j + 1][..16];
+        for (dst, &tk) in oo.iter_mut().zip(trow.iter()) {
+            *dst += tk * co;
         }
     }
     let mut out = [0i32; 32];
-    for k in 0..16 {
-        out[k] = ee[k] + oo[k];
-        out[31 - k] = ee[k] - oo[k];
+    for (k, (&ee, &oo)) in ee.iter().zip(oo.iter()).enumerate() {
+        out[k] = ee + oo;
+        out[31 - k] = ee - oo;
     }
     out
 }
@@ -332,15 +332,20 @@ fn inv_butterfly_32_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     for c in 0..N {
         let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c]);
         let raw = idct_raw_32(col);
-        for m in 0..N {
-            tmp[m * N + c] = ((raw[m] + add1) >> shift1).clamp(-32768, 32767);
+        for (m, &raw) in raw.iter().enumerate() {
+            tmp[m * N + c] = ((raw + add1) >> shift1).clamp(-32768, 32767);
         }
     }
-    for r in 0..N {
-        let row: [i32; N] = std::array::from_fn(|k| tmp[r * N + k]);
+    for (tmp_row, out_row) in tmp
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<N>().0.iter_mut())
+    {
+        let row: [i32; N] = std::array::from_fn(|k| tmp_row[k]);
         let raw = idct_raw_32(row);
-        for m in 0..N {
-            out[r * N + m] = (raw[m] + add2) >> shift2;
+        for (dst, &raw) in out_row.iter_mut().zip(raw.iter()) {
+            *dst = (raw + add2) >> shift2;
         }
     }
 }
@@ -369,30 +374,32 @@ fn inv_transform_n_into<const N: usize>(
                 continue; // sparse skip — most residual coeffs are zero
             }
             let trow = &t[k];
-            for m in 0..N {
-                acc[m] += trow[m] * ck;
+            for (acc, &tm) in acc[..N].iter_mut().zip(trow.iter()) {
+                *acc += tm * ck;
             }
         }
-        for m in 0..N {
-            tmp[m * N + c] = ((acc[m] + add1) >> shift1).clamp(-32768, 32767);
+        for (m, &acc) in acc[..N].iter().enumerate() {
+            tmp[m * N + c] = ((acc + add1) >> shift1).clamp(-32768, 32767);
         }
     }
 
-    for r in 0..N {
+    for (rowv, out_row) in tmp
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<N>().0.iter_mut())
+    {
         acc[..N].fill(0);
-        let rowv = &tmp[r * N..r * N + N];
-        for k in 0..N {
-            let rk = rowv[k];
+        for (&rk, trow) in rowv.iter().zip(t.iter()) {
             if rk == 0 {
                 continue;
             }
-            let trow = &t[k];
-            for m in 0..N {
-                acc[m] += trow[m] * rk;
+            for (acc, &tm) in acc[..N].iter_mut().zip(trow.iter()) {
+                *acc += tm * rk;
             }
         }
-        for m in 0..N {
-            out[r * N + m] = (acc[m] + add2) >> shift2;
+        for (dst, &acc) in out_row.iter_mut().zip(acc[..N].iter()) {
+            *dst = (acc + add2) >> shift2;
         }
     }
 }
@@ -414,7 +421,7 @@ pub(crate) fn dequantize_i32_into(
     let scale = DEQUANT_SCALE[(qp_scaled % 6) as usize];
     let per = 1i64 << (qp_scaled / 6);
     let factor = scale * per * 16;
-    for (o, &l) in out[..n * n].iter_mut().zip(levels) {
+    for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
         // Intermediate stays i64 (l*factor can exceed i32 for high QP); the
         // clamped result is always within i16 range, so storing as i32 is exact.
         *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;

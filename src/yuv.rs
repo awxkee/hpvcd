@@ -76,25 +76,36 @@ pub(crate) fn yuv_to_rgb_with_color(
         let max_val = yuv.bit_depth.max_val() as i64;
         return if yuv.bit_depth == BitDepth::Eight {
             let mut out = vec![0u8; dw * dh];
-            for y in 0..dh {
-                for x in 0..dw {
-                    let row = y.min(yuv.height - 1);
-                    let col = x.min(yuv.width - 1);
-                    let luma = yuv.y[row * yuv.width + col] as i64;
-                    out[y * dw + x] =
-                        ((k_y * (luma - y_black) + Q13_ROUND) >> Q13).clamp(0, 255) as u8;
+            for (y, dst_row) in out.chunks_exact_mut(dw).enumerate() {
+                let row = y.min(yuv.height - 1);
+                let src_row = &yuv.y[row * yuv.width..][..yuv.width];
+                let copy_w = dw.min(yuv.width);
+                let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
+                for (dst, &luma) in dst_copy.iter_mut().zip(src_row.iter()) {
+                    *dst = ((k_y * (luma as i64 - y_black) + Q13_ROUND) >> Q13).clamp(0, 255) as u8;
+                }
+                if let (Some(&last), false) = (src_row.last(), dst_edge.is_empty()) {
+                    let last =
+                        ((k_y * (last as i64 - y_black) + Q13_ROUND) >> Q13).clamp(0, 255) as u8;
+                    dst_edge.fill(last);
                 }
             }
             ImageBuffer::Luma8(out)
         } else {
             let mut out = vec![0u16; dw * dh];
-            for y in 0..dh {
-                for x in 0..dw {
-                    let row = y.min(yuv.height - 1);
-                    let col = x.min(yuv.width - 1);
-                    let luma = yuv.y[row * yuv.width + col] as i64;
-                    out[y * dw + x] =
-                        ((k_y * (luma - y_black) + Q13_ROUND) >> Q13).clamp(0, max_val) as u16;
+            for (y, dst_row) in out.chunks_exact_mut(dw).enumerate() {
+                let row = y.min(yuv.height - 1);
+                let src_row = &yuv.y[row * yuv.width..][..yuv.width];
+                let copy_w = dw.min(yuv.width);
+                let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
+                for (dst, &luma) in dst_copy.iter_mut().zip(src_row.iter()) {
+                    *dst = ((k_y * (luma as i64 - y_black) + Q13_ROUND) >> Q13).clamp(0, max_val)
+                        as u16;
+                }
+                if let (Some(&last), false) = (src_row.last(), dst_edge.is_empty()) {
+                    let last = ((k_y * (last as i64 - y_black) + Q13_ROUND) >> Q13)
+                        .clamp(0, max_val) as u16;
+                    dst_edge.fill(last);
                 }
             }
             ImageBuffer::Luma16(out)
@@ -175,25 +186,29 @@ pub(crate) fn yuv_to_rgb_with_color(
         macro_rules! convert_loop {
             ($T:ty, $clampmax:expr, $variant:path) => {{
                 let mut rgb = vec![0 as $T; dw * dh * 3];
-                for y_pix in 0..dh {
+                for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
                     let luma_base = y_pix * yuv.width;
                     let c_base = (y_pix / sub_h) * cw;
-                    let row_out = &mut rgb[y_pix * dw * 3..];
-                    for x_pix in 0..dw {
-                        let luma_raw = yuv.y[luma_base + x_pix] as i64;
+                    let luma_row = &yuv.y[luma_base..][..dw];
+                    let cb_row = &yuv.cb[c_base..][..cw];
+                    let cr_row = &yuv.cr[c_base..][..cw];
+                    for (x_pix, (dst, &luma_raw)) in row_out
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .zip(luma_row.iter())
+                        .enumerate()
+                    {
                         let c_col = x_pix / sub_w;
-                        let cb_raw = yuv.cb[c_base + c_col] as i64;
-                        let cr_raw = yuv.cr[c_base + c_col] as i64;
-                        let yv = k_y * (luma_raw - y_black);
-                        let cb_c = cb_raw - neutral;
-                        let cr_c = cr_raw - neutral;
+                        let cb_c = cb_row[c_col] as i64 - neutral;
+                        let cr_c = cr_row[c_col] as i64 - neutral;
+                        let yv = k_y * (luma_raw as i64 - y_black);
                         let r = (yv + cr_to_r * cr_c + Q13_ROUND) >> Q13;
                         let g = (yv + cb_to_g * cb_c + cr_to_g * cr_c + Q13_ROUND) >> Q13;
                         let b = (yv + cb_to_b * cb_c + Q13_ROUND) >> Q13;
-                        let o = &mut row_out[x_pix * 3..];
-                        o[0] = r.clamp(0, $clampmax) as $T;
-                        o[1] = g.clamp(0, $clampmax) as $T;
-                        o[2] = b.clamp(0, $clampmax) as $T;
+                        dst[0] = r.clamp(0, $clampmax) as $T;
+                        dst[1] = g.clamp(0, $clampmax) as $T;
+                        dst[2] = b.clamp(0, $clampmax) as $T;
                     }
                 }
                 return $variant(rgb);
@@ -209,10 +224,9 @@ pub(crate) fn yuv_to_rgb_with_color(
 
     if yuv.bit_depth == BitDepth::Eight {
         let mut rgb = vec![0u8; dw * dh * 3];
-        for y_pix in 0..dh {
-            for x_pix in 0..dw {
+        for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
+            for (x_pix, out) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let (r, g, b) = pixel(y_pix, x_pix);
-                let out = &mut rgb[(y_pix * dw + x_pix) * 3..];
                 out[0] = r.clamp(0, 255) as u8;
                 out[1] = g.clamp(0, 255) as u8;
                 out[2] = b.clamp(0, 255) as u8;
@@ -221,10 +235,9 @@ pub(crate) fn yuv_to_rgb_with_color(
         ImageBuffer::Rgb8(rgb)
     } else {
         let mut rgb = vec![0u16; dw * dh * 3];
-        for y_pix in 0..dh {
-            for x_pix in 0..dw {
+        for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
+            for (x_pix, out) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let (r, g, b) = pixel(y_pix, x_pix);
-                let out = &mut rgb[(y_pix * dw + x_pix) * 3..];
                 out[0] = r.clamp(0, max_val) as u16;
                 out[1] = g.clamp(0, max_val) as u16;
                 out[2] = b.clamp(0, max_val) as u16;
@@ -246,18 +259,18 @@ pub(crate) fn ycgco_to_rgb(yuv: &YuvPlanes, dw: usize, dh: usize) -> ImageBuffer
     macro_rules! run {
         ($T: ty, $cmax: expr, $variant: path) => {{
             let mut rgb = vec![0 as $T; dw * dh * 3];
-            for y_pix in 0..dh {
+            for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
                 let y_row = y_pix.min(yuv.height - 1);
                 let c_row = (y_pix / sub_h).min(ch - 1);
-                let l_base = y_row * yuv.width;
-                let c_base = c_row * cw;
-                let row_out = &mut rgb[y_pix * dw * 3..];
+                let l_row = &yuv.y[y_row * yuv.width..][..yuv.width];
+                let cb_row = &yuv.cb[c_row * cw..][..cw];
+                let cr_row = &yuv.cr[c_row * cw..][..cw];
                 for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                     let x_col = x_pix.min(yuv.width - 1);
                     let c_col = (x_pix / sub_w).min(cw - 1);
-                    let y = yuv.y[l_base + x_col] as i64;
-                    let cg = yuv.cb[c_base + c_col] as i64 - neutral;
-                    let co = yuv.cr[c_base + c_col] as i64 - neutral;
+                    let y = l_row[x_col] as i64;
+                    let cg = cb_row[c_col] as i64 - neutral;
+                    let co = cr_row[c_col] as i64 - neutral;
                     let t = y - cg;
                     dst[0] = (t + co).clamp(0, $cmax) as $T; // R
                     dst[1] = (y + cg).clamp(0, $cmax) as $T; // G

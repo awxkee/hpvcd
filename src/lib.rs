@@ -180,10 +180,9 @@ pub(crate) fn decode_heic_yuv_with(
 
         for (r, dst_row) in y_out.chunks_exact_mut(dw).enumerate() {
             let src_row = &planes.y[r.min(src_h - 1) * src_w..][..src_w];
-            let (fill, edge) = dst_row.split_at_mut(src_w.min(dw));
-            for (d, s) in fill.iter_mut().zip(src_row.iter()) {
-                *d = *s;
-            }
+            let copy_w = src_w.min(dw);
+            let (fill, edge) = dst_row.split_at_mut(copy_w);
+            fill.copy_from_slice(&src_row[..copy_w]);
             // pad right with the last luma sample if dw > src_w
             if let (Some(&last), false) = (fill.last(), edge.is_empty()) {
                 edge.fill(last);
@@ -205,15 +204,8 @@ pub(crate) fn decode_heic_yuv_with(
             let (cb_fill, cb_edge) = cb_row.split_at_mut(copy_w);
             let (cr_fill, cr_edge) = cr_row.split_at_mut(copy_w);
 
-            for (((d_cb, d_cr), s_cb), s_cr) in cb_fill
-                .iter_mut()
-                .zip(cr_fill.iter_mut())
-                .zip(src_cb.iter())
-                .zip(src_cr.iter())
-            {
-                *d_cb = *s_cb;
-                *d_cr = *s_cr;
-            }
+            cb_fill.copy_from_slice(&src_cb[..copy_w]);
+            cr_fill.copy_from_slice(&src_cr[..copy_w]);
             // pad right if cw > coded_cw
             if let (Some(&last_cb), Some(&last_cr), false) =
                 (cb_fill.last(), cr_fill.last(), cb_edge.is_empty())
@@ -1045,17 +1037,17 @@ fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) 
         Orientation::Rotate180 => px.iter().copied().rev().collect::<Vec<_>>(),
         Orientation::FlipH => {
             let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                for c in 0..w {
-                    out[r * w + (w - 1 - c)] = px[r * w + c];
+            for (src_row, dst_row) in px.chunks_exact(w).zip(out.chunks_exact_mut(w)) {
+                for (dst, &src) in dst_row.iter_mut().rev().zip(src_row.iter()) {
+                    *dst = src;
                 }
             }
             out
         }
         Orientation::FlipV => {
             let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                out[(h - 1 - r) * w..][..w].copy_from_slice(&px[r * w..][..w]);
+            for (src_row, dst_row) in px.chunks_exact(w).zip(out.chunks_exact_mut(w).rev()) {
+                dst_row.copy_from_slice(src_row);
             }
             out
         }
@@ -1094,21 +1086,27 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -
             .collect(),
         Orientation::FlipH => {
             let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                for c in 0..w {
-                    let s = (r * w + (w - 1 - c)) * 3;
-                    let d = (r * w + c) * 3;
-                    out[d..d + 3].copy_from_slice(&px[s..s + 3]);
+            for (src_row, dst_row) in px.chunks_exact(w * 3).zip(out.chunks_exact_mut(w * 3)) {
+                for (src, dst) in src_row
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .rev()
+                    .zip(dst_row.as_chunks_mut::<3>().0.iter_mut())
+                {
+                    dst.copy_from_slice(src);
                 }
             }
             out
         }
         Orientation::FlipV => {
             let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                let sr = (h - 1 - r) * w * 3;
-                let dr = r * w * 3;
-                out[dr..dr + w * 3].copy_from_slice(&px[sr..sr + w * 3]);
+            for (src_row, dst_row) in px
+                .chunks_exact(w * 3)
+                .rev()
+                .zip(out.chunks_exact_mut(w * 3))
+            {
+                dst_row.copy_from_slice(src_row);
             }
             out
         }

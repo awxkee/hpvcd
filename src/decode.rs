@@ -1681,11 +1681,20 @@ impl FullDecoder {
             }
         }
         let max = (1i32 << self.bd) - 1;
-        for yy in 0..n {
-            for xx in 0..n {
-                let v = (self.scratch.pred[yy * n + xx] as i32 + self.res_scratch[yy * n + xx])
-                    .clamp(0, max);
-                self.y[(y0 + yy) * self.w + (x0 + xx)] = v as u16;
+        let pred = &self.scratch.pred[..n * n];
+        let res = &self.res_scratch[..n * n];
+        let stride = self.w;
+        let dst = &mut self.y[y0 * stride + x0..];
+        for ((dst_row, pred_row), res_row) in dst
+            .chunks_mut(stride)
+            .take(n)
+            .zip(pred.chunks_exact(n))
+            .zip(res.chunks_exact(n))
+        {
+            let dst_row = &mut dst_row[..n];
+            for ((dst, &pred), &res) in dst_row.iter_mut().zip(pred_row.iter()).zip(res_row.iter())
+            {
+                *dst = (pred as i32 + res).clamp(0, max) as u16;
             }
         }
         self.mark_decoded(x0, y0, n);
@@ -1694,10 +1703,11 @@ impl FullDecoder {
     fn predict_only_luma(&mut self, x0: usize, y0: usize, log2_ts: u32, mode: u8) {
         let n = 1usize << log2_ts;
         self.predict_luma_block_into(x0, y0, n, mode);
-        for yy in 0..n {
-            for xx in 0..n {
-                self.y[(y0 + yy) * self.w + (x0 + xx)] = self.scratch.pred[yy * n + xx];
-            }
+        let pred = &self.scratch.pred[..n * n];
+        let stride = self.w;
+        let dst = &mut self.y[y0 * stride + x0..];
+        for (dst_row, pred_row) in dst.chunks_mut(stride).take(n).zip(pred.chunks_exact(n)) {
+            dst_row[..n].copy_from_slice(pred_row);
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -1959,12 +1969,21 @@ impl FullDecoder {
             buf[..n2].copy_from_slice(&self.scratch.pred[..n2]);
             buf
         };
+        let stride = self.cw;
         let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-        for yy in 0..n {
-            for xx in 0..n {
-                let v =
-                    (pred_tmp[yy * n + xx] as i32 + self.res_scratch[yy * n + xx]).clamp(0, max);
-                plane[(cy0 + yy) * self.cw + (cx0 + xx)] = v as u16;
+        let pred = &pred_tmp[..n2];
+        let res = &self.res_scratch[..n2];
+        let dst = &mut plane[cy0 * stride + cx0..];
+        for ((dst_row, pred_row), res_row) in dst
+            .chunks_mut(stride)
+            .take(n)
+            .zip(pred.chunks_exact(n))
+            .zip(res.chunks_exact(n))
+        {
+            let dst_row = &mut dst_row[..n];
+            for ((dst, &pred), &res) in dst_row.iter_mut().zip(pred_row.iter()).zip(res_row.iter())
+            {
+                *dst = (pred as i32 + res).clamp(0, max) as u16;
             }
         }
     }
@@ -1977,11 +1996,12 @@ impl FullDecoder {
             buf[..n2].copy_from_slice(&self.scratch.pred[..n2]);
             buf
         };
+        let stride = self.cw;
         let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-        for yy in 0..n {
-            for xx in 0..n {
-                plane[(cy0 + yy) * self.cw + (cx0 + xx)] = pred_tmp[yy * n + xx];
-            }
+        let pred = &pred_tmp[..n2];
+        let dst = &mut plane[cy0 * stride + cx0..];
+        for (dst_row, pred_row) in dst.chunks_mut(stride).take(n).zip(pred.chunks_exact(n)) {
+            dst_row[..n].copy_from_slice(pred_row);
         }
     }
 }
