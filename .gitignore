@@ -7,3 +7,4 @@ app/target
 *.png
 *.heic
 Cargo.lock
+corpus

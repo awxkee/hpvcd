@@ -1,6 +1,6 @@
 [workspace]
-members = ["app"]
-exclude = ["fuzz"]
+members = ["app", "fuzz", "hpvcd-afl"]
+exclude = []
 
 [package]
 name = "hpvcd"
