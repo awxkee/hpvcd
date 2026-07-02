@@ -5,11 +5,18 @@ use std::time::Instant;
 
 fn main() {
     let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
+    let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
         let decoded = hpvcd::decode_heic(&bytes).unwrap();
-        println!("Decoded: {:?}", instant.elapsed());
+        let elapsed = instant.elapsed();
+        println!("Iteration {i}: {:?}", elapsed);
+        durations.push(elapsed);
     }
+
+    let total: std::time::Duration = durations.iter().sum();
+    let avg = total / durations.len() as u32;
+    println!("Average: {:?}", avg);
     let instant = Instant::now();
     let decoded = hpvcd::decode_heic(&bytes).unwrap();
     println!("Decoded: {:?}", instant.elapsed());
