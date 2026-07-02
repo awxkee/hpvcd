@@ -30,7 +30,25 @@
 type SaoPlaneFn =
     fn(&mut [u16], &[u16], usize, usize, usize, usize, usize, usize, u8, &[i32; 4], u8, u8, u8);
 
+type SaoPlaneBandedFn = fn(
+    &mut [u16],
+    &[u16],
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    u8,
+    &[i32; 4],
+    u8,
+    u8,
+    u8,
+);
+
 static APPLY_SAO_PLANE: std::sync::OnceLock<SaoPlaneFn> = std::sync::OnceLock::new();
+static APPLY_SAO_PLANE_BANDED: std::sync::OnceLock<SaoPlaneBandedFn> = std::sync::OnceLock::new();
 
 #[inline]
 fn resolve_apply_sao_plane() -> SaoPlaneFn {
@@ -46,6 +64,27 @@ fn resolve_apply_sao_plane() -> SaoPlaneFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::apply_sao_plane_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
+    *APPLY_SAO_PLANE_BANDED.get_or_init(|| {
+        let mut _f: SaoPlaneBandedFn = apply_sao_plane_banded_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::apply_sao_plane_banded_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::apply_sao_plane_banded_sse41;
             }
         }
 
@@ -328,6 +367,7 @@ fn apply_sao_ctb_row(
 /// separate threads. Bit-exact with the serial path because both read only from
 /// the untouched clone and write each output pixel exactly once.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn apply_sao_plane_banded(
     dst_band: &mut [u16],
     src_full: &[u16],
@@ -344,21 +384,60 @@ fn apply_sao_plane_banded(
     eo_class: u8,
     bd: u8,
 ) {
-    let max_val = ((1u32 << bd) - 1) as i32;
+    resolve_apply_sao_plane_banded()(
+        dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, type_idx, offsets, band_pos,
+        eo_class, bd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_sao_plane_banded_scalar(
+    dst_band: &mut [u16],
+    src_full: &[u16],
+    w: usize,
+    h: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    type_idx: u8,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    eo_class: u8,
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 || y_end <= band_y0 {
+        return;
+    }
+
+    let Some(max_val) = (1u32)
+        .checked_shl(bd as u32)
+        .map(|v| v.saturating_sub(1) as i32)
+    else {
+        return;
+    };
+
     match type_idx {
         // Band offset: purely pointwise, no neighbor reads.
         1 => {
-            let shift = bd - 5;
+            let shift = bd.saturating_sub(5);
             for y in y0..y_end {
                 let src_row = y * w;
                 let dst_row = (y - band_y0) * w;
-                for x in x0..x_end {
-                    let s = src_full[src_row + x] as i32;
+                let src_range = src_row + x0..src_row + x_end;
+                let dst_range = dst_row + x0..dst_row + x_end;
+                let (Some(src_row), Some(dst_row)) =
+                    (src_full.get(src_range), dst_band.get_mut(dst_range))
+                else {
+                    continue;
+                };
+                for (s, dst) in src_row.iter().copied().zip(dst_row.iter_mut()) {
+                    let s = s as i32;
                     let band = (s >> shift) as u8;
                     let rel = band.wrapping_sub(band_pos);
                     if rel < 4 {
-                        dst_band[dst_row + x] =
-                            (s + offsets[rel as usize]).clamp(0, max_val) as u16;
+                        *dst = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
                     }
                 }
             }
@@ -375,18 +454,28 @@ fn apply_sao_plane_banded(
                 xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h
             };
             for y in y0..y_end {
-                let dst_row = (y - band_y0) * w;
+                let src_base = y * w;
+                let dst_base = (y - band_y0) * w;
                 for x in x0..x_end {
-                    let s = src_full[y * w + x] as i32;
+                    let Some(&s0) = src_full.get(src_base + x) else {
+                        continue;
+                    };
+                    let s = s0 as i32;
                     let (x1, y1) = (x as i32 + dx, y as i32 + dy);
                     let (x2, y2) = (x as i32 - dx, y as i32 - dy);
                     let n1 = if inb(x1, y1) {
-                        src_full[y1 as usize * w + x1 as usize] as i32
+                        src_full
+                            .get(y1 as usize * w + x1 as usize)
+                            .copied()
+                            .unwrap_or(s0) as i32
                     } else {
                         s
                     };
                     let n2 = if inb(x2, y2) {
-                        src_full[y2 as usize * w + x2 as usize] as i32
+                        src_full
+                            .get(y2 as usize * w + x2 as usize)
+                            .copied()
+                            .unwrap_or(s0) as i32
                     } else {
                         s
                     };
@@ -400,7 +489,9 @@ fn apply_sao_plane_banded(
                         _ => 0,
                     };
                     if offset != 0 {
-                        dst_band[dst_row + x] = (s + offset).clamp(0, max_val) as u16;
+                        if let Some(dst) = dst_band.get_mut(dst_base + x) {
+                            *dst = (s + offset).clamp(0, max_val) as u16;
+                        }
                     }
                 }
             }

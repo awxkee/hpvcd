@@ -32,7 +32,7 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-use crate::sao::apply_sao_plane_scalar;
+use crate::sao::{apply_sao_plane_banded_scalar, apply_sao_plane_scalar};
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
@@ -168,5 +168,107 @@ pub(crate) fn apply_sao_plane_sse41(
 
     unsafe {
         apply_sao_band_offset_sse41_impl(dst, src, w, x0, y0, x_end, y_end, offsets, band_pos, bd)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn apply_sao_band_offset_banded_sse41_impl(
+    dst_band: &mut [u16],
+    src_full: &[u16],
+    w: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 || y_end <= band_y0 {
+        return;
+    }
+    let Some(max_val) = (1u32)
+        .checked_shl(bd as u32)
+        .map(|v| v.saturating_sub(1) as i32)
+    else {
+        return;
+    };
+    let max = _mm_set1_epi32(max_val);
+    let zero = _mm_setzero_si128();
+    let band_pos_v = _mm_set1_epi32(band_pos as i32);
+    let shift = bd.saturating_sub(5);
+
+    for y in y0..y_end {
+        let Some(dst_base) = y.checked_sub(band_y0).and_then(|v| v.checked_mul(w)) else {
+            continue;
+        };
+        let Some(src_base) = y.checked_mul(w) else {
+            continue;
+        };
+        let src_range = src_base + x0..src_base + x_end;
+        let dst_range = dst_base + x0..dst_base + x_end;
+        let (Some(src_row), Some(dst_row)) = (src_full.get(src_range), dst_band.get_mut(dst_range))
+        else {
+            continue;
+        };
+
+        let mut x = 0usize;
+        while x + 8 <= src_row.len() {
+            let out = band_offset8_sse41(
+                &dst_row[x..],
+                &src_row[x..],
+                offsets,
+                band_pos_v,
+                shift,
+                zero,
+                max,
+            );
+            unsafe { _mm_storeu_si128(dst_row.as_mut_ptr().add(x).cast::<__m128i>(), out) };
+            x += 8;
+        }
+
+        for (s, dst) in src_row[x..].iter().copied().zip(dst_row[x..].iter_mut()) {
+            let s = s as i32;
+            let band = (s >> shift) as u8;
+            let rel = band.wrapping_sub(band_pos);
+            if rel < 4 {
+                *dst = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_sao_plane_banded_sse41(
+    dst_band: &mut [u16],
+    src_full: &[u16],
+    w: usize,
+    h: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    type_idx: u8,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    eo_class: u8,
+    bd: u8,
+) {
+    if type_idx != 1 || x_end <= x0 || y_end <= y0 {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, type_idx, offsets, band_pos,
+            eo_class, bd,
+        );
+        return;
+    }
+
+    unsafe {
+        apply_sao_band_offset_banded_sse41_impl(
+            dst_band, src_full, w, band_y0, x0, y0, x_end, y_end, offsets, band_pos, bd,
+        )
     }
 }
