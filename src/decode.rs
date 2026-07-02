@@ -34,6 +34,7 @@ use crate::config::{Pps, Sps};
 use crate::error::DecodeError;
 use crate::fmt::BitDepth;
 use crate::intra;
+use crate::reconstruct;
 use crate::transform;
 use crate::yuv::YuvPlanes;
 
@@ -913,80 +914,9 @@ impl FullDecoder {
         eo_class: u8,
         bd: u8,
     ) {
-        let max_val = ((1u32 << bd) - 1) as i32;
-
-        match type_idx {
-            1 => {
-                // Band offset
-                let shift = bd - 5;
-                for y in y0..y_end {
-                    for x in x0..x_end {
-                        let s = src[y * w + x] as i32;
-                        let band = (s >> shift) as u8;
-                        let rel = band.wrapping_sub(band_pos);
-                        if rel < 4 {
-                            let v = (s + offsets[rel as usize]).clamp(0, max_val);
-                            dst[y * w + x] = v as u16;
-                        }
-                    }
-                }
-            }
-            2 => {
-                // Edge offset (§8.7.3.2.4)
-                // Direction vectors for the two neighbors
-                let (dx, dy): (i32, i32) = match eo_class {
-                    0 => (1, 0),  // horizontal
-                    1 => (0, 1),  // vertical
-                    2 => (1, 1),  // 135°
-                    _ => (1, -1), // 45°
-                };
-
-                for y in y0..y_end {
-                    for x in x0..x_end {
-                        let s = src[y * w + x] as i32;
-
-                        // Neighbor 1 (forward direction)
-                        let x1 = x as i32 + dx;
-                        let y1 = y as i32 + dy;
-                        // Neighbor 2 (backward direction)
-                        let x2 = x as i32 - dx;
-                        let y2 = y as i32 - dy;
-
-                        // Out-of-bounds neighbors count as "equal" (no offset)
-                        let inb = |xx: i32, yy: i32| -> bool {
-                            xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h
-                        };
-                        let n1 = if inb(x1, y1) {
-                            src[y1 as usize * w + x1 as usize] as i32
-                        } else {
-                            s
-                        };
-                        let n2 = if inb(x2, y2) {
-                            src[y2 as usize * w + x2 as usize] as i32
-                        } else {
-                            s
-                        };
-
-                        let sign1 = (s > n1) as i32 - (s < n1) as i32;
-                        let sign2 = (s > n2) as i32 - (s < n2) as i32;
-                        let edge_idx = sign1 + sign2 + 2; // 0..4
-
-                        // category 2 (edge_idx==2) always has offset 0
-                        let offset = match edge_idx {
-                            0 => offsets[0], // local min → positive offset
-                            1 => offsets[1],
-                            3 => offsets[2],
-                            4 => offsets[3], // local max → negative offset
-                            _ => 0,
-                        };
-                        if offset != 0 {
-                            dst[y * w + x] = (s + offset).clamp(0, max_val) as u16;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        crate::sao::apply_sao_plane(
+            dst, src, w, h, x0, y0, x_end, y_end, type_idx, offsets, band_pos, eo_class, bd,
+        );
     }
 
     fn coding_quadtree(&mut self, x0: usize, y0: usize, log2_cb: u32, depth: u8) {
@@ -1680,23 +1610,11 @@ impl FullDecoder {
                 );
             }
         }
-        let max = (1i32 << self.bd) - 1;
         let pred = &self.scratch.pred[..n * n];
         let res = &self.res_scratch[..n * n];
         let stride = self.w;
         let dst = &mut self.y[y0 * stride + x0..];
-        for ((dst_row, pred_row), res_row) in dst
-            .chunks_mut(stride)
-            .take(n)
-            .zip(pred.chunks_exact(n))
-            .zip(res.chunks_exact(n))
-        {
-            let dst_row = &mut dst_row[..n];
-            for ((dst, &pred), &res) in dst_row.iter_mut().zip(pred_row.iter()).zip(res_row.iter())
-            {
-                *dst = (pred as i32 + res).clamp(0, max) as u16;
-            }
-        }
+        reconstruct::add_residual_into(dst, stride, pred, res, n, self.bd);
         self.mark_decoded(x0, y0, n);
     }
 
@@ -1960,31 +1878,16 @@ impl FullDecoder {
                 &mut self.res_scratch[..n * n],
             );
         }
-        let max = (1i32 << self.bd_c) - 1;
-        // Copy scratch.pred out before mutable borrow of plane
         let n2 = n * n;
-        let pred_tmp: [u16; 1024] = {
-            // max chroma TB = 16×16 = 256 samples
-            let mut buf = [0u16; 1024];
-            buf[..n2].copy_from_slice(&self.scratch.pred[..n2]);
-            buf
-        };
-        let stride = self.cw;
-        let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-        let pred = &pred_tmp[..n2];
+        let pred = &self.scratch.pred[..n2];
         let res = &self.res_scratch[..n2];
-        let dst = &mut plane[cy0 * stride + cx0..];
-        for ((dst_row, pred_row), res_row) in dst
-            .chunks_mut(stride)
-            .take(n)
-            .zip(pred.chunks_exact(n))
-            .zip(res.chunks_exact(n))
-        {
-            let dst_row = &mut dst_row[..n];
-            for ((dst, &pred), &res) in dst_row.iter_mut().zip(pred_row.iter()).zip(res_row.iter())
-            {
-                *dst = (pred as i32 + res).clamp(0, max) as u16;
-            }
+        let stride = self.cw;
+        if is_cb {
+            let dst = &mut self.cb[cy0 * stride + cx0..];
+            reconstruct::add_residual_into(dst, stride, pred, res, n, self.bd_c);
+        } else {
+            let dst = &mut self.cr[cy0 * stride + cx0..];
+            reconstruct::add_residual_into(dst, stride, pred, res, n, self.bd_c);
         }
     }
 
@@ -2024,8 +1927,6 @@ fn qpc(qpi: i32, chroma_idc: u8) -> i32 {
     }
 }
 
-// ── Top-level entry point for lib.rs ────────────────────────────────────────
-
 /// Parsed slice-segment header fields the reconstruction path needs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SliceHeader {
@@ -2058,12 +1959,12 @@ pub(crate) struct SliceHeader {
 /// by the caller or is still in the byte slice — we consume it here).
 pub(crate) fn parse_slice_header_full(
     rbsp: &[u8],
-    sps: &crate::config::Sps,
-    pps: &crate::config::Pps,
+    sps: &Sps,
+    pps: &Pps,
     nal_type: u8,
-) -> Result<SliceHeader, crate::error::DecodeError> {
+) -> Result<SliceHeader, DecodeError> {
     let mut r = crate::bitreader::BitReader::new(rbsp);
-    let e = |s: &'static str| crate::error::DecodeError::Bitstream(s.into());
+    let e = |s: &'static str| DecodeError::Bitstream(s.into());
     r.read_bits(16).map_err(|_| e("NAL header"))?; // consume 2-byte NAL header
     let first_slice = r.read_flag().map_err(|_| e("first_slice"))?;
     let is_irap = (16..=23).contains(&nal_type);

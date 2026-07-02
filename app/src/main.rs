@@ -5,6 +5,11 @@ use std::time::Instant;
 
 fn main() {
     let bytes = fs::read("./assets/aak444.heic").unwrap();
+    for i in 0..10 {
+        let instant = Instant::now();
+        let decoded = hpvcd::decode_heic(&bytes).unwrap();
+        println!("Decoded: {:?}", instant.elapsed());
+    }
     let instant = Instant::now();
     let decoded = hpvcd::decode_heic(&bytes).unwrap();
     println!("Decoded: {:?}", instant.elapsed());

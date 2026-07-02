@@ -692,7 +692,7 @@ fn build_fallback_item(item_id: u16) -> HeifItem {
         display_w: 0,
         display_h: 0,
         color: ColorMetadata::default(),
-        orientation: crate::metadata::Orientation::Normal,
+        orientation: Orientation::Normal,
         cll: None,
         clap: None,
         pasp: None,

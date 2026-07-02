@@ -28,8 +28,6 @@
  */
 
 use super::contexts::ContextSet;
-pub(crate) static TRACE_NEXT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 use super::engine::CabacDecoder;
 
 pub(crate) const SCAN_DIAG: u8 = 0;
@@ -188,16 +186,9 @@ fn decode_last_prefix(
     let max_group = GROUP_IDX[(size - 1) as usize];
     let n = ctx.len();
     let mut group = 0u32;
-    let trace = TRACE_NEXT.load(std::sync::atomic::Ordering::Relaxed);
     while group < max_group {
         let ci = ((ctx_offset + (group >> ctx_shift)) as usize).min(n - 1);
         let b = dec.decode_bin(&mut ctx[ci]);
-        if trace {
-            eprintln!(
-                "    last_sig group={} ci={} bin={} range={} off={}",
-                group, ci, b, dec.range, dec.offset
-            );
-        }
         if b == 0 {
             break;
         }
@@ -228,17 +219,17 @@ fn decode_remaining(dec: &mut CabacDecoder, rice: u32) -> u32 {
             cw = (cw << 1) | dec.decode_bypass() as u32;
         }
         // Saturate the base calculation: (1<<(p-3)+2)<<rice can overflow u32 when p≈32
-        let base = (1u32
+        let base = 1u32
             .checked_shl(prefix - 3)
             .unwrap_or(u32::MAX)
-            .saturating_add(2))
-        .checked_shl(rice)
-        .unwrap_or(u32::MAX);
+            .saturating_add(2)
+            .checked_shl(rice)
+            .unwrap_or(u32::MAX);
         base.saturating_add(cw)
     }
 }
 
-const MIN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
+static MIN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 
 /// Decode residual coefficients for one TU. Returns row-major levels (n×n i32).
 #[allow(clippy::too_many_arguments)]
@@ -374,20 +365,6 @@ pub(crate) fn residual_coding(
             let ci = sig_ctx(xc, yc, prev_csbf, log2_ts, scan_idx, is_luma)
                 .min(ctx.sig_coeff_flag.len() - 1);
             let s = dec.decode_bin(&mut ctx.sig_coeff_flag[ci]) != 0;
-            if TRACE_NEXT.load(std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "    sig k={} (xc={},yc={}) ci={} bin={} range={} off={} state={}/{}",
-                    k,
-                    xc,
-                    yc,
-                    ci,
-                    s as u8,
-                    dec.range,
-                    dec.offset,
-                    ctx.sig_coeff_flag[ci].p_state_idx,
-                    ctx.sig_coeff_flag[ci].val_mps
-                );
-            }
             sig[k] = s;
             if s {
                 any_sig = true;

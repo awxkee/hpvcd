@@ -41,9 +41,6 @@ pub(crate) static INV_ANGLE: [i32; 15] = [
 pub(crate) const PLANAR: u8 = 0;
 pub(crate) const DC: u8 = 1;
 
-// These write into caller-provided slices. FullDecoder holds one `IntraScratch`
-// that is reused every TU, avoiding ~4 small heap allocations per block.
-
 /// Pre-allocated scratch for the intra prediction pipeline (reused every TU).
 pub(crate) struct IntraScratch {
     pub(crate) sub_s: Vec<u16>, // 4*N+1
@@ -214,9 +211,50 @@ pub(crate) fn filter_refs_into(
     fl_out[2 * n] = left[2 * n];
 }
 
+pub(crate) type PredictFn = fn(u8, &[u16], &[u16], usize, bool, u8, &mut [u16], &mut [i32]);
+
+static PREDICT: std::sync::OnceLock<PredictFn> = std::sync::OnceLock::new();
+
+#[inline]
+fn resolve_predict() -> PredictFn {
+    *PREDICT.get_or_init(|| {
+        let mut _f: PredictFn = predict_into_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::predict_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::predict_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
 /// Like `predict` but writes into `out[..n*n]`; `refs_ang` is work space (≥ 3N+1).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_into(
+    mode: u8,
+    above: &[u16],
+    left: &[u16],
+    n: usize,
+    is_luma: bool,
+    bit_depth: u8,
+    out: &mut [u16],
+    refs_ang: &mut [i32],
+) {
+    resolve_predict()(mode, above, left, n, is_luma, bit_depth, out, refs_ang)
+}
+
+/// Scalar predictor fallback. Kept separate so SIMD backends can dispatch only the
+/// cheap structured modes and fall back without going through OnceLock again.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_into_scalar(
     mode: u8,
     above: &[u16],
     left: &[u16],

@@ -26,6 +26,12 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod intra;
+mod reconstruct;
+mod sao;
 mod transform;
 
+pub(crate) use intra::predict_into_neon;
+pub(crate) use reconstruct::add_residual_into_neon;
+pub(crate) use sao::apply_sao_plane_neon;
 pub(crate) use transform::{inv_transform_dst_into_neon, inv_transform_into_neon};
