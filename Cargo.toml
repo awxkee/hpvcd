@@ -4,7 +4,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "hpvcd"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "HEVC/HEIC tiny image decoder"
 readme = "README.md"
@@ -17,5 +17,10 @@ homepage = "https://github.com/awxkee/hpvcd"
 repository = "https://github.com/awxkee/hpvcd"
 exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.93.0"
+
+[features]
+default = ["neon", "sse"]
+neon = []
+sse = []
 
 [dependencies]

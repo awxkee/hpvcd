@@ -27,16 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/// 4×4 HEVC transform matrix.
-static T4: [[i32; 4]; 4] = [
-    [64, 64, 64, 64],
-    [83, 36, -36, -83],
-    [64, -64, -64, 64],
-    [36, -83, 83, -36],
-];
-
 /// 8×8 HEVC transform matrix.
-static T8: [[i32; 8]; 8] = [
+pub(crate) static T8: [[i32; 8]; 8] = [
     [64, 64, 64, 64, 64, 64, 64, 64],
     [89, 75, 50, 18, -18, -50, -75, -89],
     [83, 36, -36, -83, -83, -36, 36, 83],
@@ -47,7 +39,7 @@ static T8: [[i32; 8]; 8] = [
     [18, -50, 75, -89, 89, -75, 50, -18],
 ];
 
-static T16: [[i32; 16]; 16] = [
+pub(crate) static T16: [[i32; 16]; 16] = [
     [
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     ],
@@ -98,7 +90,7 @@ static T16: [[i32; 16]; 16] = [
     ],
 ];
 
-static T32: [[i32; 32]; 32] = [
+pub(crate) static T32: [[i32; 32]; 32] = [
     [
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
         64, 64, 64, 64, 64, 64, 64, 64, 64,
@@ -229,7 +221,7 @@ static T32: [[i32; 32]; 32] = [
     ],
 ];
 
-static DST4: [[i32; 4]; 4] = [
+pub(crate) static DST4: [[i32; 4]; 4] = [
     [29, 55, 74, 84],
     [74, 74, 0, -74],
     [84, -29, -74, 55],
@@ -240,18 +232,12 @@ static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
 #[inline(always)]
 fn idct_raw_4(c: [i32; 4]) -> [i32; 4] {
-    let mut e = [0i32; 4];
-    for j in 0..4 {
-        let cj = c[j];
-        if cj == 0 {
-            continue;
-        }
-        let trow = &T4[j];
-        for (dst, &tk) in e.iter_mut().zip(trow.iter()) {
-            *dst += tk * cj;
-        }
-    }
-    e
+    let e0 = 64 * (c[0] + c[2]);
+    let e1 = 64 * (c[0] - c[2]);
+    let o0 = 83 * c[1] + 36 * c[3];
+    let o1 = 36 * c[1] - 83 * c[3];
+
+    [e0 + o0, e1 + o1, e1 - o1, e0 - o0]
 }
 
 #[inline(always)]
@@ -320,22 +306,63 @@ fn idct_raw_32(c: [i32; 32]) -> [i32; 32] {
     out
 }
 
-/// 2-D 32×32 partial butterfly IDCT into `out[..1024]`.
+#[inline(always)]
+fn idct_raw<const N: usize>(c: [i32; N]) -> [i32; N] {
+    debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
+
+    match N {
+        4 => {
+            let src = [c[0], c[1], c[2], c[3]];
+            let r = idct_raw_4(src);
+            std::array::from_fn(|i| r[i])
+        }
+        8 => {
+            let src = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
+            let r = idct_raw_8(src);
+            std::array::from_fn(|i| r[i])
+        }
+        16 => {
+            let src = [
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12],
+                c[13], c[14], c[15],
+            ];
+            let r = idct_raw_16(src);
+            std::array::from_fn(|i| r[i])
+        }
+        32 => {
+            let src = [
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12],
+                c[13], c[14], c[15], c[16], c[17], c[18], c[19], c[20], c[21], c[22], c[23], c[24],
+                c[25], c[26], c[27], c[28], c[29], c[30], c[31],
+            ];
+            let r = idct_raw_32(src);
+            std::array::from_fn(|i| r[i])
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// 2-D partial-butterfly inverse DCT into `out[..N*N]`.
 #[inline]
-fn inv_butterfly_32_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
-    const N: usize = 32;
+fn inv_dct_n_into<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
+    debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
+    debug_assert!(coeff.len() >= N * N);
+    debug_assert!(out.len() >= N * N);
+
     let shift1 = 7i32;
     let add1 = 1i32 << (shift1 - 1);
     let shift2 = 20 - bit_depth as i32;
     let add2 = 1i32 << (shift2 - 1);
-    let mut tmp = [0i32; N * N];
+    let mut tmp = [0i32; 32 * 32];
+
     for c in 0..N {
         let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c]);
-        let raw = idct_raw_32(col);
+        let raw = idct_raw::<N>(col);
         for (m, &raw) in raw.iter().enumerate() {
             tmp[m * N + c] = ((raw + add1) >> shift1).clamp(-32768, 32767);
         }
     }
+
     for (tmp_row, out_row) in tmp
         .as_chunks::<N>()
         .0
@@ -343,7 +370,7 @@ fn inv_butterfly_32_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
         .zip(out.as_chunks_mut::<N>().0.iter_mut())
     {
         let row: [i32; N] = std::array::from_fn(|k| tmp_row[k]);
-        let raw = idct_raw_32(row);
+        let raw = idct_raw::<N>(row);
         for (dst, &raw) in out_row.iter_mut().zip(raw.iter()) {
             *dst = (raw + add2) >> shift2;
         }
@@ -428,18 +455,76 @@ pub(crate) fn dequantize_i32_into(
     }
 }
 
-/// Inverse DCT into `out[..n*n]` — no heap allocation.
-pub(crate) fn inv_transform_into(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+type InvTransformFn = fn(&[i32], usize, u8, &mut [i32]);
+type InvTransform4Fn = fn(&[i32], u8, &mut [i32]);
+
+static INV_TRANSFORM: std::sync::OnceLock<InvTransformFn> = std::sync::OnceLock::new();
+static INV_TRANSFORM_DST4: std::sync::OnceLock<InvTransform4Fn> = std::sync::OnceLock::new();
+
+#[inline]
+fn resolve_inv_transform() -> InvTransformFn {
+    *INV_TRANSFORM.get_or_init(|| {
+        let mut _f: InvTransformFn = inv_transform_into_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::inv_transform_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::inv_transform_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_inv_transform_dst4() -> InvTransform4Fn {
+    *INV_TRANSFORM_DST4.get_or_init(|| {
+        let mut _f: InvTransform4Fn = inv_transform_dst_into_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::inv_transform_dst_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::inv_transform_dst_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+/// Scalar inverse DCT into `out[..n*n]` — no heap allocation.
+pub(crate) fn inv_transform_into_scalar(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
     match n {
-        4 => inv_transform_n_into::<4>(coeff, &T4, bit_depth, out),
-        8 => inv_transform_n_into::<8>(coeff, &T8, bit_depth, out),
-        16 => inv_transform_n_into::<16>(coeff, &T16, bit_depth, out),
-        32 => inv_butterfly_32_into(coeff, bit_depth, &mut out[..1024]),
+        4 => inv_dct_n_into::<4>(coeff, bit_depth, out),
+        8 => inv_dct_n_into::<8>(coeff, bit_depth, out),
+        16 => inv_dct_n_into::<16>(coeff, bit_depth, out),
+        32 => inv_dct_n_into::<32>(coeff, bit_depth, out),
         _ => panic!("unsupported transform size {n}"),
     }
 }
 
-/// Inverse 4×4 DST into `out[..16]` — no heap allocation.
-pub(crate) fn inv_transform_dst_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
+/// Scalar inverse 4×4 DST/ADST-like intra transform into `out[..16]`.
+pub(crate) fn inv_transform_dst_into_scalar(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     inv_transform_n_into::<4>(coeff, &DST4, bit_depth, out);
+}
+
+/// Inverse DCT into `out[..n*n]` — no heap allocation.
+pub(crate) fn inv_transform_into(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+    resolve_inv_transform()(coeff, n, bit_depth, out);
+}
+
+/// Inverse 4×4 DST/ADST-like intra transform into `out[..16]` — no heap allocation.
+pub(crate) fn inv_transform_dst_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
+    resolve_inv_transform_dst4()(coeff, bit_depth, out);
 }

@@ -41,6 +41,10 @@ mod info;
 mod intra;
 mod limits;
 mod metadata;
+#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+mod neon;
+#[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+mod sse;
 mod threadpool;
 mod transform;
 mod yuv;
