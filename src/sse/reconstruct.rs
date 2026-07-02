@@ -32,7 +32,7 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-use crate::reconstruct::add_residual_into_scalar;
+use crate::reconstruct::{add_residual_into_scalar, can_reconstruct_full_block, sample_max};
 
 #[inline]
 fn supported_n(n: usize) -> bool {
@@ -152,20 +152,30 @@ fn add_residual_into_sse41_impl(
     bit_depth: u8,
 ) {
     debug_assert!(supported_n(n));
-    let pred = &pred[..n * n];
-    let res = &res[..n * n];
-    let max = _mm_set1_epi32((1i32 << bit_depth) - 1);
+    let Some(n2) = n.checked_mul(n) else {
+        return;
+    };
+    let Some(pred) = pred.get(..n2) else {
+        return;
+    };
+    let Some(res) = res.get(..n2) else {
+        return;
+    };
+    let max = _mm_set1_epi32(sample_max(bit_depth));
 
     for y in 0..n {
         let row_off = y * n;
         let dst_off = y * stride;
-        add_clip_row_sse41(
-            &mut dst[dst_off..dst_off + n],
-            &pred[row_off..row_off + n],
-            &res[row_off..row_off + n],
-            n,
-            max,
-        );
+        let Some(dst_row) = dst.get_mut(dst_off..dst_off.saturating_add(n)) else {
+            break;
+        };
+        let Some(pred_row) = pred.get(row_off..row_off + n) else {
+            break;
+        };
+        let Some(res_row) = res.get(row_off..row_off + n) else {
+            break;
+        };
+        add_clip_row_sse41(dst_row, pred_row, res_row, n, max);
     }
 }
 
@@ -175,10 +185,14 @@ pub(crate) fn add_residual_into_sse41(
     pred: &[u16],
     res: &[i32],
     n: usize,
+    valid_w: usize,
+    valid_h: usize,
     bit_depth: u8,
 ) {
-    if !supported_n(n) {
-        add_residual_into_scalar(dst, stride, pred, res, n, bit_depth);
+    if !supported_n(n)
+        || !can_reconstruct_full_block(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
+    {
+        add_residual_into_scalar(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
         return;
     }
 

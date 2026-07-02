@@ -245,8 +245,26 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         crop_top = r.read_ue().map_err(|_| e("cw_top"))?;
         crop_bottom = r.read_ue().map_err(|_| e("cw_bottom"))?;
     }
-    let bit_depth_luma = r.read_ue().map_err(|_| e("bd_luma"))? as u8 + 8;
-    let bit_depth_chroma = r.read_ue().map_err(|_| e("bd_chroma"))? as u8 + 8;
+    let bit_depth_luma = r
+        .read_ue()
+        .map_err(|_| e("bd_luma"))?
+        .checked_add(8)
+        .filter(|&v| v <= u8::MAX as u32)
+        .map(|v| v as u8)
+        .ok_or_else(|| e("bd_luma"))?;
+    if !matches!(bit_depth_luma, 8 | 10 | 12) {
+        return Err(DecodeError::UnsupportedBitDepth(bit_depth_luma));
+    }
+    let bit_depth_chroma = r
+        .read_ue()
+        .map_err(|_| e("bd_chroma"))?
+        .checked_add(8)
+        .filter(|&v| v <= u8::MAX as u32)
+        .map(|v| v as u8)
+        .ok_or_else(|| e("bd_chroma"))?;
+    if !matches!(bit_depth_chroma, 8 | 10 | 12) {
+        return Err(DecodeError::UnsupportedBitDepth(bit_depth_chroma));
+    }
     let log2_max_poc = r.read_ue().map_err(|_| e("log2_max_poc"))? + 4;
     let _ = log2_max_poc;
 
@@ -262,12 +280,30 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         r.read_ue().map_err(|_| e("max_latency"))?;
     }
 
-    let log2_min_cb = r.read_ue().map_err(|_| e("log2_min_cb"))? + 3;
+    let log2_min_cb = r
+        .read_ue()
+        .map_err(|_| e("log2_min_cb"))?
+        .checked_add(3)
+        .ok_or_else(|| e("log2_min_cb overflow"))?;
     let log2_diff_max_min_cb = r.read_ue().map_err(|_| e("log2_diff_max_min_cb"))?;
-    let log2_ctb = log2_min_cb + log2_diff_max_min_cb;
-    let log2_min_tb = r.read_ue().map_err(|_| e("log2_min_tb"))? + 2;
+    let log2_ctb = log2_min_cb
+        .checked_add(log2_diff_max_min_cb)
+        .ok_or_else(|| e("log2_ctb overflow"))?;
+    let log2_min_tb = r
+        .read_ue()
+        .map_err(|_| e("log2_min_tb"))?
+        .checked_add(2)
+        .ok_or_else(|| e("log2_min_tb overflow"))?;
     let log2_diff_max_min_tb = r.read_ue().map_err(|_| e("log2_diff_max_min_tb"))?;
-    let log2_max_tb = log2_min_tb + log2_diff_max_min_tb;
+    let log2_max_tb = log2_min_tb
+        .checked_add(log2_diff_max_min_tb)
+        .ok_or_else(|| e("log2_max_tb overflow"))?;
+    if !(3..=6).contains(&log2_min_cb) || log2_ctb < log2_min_cb || log2_ctb > 6 {
+        return Err(e("log2_ctb"));
+    }
+    if !(2..=5).contains(&log2_min_tb) || log2_max_tb < log2_min_tb || log2_max_tb > 5 {
+        return Err(e("log2_tb"));
+    }
     let max_transform_hierarchy_inter = r.read_ue().map_err(|_| e("mth_inter"))?;
     let max_transform_hierarchy_intra = r.read_ue().map_err(|_| e("mth_intra"))?;
 

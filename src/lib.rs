@@ -155,7 +155,11 @@ pub(crate) fn decode_heic_yuv_with(
 
     // Single-tile path
     let start = heif.primary.data_offset as usize;
-    let end = start + heif.primary.data_length as usize;
+    let Some(end) = start.checked_add(heif.primary.data_length as usize) else {
+        return Err(DecodeError::Bitstream(
+            "image data offset/length overflows usize".into(),
+        ));
+    };
     if end > file.len() {
         return Err(DecodeError::Bitstream(
             "image data extends past file end".into(),
@@ -278,7 +282,9 @@ fn stitch_yuv_band(
             None => break,
         };
         let start = tile.data_offset as usize;
-        let end = start + tile.data_length as usize;
+        let Some(end) = start.checked_add(tile.data_length as usize) else {
+            continue;
+        };
         if end > ctx.file.len() {
             continue;
         }
@@ -609,7 +615,11 @@ pub(crate) fn decode_heic_with(
     }
 
     let start = heif.primary.data_offset as usize;
-    let end = start + heif.primary.data_length as usize;
+    let Some(end) = start.checked_add(heif.primary.data_length as usize) else {
+        return Err(DecodeError::Bitstream(
+            "image data offset/length overflows usize".into(),
+        ));
+    };
     if end > file.len() {
         return Err(DecodeError::Bitstream(
             "image data extends past file end".into(),
@@ -618,6 +628,7 @@ pub(crate) fn decode_heic_with(
     let (yuv_planes, vui_color) = decode_hevc_item(&file[start..end], &heif.primary.hvcc)?;
     let dw = heif.primary.display_w as usize;
     let dh = heif.primary.display_h as usize;
+    decoder.check_dims(dw, dh)?;
 
     // Color encoding for the YCbCr→RGB step.
     // The VUI matrix/range values describe how the YCbCr was encoded; prefer
@@ -635,14 +646,17 @@ pub(crate) fn decode_heic_with(
     let alpha = if let Some(a) = &heif.alpha {
         if !a.hvcc.is_empty() {
             let astart = a.data_offset as usize;
-            let aend = astart + a.data_length as usize;
-            if aend <= file.len() {
-                decode_hevc_item(&file[astart..aend], &a.hvcc)
-                    .ok()
-                    .map(|(ap, _)| {
-                        let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
-                        plane_to_buf(plane, ap.bit_depth)
-                    })
+            if let Some(aend) = astart.checked_add(a.data_length as usize) {
+                if aend <= file.len() {
+                    decode_hevc_item(&file[astart..aend], &a.hvcc)
+                        .ok()
+                        .map(|(ap, _)| {
+                            let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
+                            plane_to_buf(plane, ap.bit_depth)
+                        })
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -705,7 +719,9 @@ fn stitch_grid_band<T: Copy>(
             None => break,
         };
         let start = tile.data_offset as usize;
-        let end = start + tile.data_length as usize;
+        let Some(end) = start.checked_add(tile.data_length as usize) else {
+            continue;
+        };
         if end > ctx.file.len() {
             continue;
         }

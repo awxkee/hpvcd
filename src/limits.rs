@@ -117,6 +117,9 @@ impl ParseLimits {
     /// Validate declared image geometry against the image-size limits.
     pub(crate) fn check_image(&self, w: u32, h: u32) -> Result<(), crate::error::DecodeError> {
         use crate::error::DecodeError;
+        if w == 0 || h == 0 {
+            return Err(DecodeError::BadDimensions { w, h });
+        }
         if w > self.max_dimension {
             return Err(DecodeError::LimitExceeded {
                 what: "image width",
@@ -157,6 +160,7 @@ mod tests {
     fn defaults_accept_reasonable_and_reject_huge() {
         let l = ParseLimits::default();
         assert!(l.check_image(4032, 3024).is_ok()); // 12 Mpx phone photo
+        assert!(l.check_image(0, 3024).is_err()); // zero dimensions are invalid
         assert!(l.check_image(17_000, 10).is_err()); // over max dimension
         assert!(l.check_image(16_000, 16_000).is_err()); // 256 Mpx > 64 Mpx
     }

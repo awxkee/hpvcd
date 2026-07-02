@@ -35,7 +35,7 @@ while IFS= read -r -d '' crash; do
   echo "=============================="
 
   ASAN_OPTIONS=abort_on_error=1:symbolize=1 \
-    ./target/debug/tealdust-afl < "$crash"
+    ./target/debug/hpvcd-afl < "$crash"
 
   echo "exit=$?"
 done

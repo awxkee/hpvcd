@@ -202,8 +202,12 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
     for b in Boxes::with_limit(meta, mbs) {
         match &b.fourcc {
             b"pitm" => {
-                if let Some((_, _, rest)) = fullbox_header(b.payload) {
-                    pitm = u16::from_be_bytes(rest[..2].try_into().unwrap_or([0; 2]));
+                if let Some((version, _, rest)) = fullbox_header(b.payload) {
+                    pitm = if version == 1 {
+                        read_u32(rest, 0).map(|v| v as u16).unwrap_or(pitm)
+                    } else {
+                        read_u16(rest, 0).unwrap_or(pitm)
+                    };
                 }
             }
             b"iloc" => iloc_data = Some(b.payload),

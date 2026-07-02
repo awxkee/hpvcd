@@ -62,6 +62,20 @@ pub(crate) fn yuv_to_rgb_with_color(
     dh: usize,
     color: &Cicp,
 ) -> ImageBuffer {
+    if dw == 0 || dh == 0 || yuv.width == 0 || yuv.height == 0 {
+        return if yuv.chroma.is_monochrome() {
+            if yuv.bit_depth == BitDepth::Eight {
+                ImageBuffer::Luma8(Vec::new())
+            } else {
+                ImageBuffer::Luma16(Vec::new())
+            }
+        } else if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(Vec::new())
+        } else {
+            ImageBuffer::Rgb16(Vec::new())
+        };
+    }
+
     if yuv.chroma.is_monochrome() {
         let y_black = if color.full_range {
             0i64
@@ -248,6 +262,14 @@ pub(crate) fn yuv_to_rgb_with_color(
 }
 
 pub(crate) fn ycgco_to_rgb(yuv: &YuvPlanes, dw: usize, dh: usize) -> ImageBuffer {
+    if dw == 0 || dh == 0 || yuv.width == 0 || yuv.height == 0 {
+        return if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(Vec::new())
+        } else {
+            ImageBuffer::Rgb16(Vec::new())
+        };
+    }
+
     let scale = 1i64 << yuv.bit_depth.minus8();
     let neutral = 128 * scale; // 1 << (bit_depth - 1)
     let max_val = yuv.bit_depth.max_val() as i64;

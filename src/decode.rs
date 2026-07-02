@@ -80,9 +80,9 @@ pub(crate) struct FullDecoder {
     decoded: Vec<bool>, // per 4×4 luma block
     tqb: Vec<bool>,     // per 4×4 luma block: cu_transquant_bypass_flag (lossless)
     cu_tqb: bool,       // current CU's cu_transquant_bypass_flag
-    grid_w: usize,      // w/4
+    grid_w: usize,      // ceil(w/4), one entry for every covered 4×4 luma grid cell
     #[allow(dead_code)]
-    grid_h: usize, // h/4
+    grid_h: usize, // ceil(h/4)
     ct_depth: Vec<u8>,  // per 4×4, coding-tree depth (for split_cu_flag ctx)
 
     // QP tracking
@@ -156,6 +156,14 @@ impl FullDecoder {
                 w, h
             )));
         }
+        // The pixel/output paths are implemented for 8/10/12-bit streams only.
+        // Reject malformed SPS values before they reach shifts like `1 << (bd - 1)`.
+        sps.bit_depth()?;
+        match sps.bit_depth_chroma {
+            8 | 10 | 12 => {}
+            n => return Err(DecodeError::UnsupportedBitDepth(n)),
+        }
+
         let cab =
             CabacDecoder::new(cabac).map_err(|_| DecodeError::Bitstream("cabac init".into()))?;
         let log2_ctb = sps.log2_ctb;
@@ -165,15 +173,15 @@ impl FullDecoder {
         let cw = if sps.chroma.is_monochrome() {
             0
         } else {
-            w / sub_w
+            w.div_ceil(sub_w)
         };
         let ch = if sps.chroma.is_monochrome() {
             0
         } else {
-            h / sub_h
+            h.div_ceil(sub_h)
         };
-        let grid_w = w / 4;
-        let grid_h = h / 4;
+        let grid_w = w.div_ceil(4);
+        let grid_h = h.div_ceil(4);
         let qp = ContextSet::init_islice(slice_qp.clamp(0, 51) as u8);
         let ictx = IntraModeContexts::init_islice(slice_qp.clamp(0, 51) as u8);
         let ctb_cols = w.div_ceil(ctb);
@@ -332,7 +340,11 @@ impl FullDecoder {
             // then the next row's sub-stream starts.
             if wpp && ry < self.ctb_rows - 1 {
                 let eoss = self.cab.decode_terminate();
-                debug_assert_eq!(eoss, 1, "WPP: end_of_sub_stream_one_bit must be 1");
+                if eoss != 1 {
+                    return Err(DecodeError::Bitstream(
+                        "WPP end_of_sub_stream_one_bit must be 1".into(),
+                    ));
+                }
                 self.cab.byte_align();
                 // Engine reinit happens at the top of the next loop iteration.
             }
@@ -496,10 +508,24 @@ impl FullDecoder {
         let cw = self.cw;
         let ch = self.ch;
         let gw = self.grid_w;
+        let gh = self.grid_h;
+        let default_qp = self.slice_qp as i16;
 
-        // Helper: look up qp_y_map for a luma pixel (rounded to 4×4 grid)
+        // Helper: look up qp_y_map for a luma pixel (rounded to 4×4 grid).
+        // Fuzzed / malformed pictures can be smaller than 4 pixels in one
+        // dimension; avoid the old `w / 4 - 1` / `h / 4 - 1` underflow and
+        // treat missing grid entries as the slice QP.
         let qp_at = |qp_map: &[i16], px: usize, py: usize| -> i32 {
-            qp_map[(py / 4).min(h / 4 - 1) * gw + (px / 4).min(w / 4 - 1)] as i32
+            if qp_map.is_empty() || gw == 0 || gh == 0 {
+                return default_qp as i32;
+            }
+            let gx = (px / 4).min(gw.saturating_sub(1));
+            let gy = (py / 4).min(gh.saturating_sub(1));
+            gy.checked_mul(gw)
+                .and_then(|base| base.checked_add(gx))
+                .and_then(|idx| qp_map.get(idx))
+                .copied()
+                .unwrap_or(default_qp) as i32
         };
 
         // Vertical edges first (filter across columns), then horizontal.
@@ -514,7 +540,12 @@ impl FullDecoder {
             let _ = scan_step;
 
             let mut edge = 8; // skip image boundary
-            while edge < edge_max {
+            // The luma filter reads/writes up to p3 and q3. On fuzzed edge
+            // geometry the final nominal 8-pixel edge can be too close to the
+            // picture boundary, so only run full filtering when both sides have
+            // all required samples.
+            let last_full_edge = edge_max.saturating_sub(4);
+            while edge <= last_full_edge {
                 // For each 4-pixel segment along the edge
                 let mut scan = 0;
                 while scan + 4 <= scan_max {
@@ -733,7 +764,11 @@ impl FullDecoder {
             let maxv_c = (1i32 << self.bd_c) - 1;
 
             let mut edge = 8;
-            while edge < if pass == 0 { cw } else { ch } {
+            let chroma_edge_max = if pass == 0 { cw } else { ch };
+            // Chroma filter reads p1 and q1 around the edge, so require at
+            // least one q-side sample beyond the boundary.
+            let last_full_chroma_edge = chroma_edge_max.saturating_sub(2);
+            while edge <= last_full_chroma_edge {
                 let mut scan = 0;
                 while scan + 4 <= scan_max {
                     let mid = scan + 1;
@@ -951,17 +986,19 @@ impl FullDecoder {
 
     fn split_cu_ctx(&self, x0: usize, y0: usize, depth: u8) -> usize {
         let mut inc = 0;
-        if x0 >= 4 {
-            let g = (y0 / 4) * self.grid_w + (x0 - 1) / 4;
-            if self.decoded[g] && self.ct_depth[g] as usize > depth as usize {
-                inc += 1;
-            }
+        if x0 >= 4
+            && let Some(g) = self.grid_idx(x0 - 1, y0)
+            && self.decoded[g]
+            && self.ct_depth[g] as usize > depth as usize
+        {
+            inc += 1;
         }
-        if y0 >= 4 {
-            let g = ((y0 - 1) / 4) * self.grid_w + x0 / 4;
-            if self.decoded[g] && self.ct_depth[g] as usize > depth as usize {
-                inc += 1;
-            }
+        if y0 >= 4
+            && let Some(g) = self.grid_idx(x0, y0 - 1)
+            && self.decoded[g]
+            && self.ct_depth[g] as usize > depth as usize
+        {
+            inc += 1;
         }
         inc
     }
@@ -969,8 +1006,11 @@ impl FullDecoder {
     fn set_ct_depth(&mut self, x0: usize, y0: usize, size: usize, depth: u8) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w && yy < self.h {
-                    self.ct_depth[(yy / 4) * self.grid_w + xx / 4] = depth;
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.ct_depth[g] = depth;
                 }
             }
         }
@@ -1084,6 +1124,15 @@ impl FullDecoder {
         self.set_qp(x0, y0, cb_size, self.cur_qp);
     }
 
+    #[inline]
+    fn grid_idx(&self, x: usize, y: usize) -> Option<usize> {
+        if x >= self.w || y >= self.h {
+            return None;
+        }
+        let idx = (y / 4).checked_mul(self.grid_w)?.checked_add(x / 4)?;
+        (idx < self.decoded.len()).then_some(idx)
+    }
+
     fn predict_qp(&self, xqg: usize, yqg: usize) -> i32 {
         let ctb = 1usize << self.log2_ctb;
         let ctb_x = (xqg / ctb) * ctb;
@@ -1097,13 +1146,21 @@ impl FullDecoder {
 
         // qPY_A: left neighbor, must be in same CTB
         let qp_a = if xqg >= 1 && (xqg - 1) >= ctb_x {
-            self.qp_y_map[(yqg / 4) * self.grid_w + (xqg - 1) / 4] as i32
+            self.grid_idx(xqg - 1, yqg)
+                .and_then(|g| self.qp_y_map.get(g))
+                .copied()
+                .map(i32::from)
+                .unwrap_or(self.qp_y_prev)
         } else {
             self.qp_y_prev
         };
         // qPY_B: above neighbor, must be in same CTB
         let qp_b = if yqg >= 1 && (yqg - 1) >= ctb_y {
-            self.qp_y_map[((yqg - 1) / 4) * self.grid_w + xqg / 4] as i32
+            self.grid_idx(xqg, yqg - 1)
+                .and_then(|g| self.qp_y_map.get(g))
+                .copied()
+                .map(i32::from)
+                .unwrap_or(self.qp_y_prev)
         } else {
             self.qp_y_prev
         };
@@ -1113,8 +1170,11 @@ impl FullDecoder {
     fn set_qp(&mut self, x0: usize, y0: usize, size: usize, qp: i32) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w && yy < self.h {
-                    self.qp_y_map[(yy / 4) * self.grid_w + xx / 4] = qp as i16;
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.qp_y_map[g] = qp as i16;
                 }
             }
         }
@@ -1123,8 +1183,11 @@ impl FullDecoder {
     fn set_mode(&mut self, x0: usize, y0: usize, size: usize, mode: u8) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w && yy < self.h {
-                    self.mode_y[(yy / 4) * self.grid_w + xx / 4] = mode;
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.mode_y[g] = mode;
                 }
             }
         }
@@ -1133,8 +1196,11 @@ impl FullDecoder {
     fn mark_decoded(&mut self, x0: usize, y0: usize, size: usize) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w && yy < self.h {
-                    self.decoded[(yy / 4) * self.grid_w + xx / 4] = true;
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.decoded[g] = true;
                 }
             }
         }
@@ -1143,8 +1209,11 @@ impl FullDecoder {
     fn set_tqb(&mut self, x0: usize, y0: usize, size: usize) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w && yy < self.h {
-                    self.tqb[(yy / 4) * self.grid_w + xx / 4] = true;
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.tqb[g] = true;
                 }
             }
         }
@@ -1155,7 +1224,10 @@ impl FullDecoder {
         if px >= self.w || py >= self.h {
             return false;
         }
-        self.tqb[(py / 4) * self.grid_w + px / 4]
+        self.grid_idx(px, py)
+            .and_then(|g| self.tqb.get(g))
+            .copied()
+            .unwrap_or(false)
     }
 
     fn derive_luma_mode(&self, x0: usize, y0: usize, prev: bool, val: u8) -> u8 {
@@ -1181,8 +1253,10 @@ impl FullDecoder {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
             return MODE_DC;
         }
-        let g = (y as usize / 4) * self.grid_w + x as usize / 4;
-        self.mode_y[g]
+        self.grid_idx(x as usize, y as usize)
+            .and_then(|g| self.mode_y.get(g))
+            .copied()
+            .unwrap_or(MODE_DC)
     }
 
     fn decode_chroma_mode(&mut self, luma_mode: u8) -> u8 {
@@ -1500,7 +1574,52 @@ impl FullDecoder {
     }
 
     fn luma_mode_at(&self, x0: usize, y0: usize, _modes: &[u8; 4], _blk: u8) -> u8 {
-        self.mode_y[(y0 / 4) * self.grid_w + x0 / 4]
+        self.grid_idx(x0, y0)
+            .and_then(|g| self.mode_y.get(g))
+            .copied()
+            .unwrap_or(MODE_DC)
+    }
+}
+
+#[inline]
+fn plane_tail_mut(plane: &mut [u16], stride: usize, x0: usize, y0: usize) -> Option<&mut [u16]> {
+    if stride == 0 {
+        return None;
+    }
+    let off = y0.checked_mul(stride)?.checked_add(x0)?;
+    plane.get_mut(off..)
+}
+
+fn copy_pred_block_clipped(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+) {
+    if n == 0 || stride == 0 {
+        return;
+    }
+    let Some(n2) = n.checked_mul(n) else {
+        return;
+    };
+    if pred.len() < n2 {
+        return;
+    }
+    let valid_w = valid_w.min(n).min(stride);
+    let valid_h = valid_h.min(n);
+    for y in 0..valid_h {
+        let dst_off = y.saturating_mul(stride);
+        if dst_off >= dst.len() {
+            break;
+        }
+        let cols = valid_w.min(dst.len() - dst_off);
+        if cols == 0 {
+            break;
+        }
+        let row_off = y * n;
+        dst[dst_off..dst_off + cols].copy_from_slice(&pred[row_off..row_off + cols]);
     }
 }
 
@@ -1541,7 +1660,10 @@ impl FullDecoder {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
             return false;
         }
-        self.decoded[(y as usize / 4) * self.grid_w + x as usize / 4]
+        self.grid_idx(x as usize, y as usize)
+            .and_then(|g| self.decoded.get(g))
+            .copied()
+            .unwrap_or(false)
     }
     fn chroma_avail(&self, cx: i32, cy: i32) -> bool {
         if cx < 0 || cy < 0 || cx as usize >= self.cw || cy as usize >= self.ch {
@@ -1552,7 +1674,10 @@ impl FullDecoder {
         if lx >= self.w || ly >= self.h {
             return false;
         }
-        self.decoded[(ly / 4) * self.grid_w + lx / 4]
+        self.grid_idx(lx, ly)
+            .and_then(|g| self.decoded.get(g))
+            .copied()
+            .unwrap_or(false)
     }
 
     fn gather_luma_refs_into(
@@ -1613,8 +1738,14 @@ impl FullDecoder {
         let pred = &self.scratch.pred[..n * n];
         let res = &self.res_scratch[..n * n];
         let stride = self.w;
-        let dst = &mut self.y[y0 * stride + x0..];
-        reconstruct::add_residual_into(dst, stride, pred, res, n, self.bd);
+        let valid_w = self.w.saturating_sub(x0).min(n);
+        let valid_h = self.h.saturating_sub(y0).min(n);
+        if valid_w != 0
+            && valid_h != 0
+            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+        {
+            reconstruct::add_residual_into(dst, stride, pred, res, n, valid_w, valid_h, self.bd);
+        }
         self.mark_decoded(x0, y0, n);
     }
 
@@ -1623,9 +1754,13 @@ impl FullDecoder {
         self.predict_luma_block_into(x0, y0, n, mode);
         let pred = &self.scratch.pred[..n * n];
         let stride = self.w;
-        let dst = &mut self.y[y0 * stride + x0..];
-        for (dst_row, pred_row) in dst.chunks_mut(stride).take(n).zip(pred.chunks_exact(n)) {
-            dst_row[..n].copy_from_slice(pred_row);
+        let valid_w = self.w.saturating_sub(x0).min(n);
+        let valid_h = self.h.saturating_sub(y0).min(n);
+        if valid_w != 0
+            && valid_h != 0
+            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+        {
+            copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -1634,7 +1769,9 @@ impl FullDecoder {
         let mut above = std::mem::take(&mut self.scratch.raw_above);
         let mut left = std::mem::take(&mut self.scratch.raw_left);
         let corner = self.gather_luma_refs_into(x0, y0, n, &mut above[..2 * n], &mut left[..2 * n]);
-        let neutral = 1u16 << (self.bd - 1);
+        let neutral = 1u16
+            .checked_shl((self.bd.saturating_sub(1)) as u32)
+            .unwrap_or(0);
         let strong = self.strong_smoothing && self.sps.strong_intra_smoothing;
         let sc = &mut self.scratch;
         intra::substitute_refs_into(
@@ -1791,7 +1928,9 @@ impl FullDecoder {
             &mut above[..2 * n],
             &mut left[..2 * n],
         );
-        let neutral = 1u16 << (self.bd_c - 1);
+        let neutral = 1u16
+            .checked_shl((self.bd_c.saturating_sub(1)) as u32)
+            .unwrap_or(0);
         let sc = &mut self.scratch;
         intra::substitute_refs_into(
             corner,
@@ -1882,12 +2021,15 @@ impl FullDecoder {
         let pred = &self.scratch.pred[..n2];
         let res = &self.res_scratch[..n2];
         let stride = self.cw;
-        if is_cb {
-            let dst = &mut self.cb[cy0 * stride + cx0..];
-            reconstruct::add_residual_into(dst, stride, pred, res, n, self.bd_c);
-        } else {
-            let dst = &mut self.cr[cy0 * stride + cx0..];
-            reconstruct::add_residual_into(dst, stride, pred, res, n, self.bd_c);
+        let valid_w = self.cw.saturating_sub(cx0).min(n);
+        let valid_h = self.ch.saturating_sub(cy0).min(n);
+        if valid_w != 0 && valid_h != 0 {
+            let plane = if is_cb { &mut self.cb } else { &mut self.cr };
+            if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
+                reconstruct::add_residual_into(
+                    dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+                );
+            }
         }
     }
 
@@ -1900,11 +2042,14 @@ impl FullDecoder {
             buf
         };
         let stride = self.cw;
-        let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-        let pred = &pred_tmp[..n2];
-        let dst = &mut plane[cy0 * stride + cx0..];
-        for (dst_row, pred_row) in dst.chunks_mut(stride).take(n).zip(pred.chunks_exact(n)) {
-            dst_row[..n].copy_from_slice(pred_row);
+        let valid_w = self.cw.saturating_sub(cx0).min(n);
+        let valid_h = self.ch.saturating_sub(cy0).min(n);
+        if valid_w != 0 && valid_h != 0 {
+            let plane = if is_cb { &mut self.cb } else { &mut self.cr };
+            let pred = &pred_tmp[..n2];
+            if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
+                copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
+            }
         }
     }
 }
