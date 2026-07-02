@@ -179,6 +179,7 @@ fn add_residual_into_sse41_impl(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn add_residual_into_sse41(
     dst: &mut [u16],
     stride: usize,
