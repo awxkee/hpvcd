@@ -178,8 +178,6 @@ pub(crate) fn run_wavefront(
     debug_assert_eq!(ctb_rows, template.ctb_rows_pub());
 
     // Per-row completed-column counters and context-snapshot hand-off slots.
-    // These persist across bands so a band's first row can seed from the
-    // previous band's last row.
     let progress: Vec<AtomicUsize> = (0..ctb_rows).map(|_| AtomicUsize::new(0)).collect();
     let snapshots: Vec<OnceLock<(ContextSet, IntraModeContexts)>> =
         (0..ctb_rows).map(|_| OnceLock::new()).collect();
@@ -191,50 +189,52 @@ pub(crate) fn run_wavefront(
 
     let first_err: OnceLock<DecodeError> = OnceLock::new();
 
-    // Band size: at most the worker count, at least 1, capped by rows.
-    let band = pool.threads().max(1);
+    // Shared row dispatcher: each runner claims the next row via fetch_add.
+    let next_row = AtomicUsize::new(0);
 
-    let mut band_start = 0usize;
-    while band_start < ctb_rows {
-        // Stop dispatching further bands once an error has occurred.
-        if first_err.get().is_some() {
-            break;
-        }
-        let band_end = (band_start + band).min(ctb_rows);
+    let n_runners = pool.threads().max(1).min(ctb_rows);
 
-        pool.scope(|scope| {
-            for ry in band_start..band_end {
-                let sub = rows[ry];
-                if sub.start > sub.end || sub.end > rbsp.len() {
-                    let _ = first_err.set(DecodeError::Bitstream("wpp substream range".into()));
-                    // Publish so the row below (same band) never stalls.
-                    let _ = snapshots[ry].set(default_contexts());
-                    progress[ry].store(usize::MAX, Ordering::Release);
-                    continue;
-                }
-                let row_cabac = &rbsp[sub.start..sub.end];
+    pool.scope(|scope| {
+        for _ in 0..n_runners {
+            let progress_ref = &progress;
+            let snapshots_ref = &snapshots;
+            let first_err_ref = &first_err;
+            let factory_ref = &factory;
+            let next_row_ref = &next_row;
+            let init_ctx = init_ctx.clone();
 
-                let progress_ref = &progress;
-                let snapshots_ref = &snapshots;
-                let init_ctx = init_ctx.clone();
-                let first_err_ref = &first_err;
-                let factory_ref = &factory;
+            scope.spawn(move || {
+                loop {
+                    // Claim the next row. Stop once all rows are taken or an
+                    // error has been recorded (so we drain instead of spinning).
+                    let ry = next_row_ref.fetch_add(1, Ordering::Relaxed);
+                    if ry >= ctb_rows || first_err_ref.get().is_some() {
+                        break;
+                    }
 
-                scope.spawn(move || {
-                    // Seed contexts. Row 0 of the whole picture uses I-slice
-                    // init; every other row (including a band's first row) waits
-                    // for the row above to publish its post-CTB-1 snapshot. For a
-                    // band's first row the above row is in the *previous* band,
-                    // already finished, so its snapshot is already set.
+                    let sub = rows[ry];
+                    if sub.start > sub.end || sub.end > rbsp.len() {
+                        let _ =
+                            first_err_ref.set(DecodeError::Bitstream("wpp substream range".into()));
+                        // Unblock the row below so its runner never stalls.
+                        let _ = snapshots_ref[ry].set(default_contexts());
+                        progress_ref[ry].store(usize::MAX, Ordering::Release);
+                        continue;
+                    }
+                    let row_cabac = &rbsp[sub.start..sub.end];
+
+                    // Seed contexts. Row 0 uses I-slice init; any other row
+                    // waits for the row above to publish its post-CTB-1 snapshot.
+                    // The row above has a smaller index, hence was claimed
+                    // earlier and is in flight, so this wait always resolves.
                     let (ctx, ictx) = if ry == 0 {
-                        (init_ctx, init_ictx)
+                        (init_ctx.clone(), init_ictx)
                     } else {
                         loop {
                             if let Some(snap) = snapshots_ref[ry - 1].get() {
                                 break snap.clone();
                             }
                             if first_err_ref.get().is_some() {
-                                // Predecessor failed; bail without decoding.
                                 break default_contexts();
                             }
                             std::hint::spin_loop();
@@ -242,21 +242,17 @@ pub(crate) fn run_wavefront(
                     };
 
                     // SAFETY: disjointness upheld by the 2-CTB lag; buffers live
-                    // for the whole run (template outlives every band scope).
+                    // for the whole scope (template outlives it).
                     let mut row = match unsafe { factory_ref.make(row_cabac, ctx, ictx) } {
                         Ok(r) => r,
                         Err(e) => {
                             let _ = first_err_ref.set(e);
                             let _ = snapshots_ref[ry].set(default_contexts());
                             progress_ref[ry].store(usize::MAX, Ordering::Release);
-                            return;
+                            continue;
                         }
                     };
 
-                    // The gate row is the one directly above. It is in this band
-                    // (scheduled) unless ry is the band's first row, in which case
-                    // it is in the previous, already-completed band — its
-                    // `progress` is `cols+2`, so the gate opens immediately.
                     let above = if ry == 0 {
                         None
                     } else {
@@ -267,12 +263,10 @@ pub(crate) fn run_wavefront(
                     {
                         let _ = first_err_ref.set(e);
                     }
-                });
-            }
-        });
-
-        band_start = band_end;
-    }
+                }
+            });
+        }
+    });
 
     if let Some(e) = first_err.into_inner() {
         return Err(e);

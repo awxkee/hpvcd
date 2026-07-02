@@ -575,7 +575,7 @@ fn decode_hevc_item(
             continue; // non-VCL
         }
 
-        let (rbsp, src_of) = crate::bitreader::unescape_rbsp_with_map(nal_bytes);
+        let rbsp = crate::bitreader::unescape_rbsp(nal_bytes);
         let hdr = match parse_slice_header_full(&rbsp, &sps, &pps, nal_type) {
             Ok(h) => h,
             Err(_) => continue, // skip a slice we can't parse rather than failing whole image
@@ -594,7 +594,7 @@ fn decode_hevc_item(
                 // picture when eligible (single independent segment, WPP, entry
                 // points). Otherwise fall back to the serial per-row decode.
                 let ran_wavefront = match pool {
-                    Some(p) => d.try_decode_wavefront(&rbsp, &src_of, &hdr, p)?,
+                    Some(p) => d.try_decode_wavefront(&rbsp, nal_bytes, &hdr, p)?,
                     None => false,
                 };
                 if !ran_wavefront {

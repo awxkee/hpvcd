@@ -41,6 +41,11 @@ use crate::yuv::YuvPlanes;
 const MODE_PLANAR: u8 = 0;
 const MODE_DC: u8 = 1;
 
+/// Minimum total CTB count before the WPP wavefront is worth its fixed costs.
+/// Below this the serial per-row decode is faster (spawn/coordination overhead
+/// and the diagonal ramp dominate). ~64 CTBs ≈ a 512×512 picture at 64×64 CTBs.
+const WAVEFRONT_MIN_CTBS: usize = 64;
+
 #[derive(Clone, Default)]
 struct SaoCtb {
     type_idx: [u8; 3], // 0=off,1=band,2=edge
@@ -281,6 +286,16 @@ impl FullDecoder {
     /// and the parallel wavefront so both parse every CTB identically.
     #[inline]
     fn decode_one_ctb(&mut self, rx: usize, ry: usize, wpp: bool) -> bool {
+        self.decode_one_ctb_inner(rx, ry, wpp, true)
+    }
+
+    /// As [`decode_one_ctb`], but `store_snap` controls whether the post-CTB-1
+    /// context snapshot is written into `wpp_ctx_snap`/`wpp_ictx_snap`. The
+    /// serial path needs it (rows share one decoder); the wavefront path sets
+    /// `false` and captures the snapshot directly from `self.ctx`/`self.ictx`,
+    /// avoiding the per-row `Vec<Option<..>>` allocations entirely.
+    #[inline]
+    fn decode_one_ctb_inner(&mut self, rx: usize, ry: usize, wpp: bool, store_snap: bool) -> bool {
         let ctb = 1usize << self.log2_ctb;
         if self.sps.sao_enabled {
             self.parse_sao(rx, ry);
@@ -289,7 +304,7 @@ impl FullDecoder {
         self.coding_quadtree(rx * ctb, ry * ctb, self.log2_ctb, 0);
 
         // WPP: save context snapshot after the 2nd CTB of each row.
-        if wpp && rx == 1 {
+        if store_snap && wpp && rx == 1 {
             self.wpp_ctx_snap[ry] = Some(self.ctx.clone());
             self.wpp_ictx_snap[ry] = Some(self.ictx);
         }
@@ -309,7 +324,7 @@ impl FullDecoder {
     pub(crate) fn try_decode_wavefront(
         &mut self,
         rbsp: &[u8],
-        src_of: &[usize],
+        nal_bytes: &[u8],
         hdr: &SliceHeader,
         pool: &crate::threadpool::ThreadPool,
     ) -> Result<bool, DecodeError> {
@@ -321,8 +336,23 @@ impl FullDecoder {
         {
             return Ok(false);
         }
+        // Below a minimum amount of work the wavefront's fixed costs (runner
+        // spawn, per-row decoder construction, atomic coordination) outweigh the
+        // serial decode, and the diagonal ramp-up leaves most cores idle anyway.
+        // Require enough CTB rows to fill the pool plus a couple of diagonals,
+        // and a non-trivial total CTB count. Tuned conservatively; small stills
+        // fall through to the serial path.
+        let total_ctbs = self.ctb_cols * self.ctb_rows;
+        let enough_rows = self.ctb_rows >= pool.threads().max(2) + 2;
+        if total_ctbs < WAVEFRONT_MIN_CTBS || !enough_rows {
+            return Ok(false);
+        }
+        // Only now (wavefront is actually going to run) build the NAL→RBSP
+        // offset map — it costs ~8 bytes per RBSP byte, so we avoid it on the
+        // common serial / non-WPP path entirely.
+        let src_of = crate::bitreader::rbsp_src_map(nal_bytes);
         let rows = match crate::wpp::row_substreams(
-            src_of,
+            &src_of,
             hdr.cabac_offset,
             &hdr.entry_points,
             rbsp.len(),
@@ -429,16 +459,12 @@ impl FullDecoder {
                     std::hint::spin_loop();
                 }
             }
-            let terminated = self.decode_one_ctb(rx, ry, true);
+            let terminated = self.decode_one_ctb_inner(rx, ry, true, false);
 
-            // Publish the post-CTB-1 snapshot for the row below. `decode_one_ctb`
-            // stored it into our own `wpp_ctx_snap[ry]`/`wpp_ictx_snap[ry]` when
-            // rx == 1; hand it off exactly once.
-            if rx == 1
-                && let (Some(ctx), Some(ictx)) =
-                    (self.wpp_ctx_snap[ry].take(), self.wpp_ictx_snap[ry].take())
-            {
-                let _ = snapshot_out.set((ctx, ictx));
+            // Publish the post-CTB-1 snapshot for the row below, straight from
+            // the live contexts (no per-row snapshot array needed).
+            if rx == 1 {
+                let _ = snapshot_out.set((self.ctx.clone(), self.ictx));
             }
 
             // Publish progress *after* the CTB is fully reconstructed so a waiter
@@ -2429,8 +2455,11 @@ impl RowFactory {
             beta_offset_div2: self.beta_offset_div2,
             tc_offset_div2: self.tc_offset_div2,
             sign_hiding: self.sign_hiding,
-            wpp_ctx_snap: vec![None; self.ctb_rows],
-            wpp_ictx_snap: vec![None; self.ctb_rows],
+            // Row-views capture the WPP snapshot directly from live contexts, so
+            // these arrays are never indexed here — keep them empty (no O(rows)
+            // allocation per row).
+            wpp_ctx_snap: Vec::new(),
+            wpp_ictx_snap: Vec::new(),
             scratch: intra::IntraScratch::new(),
             deq_scratch: vec![0i32; 1024],
             res_scratch: vec![0i32; 1024],
