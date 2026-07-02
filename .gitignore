@@ -8,3 +8,4 @@ app/target
 *.heic
 Cargo.lock
 corpus
+findings
