@@ -254,7 +254,7 @@ impl ThreadPool {
         for id in 0..threads {
             let shared = Arc::clone(&shared);
             let handle = thread::Builder::new()
-                .name(format!("hpvcd-worker-{id}"))
+                .name(format!("hpvcd-worker-{}", id))
                 .spawn(move || worker_loop(shared, id))
                 .expect("spawn worker thread");
             workers.push(handle);

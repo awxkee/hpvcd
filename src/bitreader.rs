@@ -129,9 +129,46 @@ pub(crate) fn unescape_rbsp(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Like [`unescape_rbsp`], but also returns, for each RBSP (output) byte, the
+/// index of the NAL (source) byte it came from. This lets a NAL-relative offset
+/// — such as a WPP `entry_point_offset` — be translated into an RBSP offset:
+/// find the first RBSP index whose source index is ≥ the NAL offset.
+///
+/// `src_of[k]` is the source index of RBSP byte `k`; it is strictly increasing.
+/// To map a NAL byte offset `nal_off` to an RBSP offset, use
+/// [`nal_to_rbsp_offset`].
+pub(crate) fn unescape_rbsp_with_map(src: &[u8]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = Vec::with_capacity(src.len());
+    let mut src_of = Vec::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        if i + 2 < src.len() && src[i] == 0x00 && src[i + 1] == 0x00 && src[i + 2] == 0x03 {
+            out.push(0x00);
+            src_of.push(i);
+            out.push(0x00);
+            src_of.push(i + 1);
+            i += 3; // skip the 0x03 emulation-prevention byte
+        } else {
+            out.push(src[i]);
+            src_of.push(i);
+            i += 1;
+        }
+    }
+    (out, src_of)
+}
+
+/// Translate a NAL-relative byte offset into an RBSP byte offset using the
+/// `src_of` map from [`unescape_rbsp_with_map`]. Returns the first RBSP index
+/// whose source index is ≥ `nal_off`; if none (the offset is past the last kept
+/// byte), returns `src_of.len()` (i.e. the RBSP length).
+pub(crate) fn nal_to_rbsp_offset(src_of: &[usize], nal_off: usize) -> usize {
+    // `src_of` is strictly increasing, so binary-search the partition point.
+    src_of.partition_point(|&s| s < nal_off)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::bitreader::{BitReader, unescape_rbsp};
 
     #[test]
     fn round_trip_ue() {
