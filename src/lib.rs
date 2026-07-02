@@ -32,6 +32,7 @@ mod bitreader;
 mod cabac;
 mod color;
 mod config;
+mod deblock;
 mod decode;
 mod decoder;
 mod error;
@@ -43,12 +44,14 @@ mod limits;
 mod metadata;
 #[cfg(all(feature = "neon", target_arch = "aarch64"))]
 mod neon;
+mod plane;
 mod reconstruct;
 mod sao;
 #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
 mod sse;
 mod threadpool;
 mod transform;
+mod wpp;
 mod yuv;
 
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
@@ -128,7 +131,7 @@ fn decode_alpha_plane(
     if aend > file.len() {
         return None;
     }
-    decode_hevc_item(&file[astart..aend], &a.hvcc)
+    decode_hevc_item(&file[astart..aend], &a.hvcc, None)
         .ok()
         .map(|(ap, _)| {
             let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
@@ -165,7 +168,8 @@ pub(crate) fn decode_heic_yuv_with(
             "image data extends past file end".into(),
         ));
     }
-    let (planes, _) = decode_hevc_item(&file[start..end], &heif.primary.hvcc)?;
+    let (planes, _) =
+        decode_hevc_item(&file[start..end], &heif.primary.hvcc, Some(decoder.pool()))?;
     let dw = heif.primary.display_w as usize;
     let dh = heif.primary.display_h as usize;
     decoder.check_dims(dw, dh)?;
@@ -296,7 +300,7 @@ fn stitch_yuv_band(
         if hvcc.is_empty() {
             continue;
         }
-        let (planes, _) = match decode_hevc_item(&ctx.file[start..end], hvcc) {
+        let (planes, _) = match decode_hevc_item(&ctx.file[start..end], hvcc, None) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -534,8 +538,11 @@ fn decode_grid_yuv(
     })
 }
 
-fn decode_hevc_item(sample: &[u8], hvcc: &[u8]) -> Result<(yuv::YuvPlanes, Cicp), DecodeError> {
-    use bitreader::unescape_rbsp;
+fn decode_hevc_item(
+    sample: &[u8],
+    hvcc: &[u8],
+    pool: Option<&threadpool::ThreadPool>,
+) -> Result<(yuv::YuvPlanes, Cicp), DecodeError> {
     use config::parse_hvcc_full;
     use decode::{FullDecoder, parse_slice_header_full};
 
@@ -568,7 +575,7 @@ fn decode_hevc_item(sample: &[u8], hvcc: &[u8]) -> Result<(yuv::YuvPlanes, Cicp)
             continue; // non-VCL
         }
 
-        let rbsp = unescape_rbsp(nal_bytes);
+        let rbsp = crate::bitreader::unescape_rbsp(nal_bytes);
         let hdr = match parse_slice_header_full(&rbsp, &sps, &pps, nal_type) {
             Ok(h) => h,
             Err(_) => continue, // skip a slice we can't parse rather than failing whole image
@@ -583,7 +590,16 @@ fn decode_hevc_item(sample: &[u8], hvcc: &[u8]) -> Result<(yuv::YuvPlanes, Cicp)
                     continue;
                 }
                 let mut d = FullDecoder::new(cabac, sps.clone(), pps.clone(), &hdr)?;
-                d.decode_slice(hdr.slice_segment_address)?;
+                // Try the parallel WPP wavefront first; it decodes the whole
+                // picture when eligible (single independent segment, WPP, entry
+                // points). Otherwise fall back to the serial per-row decode.
+                let ran_wavefront = match pool {
+                    Some(p) => d.try_decode_wavefront(&rbsp, nal_bytes, &hdr, p)?,
+                    None => false,
+                };
+                if !ran_wavefront {
+                    d.decode_slice(hdr.slice_segment_address)?;
+                }
                 dec = Some(d);
             }
             Some(d) => {
@@ -594,7 +610,7 @@ fn decode_hevc_item(sample: &[u8], hvcc: &[u8]) -> Result<(yuv::YuvPlanes, Cicp)
     }
 
     match dec {
-        Some(mut d) => Ok((d.finish(), vui_color)),
+        Some(mut d) => Ok((d.finish(pool), vui_color)),
         None => Err(DecodeError::Bitstream("no VCL slice NAL found".into())),
     }
 }
@@ -625,7 +641,8 @@ pub(crate) fn decode_heic_with(
             "image data extends past file end".into(),
         ));
     }
-    let (yuv_planes, vui_color) = decode_hevc_item(&file[start..end], &heif.primary.hvcc)?;
+    let (yuv_planes, vui_color) =
+        decode_hevc_item(&file[start..end], &heif.primary.hvcc, Some(decoder.pool()))?;
     let dw = heif.primary.display_w as usize;
     let dh = heif.primary.display_h as usize;
     decoder.check_dims(dw, dh)?;
@@ -648,7 +665,7 @@ pub(crate) fn decode_heic_with(
             let astart = a.data_offset as usize;
             if let Some(aend) = astart.checked_add(a.data_length as usize) {
                 if aend <= file.len() {
-                    decode_hevc_item(&file[astart..aend], &a.hvcc)
+                    decode_hevc_item(&file[astart..aend], &a.hvcc, None)
                         .ok()
                         .map(|(ap, _)| {
                             let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
@@ -733,7 +750,7 @@ fn stitch_grid_band<T: Copy>(
         if hvcc.is_empty() {
             continue;
         }
-        let (yuv, _) = match decode_hevc_item(&ctx.file[start..end], hvcc) {
+        let (yuv, _) = match decode_hevc_item(&ctx.file[start..end], hvcc, None) {
             Ok(r) => r,
             Err(_) => continue,
         };

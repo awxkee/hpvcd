@@ -33,5 +33,5 @@ mod transform;
 
 pub(crate) use intra::predict_into_neon;
 pub(crate) use reconstruct::add_residual_into_neon;
-pub(crate) use sao::apply_sao_plane_neon;
+pub(crate) use sao::{apply_sao_plane_banded_neon, apply_sao_plane_neon};
 pub(crate) use transform::{inv_transform_dst_into_neon, inv_transform_into_neon};

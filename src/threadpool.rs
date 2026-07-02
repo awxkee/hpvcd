@@ -254,7 +254,7 @@ impl ThreadPool {
         for id in 0..threads {
             let shared = Arc::clone(&shared);
             let handle = thread::Builder::new()
-                .name(format!("hpvcd-worker-{id}"))
+                .name(format!("hpvcd-worker-{}", id))
                 .spawn(move || worker_loop(shared, id))
                 .expect("spawn worker thread");
             workers.push(handle);
@@ -298,9 +298,8 @@ impl ThreadPool {
     {
         let scope = Scope {
             pool: self,
-            outstanding: AtomicUsize::new(0),
+            outstanding: Mutex::new(0),
             done: Condvar::new(),
-            done_lock: Mutex::new(()),
         };
         let result = f(&scope);
         scope.wait();
@@ -357,9 +356,8 @@ fn worker_loop(shared: Arc<Shared>, id: usize) {
 /// guarantees they all complete before the borrow ends.
 pub(crate) struct Scope<'scope> {
     pool: &'scope ThreadPool,
-    outstanding: AtomicUsize,
+    outstanding: Mutex<usize>,
     done: Condvar,
-    done_lock: Mutex<()>,
 }
 
 impl<'scope> Scope<'scope> {
@@ -368,7 +366,7 @@ impl<'scope> Scope<'scope> {
     where
         F: FnOnce() + Send + 'scope,
     {
-        self.outstanding.fetch_add(1, Ordering::SeqCst);
+        *self.outstanding.lock().unwrap() += 1;
 
         // The scope out-lives every job (we join in `wait` before returning),
         // so widening the job lifetime to 'static for storage on the shared
@@ -378,14 +376,22 @@ impl<'scope> Scope<'scope> {
 
         let job: Box<dyn FnOnce() + Send + 'scope> = Box::new(move || {
             f();
-            // SAFETY: `wait` has not returned yet (it waits for `outstanding`
-            // to hit zero, which this decrement drives), so `*scope_ptr` is
-            // still a live, valid `Scope`.
+            // SAFETY: `wait` has not returned yet — it only returns after
+            // observing `outstanding == 0` *while holding the lock*, and this
+            // job still holds that lock across the decrement + notify below, so
+            // `*scope_ptr` is a live, valid `Scope` for the whole critical
+            // section. Crucially, once we release the lock at zero, `wait` may
+            // return and the `Scope` may be destroyed — so we must not touch
+            // `scope` after the `MutexGuard` is dropped.
             let scope = unsafe { &*(scope_addr as *const Scope<'scope>) };
-            if scope.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
-                let _g = scope.done_lock.lock().unwrap();
+            let mut n = scope.outstanding.lock().unwrap();
+            *n -= 1;
+            if *n == 0 {
+                // Notify while still holding the lock; `wait` re-checks the
+                // count under the same lock, so it cannot have returned yet.
                 scope.done.notify_all();
             }
+            // `n` (the guard) drops here, ending all access to `scope`.
         });
 
         // SAFETY: transmute the job's lifetime to 'static for queue storage.
@@ -406,19 +412,26 @@ impl<'scope> Scope<'scope> {
     fn wait(&self) {
         let external = self.pool.shared.deques.len();
         loop {
-            if self.outstanding.load(Ordering::SeqCst) == 0 {
-                return;
-            }
+            // Help drain outstanding work without holding the lock, so workers
+            // and the waiter make progress in parallel.
             if let Some(job) = self.pool.shared.find_job(external) {
                 job();
                 self.pool.shared.finish_one();
                 continue;
             }
-            // No stealable job right now, but some are still running on workers.
-            let guard = self.done_lock.lock().unwrap();
-            if self.outstanding.load(Ordering::SeqCst) == 0 {
+            // No stealable job right now. Decide whether to return or block,
+            // under the lock. Returning only while holding the lock at zero
+            // guarantees no job is still mid-notify on this `Scope`: a job's
+            // final decrement+notify happens under this same lock, so if we
+            // observe zero here, every job has already released the lock and
+            // will not touch `self` again. This is what prevents the
+            // stack-use-after-scope when `wait` returns and `self` is dropped.
+            let guard = self.outstanding.lock().unwrap();
+            if *guard == 0 {
                 return;
             }
+            // Some jobs are still running on other workers. Block until one
+            // signals completion (or the short timeout, to re-attempt stealing).
             let _unused = self
                 .done
                 .wait_timeout(guard, std::time::Duration::from_millis(1))

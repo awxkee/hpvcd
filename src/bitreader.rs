@@ -129,9 +129,71 @@ pub(crate) fn unescape_rbsp(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Like [`unescape_rbsp`], but also returns, for each RBSP (output) byte, the
+/// index of the NAL (source) byte it came from. Only used by tests now; the
+/// production wavefront path builds just the map via [`rbsp_src_map`] (it
+/// already holds the RBSP).
+#[cfg(test)]
+pub(crate) fn unescape_rbsp_with_map(src: &[u8]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = Vec::with_capacity(src.len());
+    let mut src_of = Vec::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        if i + 2 < src.len() && src[i] == 0x00 && src[i + 1] == 0x00 && src[i + 2] == 0x03 {
+            out.push(0x00);
+            src_of.push(i);
+            out.push(0x00);
+            src_of.push(i + 1);
+            i += 3; // skip the 0x03 emulation-prevention byte
+        } else {
+            out.push(src[i]);
+            src_of.push(i);
+            i += 1;
+        }
+    }
+    (out, src_of)
+}
+
+pub(crate) fn rbsp_src_map(src: &[u8]) -> Vec<usize> {
+    let mut src_of = Vec::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        if i + 2 < src.len() && src[i] == 0x00 && src[i + 1] == 0x00 && src[i + 2] == 0x03 {
+            src_of.push(i);
+            src_of.push(i + 1);
+            i += 3;
+        } else {
+            src_of.push(i);
+            i += 1;
+        }
+    }
+    src_of
+}
+
+/// Translate a NAL-relative byte offset into an RBSP byte offset using the
+/// `src_of` map from [`unescape_rbsp_with_map`]. Returns the first RBSP index
+/// whose source index is ≥ `nal_off`; if none (the offset is past the last kept
+/// byte), returns `src_of.len()` (i.e. the RBSP length).
+pub(crate) fn nal_to_rbsp_offset(src_of: &[usize], nal_off: usize) -> usize {
+    // `src_of` is strictly increasing, so binary-search the partition point.
+    src_of.partition_point(|&s| s < nal_off)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::bitreader::{BitReader, rbsp_src_map, unescape_rbsp, unescape_rbsp_with_map};
+
+    #[test]
+    fn src_map_matches_with_map_variant() {
+        // rbsp_src_map must produce the same offset map as the paired variant,
+        // including across emulation-prevention bytes.
+        let nal = [
+            0x00u8, 0x00, 0x03, 0x00, 0xAA, 0x00, 0x00, 0x03, 0x01, 0xBB, 0xCC,
+        ];
+        let (_rbsp, map_ref) = unescape_rbsp_with_map(&nal);
+        let map = rbsp_src_map(&nal);
+        assert_eq!(map, map_ref);
+    }
 
     #[test]
     fn round_trip_ue() {

@@ -41,6 +41,11 @@ use crate::yuv::YuvPlanes;
 const MODE_PLANAR: u8 = 0;
 const MODE_DC: u8 = 1;
 
+/// Minimum total CTB count before the WPP wavefront is worth its fixed costs.
+/// Below this the serial per-row decode is faster (spawn/coordination overhead
+/// and the diagonal ramp dominate). ~64 CTBs ≈ a 512×512 picture at 64×64 CTBs.
+const WAVEFRONT_MIN_CTBS: usize = 64;
+
 #[derive(Clone, Default)]
 struct SaoCtb {
     type_idx: [u8; 3], // 0=off,1=band,2=edge
@@ -57,9 +62,9 @@ pub(crate) struct FullDecoder {
     pps: Pps,
 
     // Reconstruction planes (coded dimensions, CTB-aligned).
-    y: Vec<u16>,
-    cb: Vec<u16>,
-    cr: Vec<u16>,
+    y: crate::plane::Plane<u16>,
+    cb: crate::plane::Plane<u16>,
+    cr: crate::plane::Plane<u16>,
     w: usize,  // coded luma width
     h: usize,  // coded luma height
     cw: usize, // chroma width
@@ -76,25 +81,25 @@ pub(crate) struct FullDecoder {
     max_trafo_depth_intra: u32,
 
     // Per-4×4-luma intra mode and "decoded" availability.
-    mode_y: Vec<u8>,
-    decoded: Vec<bool>, // per 4×4 luma block
-    tqb: Vec<bool>,     // per 4×4 luma block: cu_transquant_bypass_flag (lossless)
-    cu_tqb: bool,       // current CU's cu_transquant_bypass_flag
-    grid_w: usize,      // ceil(w/4), one entry for every covered 4×4 luma grid cell
+    mode_y: crate::plane::Plane<u8>,
+    decoded: crate::plane::Plane<bool>, // per 4×4 luma block
+    tqb: crate::plane::Plane<bool>,     // per 4×4 luma block: cu_transquant_bypass_flag (lossless)
+    cu_tqb: bool,                       // current CU's cu_transquant_bypass_flag
+    grid_w: usize,                      // ceil(w/4), one entry for every covered 4×4 luma grid cell
     #[allow(dead_code)]
     grid_h: usize, // ceil(h/4)
-    ct_depth: Vec<u8>,  // per 4×4, coding-tree depth (for split_cu_flag ctx)
+    ct_depth: crate::plane::Plane<u8>,  // per 4×4, coding-tree depth (for split_cu_flag ctx)
 
     // QP tracking
     slice_qp: i32,
     qp_y_prev: i32,
-    qp_y_map: Vec<i16>, // per 4×4 luma (QpY ∈ −24..51, fits i16; halves a multi-MB buffer)
+    qp_y_map: crate::plane::Plane<i16>, // per 4×4 luma (QpY ∈ −24..51, fits i16; halves a multi-MB buffer)
     cu_qp_delta_val: i32,
     is_cu_qp_delta_coded: bool,
     log2_qg: u32,
     cur_qp: i32,
 
-    sao: Vec<SaoCtb>,
+    sao: crate::plane::Plane<SaoCtb>,
     ctb_cols: usize,
     ctb_rows: usize,
     sao_luma: bool,
@@ -198,30 +203,30 @@ impl FullDecoder {
             log2_min_tb: sps.log2_min_tb,
             log2_max_tb: sps.log2_max_tb,
             max_trafo_depth_intra: sps.max_transform_hierarchy_intra,
-            y: vec![0; w * h],
-            cb: vec![0; cw * ch],
-            cr: vec![0; cw * ch],
+            y: crate::plane::Plane::owned(vec![0; w * h]),
+            cb: crate::plane::Plane::owned(vec![0; cw * ch]),
+            cr: crate::plane::Plane::owned(vec![0; cw * ch]),
             w,
             h,
             cw,
             ch,
             sub_w,
             sub_h,
-            mode_y: vec![MODE_DC; grid_w * grid_h],
-            decoded: vec![false; grid_w * grid_h],
-            tqb: vec![false; grid_w * grid_h],
+            mode_y: crate::plane::Plane::owned(vec![MODE_DC; grid_w * grid_h]),
+            decoded: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            tqb: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             cu_tqb: false,
-            ct_depth: vec![0; grid_w * grid_h],
+            ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
             grid_w,
             grid_h,
             slice_qp,
             qp_y_prev: slice_qp,
-            qp_y_map: vec![slice_qp as i16; grid_w * grid_h],
+            qp_y_map: crate::plane::Plane::owned(vec![slice_qp as i16; grid_w * grid_h]),
             cu_qp_delta_val: 0,
             is_cu_qp_delta_coded: false,
             log2_qg,
             cur_qp: slice_qp,
-            sao: vec![SaoCtb::default(); ctb_cols * ctb_rows],
+            sao: crate::plane::Plane::owned(vec![SaoCtb::default(); ctb_cols * ctb_rows]),
             ctb_cols,
             ctb_rows,
             sao_luma,
@@ -274,11 +279,217 @@ impl FullDecoder {
         self.decode_slice(hdr.slice_segment_address)
     }
 
+    /// Decode one CTB at grid position `(rx, ry)`: parse SAO params, run the
+    /// coding quadtree (parse + reconstruct), take the WPP context snapshot after
+    /// CTB column 1, and read `end_of_slice_segment_flag`. Returns `true` if the
+    /// slice segment terminated at this CTB. Shared by the serial `decode_slice`
+    /// and the parallel wavefront so both parse every CTB identically.
+    #[inline]
+    fn decode_one_ctb(&mut self, rx: usize, ry: usize, wpp: bool) -> bool {
+        self.decode_one_ctb_inner(rx, ry, wpp, true)
+    }
+
+    /// As [`decode_one_ctb`], but `store_snap` controls whether the post-CTB-1
+    /// context snapshot is written into `wpp_ctx_snap`/`wpp_ictx_snap`. The
+    /// serial path needs it (rows share one decoder); the wavefront path sets
+    /// `false` and captures the snapshot directly from `self.ctx`/`self.ictx`,
+    /// avoiding the per-row `Vec<Option<..>>` allocations entirely.
+    #[inline]
+    fn decode_one_ctb_inner(&mut self, rx: usize, ry: usize, wpp: bool, store_snap: bool) -> bool {
+        let ctb = 1usize << self.log2_ctb;
+        if self.sps.sao_enabled {
+            self.parse_sao(rx, ry);
+        }
+        // New CTB → QG reset handled inside coding_unit via QG tracking.
+        self.coding_quadtree(rx * ctb, ry * ctb, self.log2_ctb, 0);
+
+        // WPP: save context snapshot after the 2nd CTB of each row.
+        if store_snap && wpp && rx == 1 {
+            self.wpp_ctx_snap[ry] = Some(self.ctx.clone());
+            self.wpp_ictx_snap[ry] = Some(self.ictx);
+        }
+
+        self.cab.decode_terminate() != 0
+    }
+
+    /// Attempt a parallel WPP-wavefront decode of a single independent slice
+    /// segment covering the whole picture. Returns `Ok(true)` if the wavefront
+    /// ran (and the picture is fully reconstructed up to the loop filters);
+    /// `Ok(false)` if the stream is ineligible and the caller should fall back to
+    /// the serial [`decode_slice`]. `Err` only on a genuine bitstream error.
+    ///
+    /// Eligibility: WPP enabled, the segment starts at CTB 0, entry points are
+    /// present and number exactly `ctb_rows - 1`, more than one CTB row, and a
+    /// multi-threaded pool. Anything else → `Ok(false)`.
+    pub(crate) fn try_decode_wavefront(
+        &mut self,
+        rbsp: &[u8],
+        nal_bytes: &[u8],
+        hdr: &SliceHeader,
+        pool: &crate::threadpool::ThreadPool,
+    ) -> Result<bool, DecodeError> {
+        if !self.pps.entropy_coding_sync_enabled
+            || hdr.slice_segment_address != 0
+            || self.ctb_rows <= 1
+            || pool.threads() <= 1
+            || hdr.entry_points.is_empty()
+        {
+            return Ok(false);
+        }
+        // Below a minimum amount of work the wavefront's fixed costs (runner
+        // spawn, per-row decoder construction, atomic coordination) outweigh the
+        // serial decode, and the diagonal ramp-up leaves most cores idle anyway.
+        // Require enough CTB rows to fill the pool plus a couple of diagonals,
+        // and a non-trivial total CTB count. Tuned conservatively; small stills
+        // fall through to the serial path.
+        let total_ctbs = self.ctb_cols * self.ctb_rows;
+        let enough_rows = self.ctb_rows >= pool.threads().max(2) + 2;
+        if total_ctbs < WAVEFRONT_MIN_CTBS || !enough_rows {
+            return Ok(false);
+        }
+        // Only now (wavefront is actually going to run) build the NAL→RBSP
+        // offset map — it costs ~8 bytes per RBSP byte, so we avoid it on the
+        // common serial / non-WPP path entirely.
+        let src_of = crate::bitreader::rbsp_src_map(nal_bytes);
+        let rows = match crate::wpp::row_substreams(
+            &src_of,
+            hdr.cabac_offset,
+            &hdr.entry_points,
+            rbsp.len(),
+            self.ctb_rows,
+        ) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        crate::wpp::run_wavefront(self, rbsp, &rows, pool)?;
+        Ok(true)
+    }
+
+    /// Number of CTB rows (public accessor for the wavefront driver).
+    pub(crate) fn ctb_rows_pub(&self) -> usize {
+        self.ctb_rows
+    }
+
+    /// I-slice initial entropy contexts for seeding wavefront row 0.
+    pub(crate) fn init_contexts_pub(&self) -> (ContextSet, IntraModeContexts) {
+        let qp = self.slice_qp.clamp(0, 51) as u8;
+        (
+            ContextSet::init_islice(qp),
+            IntraModeContexts::init_islice(qp),
+        )
+    }
+
+    /// Build a [`RowFactory`] capturing raw aliasing pointers to this decoder's
+    /// shared picture buffers plus all immutable config. The factory is `Send +
+    /// Sync` and each wavefront worker uses it to construct its per-row decoder.
+    ///
+    /// SAFETY: the returned factory holds `*mut` into `self`'s buffers. The
+    /// caller (the wavefront driver) must keep `self` alive for the whole scope
+    /// and must not access `self`'s planes through `self` while row views built
+    /// from the factory are alive. The 2-CTB lag keeps concurrent row writes
+    /// disjoint.
+    pub(crate) fn row_factory(&mut self) -> RowFactory {
+        RowFactory {
+            y: (self.y.as_mut_ptr(), self.y.len()),
+            cb: (self.cb.as_mut_ptr(), self.cb.len()),
+            cr: (self.cr.as_mut_ptr(), self.cr.len()),
+            mode_y: (self.mode_y.as_mut_ptr(), self.mode_y.len()),
+            decoded: (self.decoded.as_mut_ptr(), self.decoded.len()),
+            tqb: (self.tqb.as_mut_ptr(), self.tqb.len()),
+            ct_depth: (self.ct_depth.as_mut_ptr(), self.ct_depth.len()),
+            qp_y_map: (self.qp_y_map.as_mut_ptr(), self.qp_y_map.len()),
+            sao: (self.sao.as_mut_ptr(), self.sao.len()),
+            sps: self.sps.clone(),
+            pps: self.pps.clone(),
+            w: self.w,
+            h: self.h,
+            cw: self.cw,
+            ch: self.ch,
+            sub_w: self.sub_w,
+            sub_h: self.sub_h,
+            bd: self.bd,
+            bd_c: self.bd_c,
+            log2_ctb: self.log2_ctb,
+            log2_min_cb: self.log2_min_cb,
+            log2_min_tb: self.log2_min_tb,
+            log2_max_tb: self.log2_max_tb,
+            max_trafo_depth_intra: self.max_trafo_depth_intra,
+            grid_w: self.grid_w,
+            grid_h: self.grid_h,
+            slice_qp: self.slice_qp,
+            log2_qg: self.log2_qg,
+            ctb_cols: self.ctb_cols,
+            ctb_rows: self.ctb_rows,
+            sao_luma: self.sao_luma,
+            sao_chroma: self.sao_chroma,
+            slice_cb_qp_offset: self.slice_cb_qp_offset,
+            slice_cr_qp_offset: self.slice_cr_qp_offset,
+            deblocking_disabled: self.deblocking_disabled,
+            beta_offset_div2: self.beta_offset_div2,
+            tc_offset_div2: self.tc_offset_div2,
+            sign_hiding: self.sign_hiding,
+            strong_smoothing: self.strong_smoothing,
+        }
+    }
+
+    /// Decode a single CTB row `ry` (all columns) for the wavefront.
+    ///
+    /// Gating: column `c` is processed only once the row above has completed
+    /// column `c + 2` (the 2-CTB lag), enforced via `above_progress`. After
+    /// finishing CTB column 1 this row publishes its CABAC context snapshot into
+    /// `snapshot_out` so the row below can seed its engine. `progress` publishes
+    /// this row's completed-column count. Stops at the row's terminate bin.
+    ///
+    /// The engine and contexts (`self.cab`, `self.ctx`, `self.ictx`) must already
+    /// be seeded by the caller: row 0 from I-slice init, row `r>0` from row
+    /// `r-1`'s published snapshot.
+    pub(crate) fn decode_wavefront_row(
+        &mut self,
+        ry: usize,
+        progress: &std::sync::atomic::AtomicUsize,
+        above_progress: Option<&std::sync::atomic::AtomicUsize>,
+        snapshot_out: &std::sync::OnceLock<(ContextSet, IntraModeContexts)>,
+    ) -> Result<(), DecodeError> {
+        use std::sync::atomic::Ordering;
+        let cols = self.ctb_cols;
+        for rx in 0..cols {
+            // Wavefront gate: wait until the row above is ≥ 2 CTBs ahead.
+            if let Some(above) = above_progress {
+                while above.load(Ordering::Acquire) < rx + 2 {
+                    std::hint::spin_loop();
+                }
+            }
+            let terminated = self.decode_one_ctb_inner(rx, ry, true, false);
+
+            // Publish the post-CTB-1 snapshot for the row below, straight from
+            // the live contexts (no per-row snapshot array needed).
+            if rx == 1 {
+                let _ = snapshot_out.set((self.ctx.clone(), self.ictx));
+            }
+
+            // Publish progress *after* the CTB is fully reconstructed so a waiter
+            // observing `rx+1` can safely read our columns ≤ rx.
+            progress.store(rx + 1, Ordering::Release);
+            if terminated {
+                break;
+            }
+        }
+        // If the row terminated before CTB 1 (a 1-CTB-wide picture is excluded by
+        // eligibility, but a mid-row end_of_slice could still occur on malformed
+        // streams), make sure the row below gets *some* snapshot to avoid a hang.
+        if snapshot_out.get().is_none() {
+            let _ = snapshot_out.set((self.ctx.clone(), self.ictx));
+        }
+        // Ensure the row below can always advance past our last column.
+        progress.store(cols + 2, Ordering::Release);
+        Ok(())
+    }
+
     /// Reconstruct CTBs starting at raster address `start_ctb`, stopping at the
     /// slice's `end_of_slice_segment_flag`. Does not run loop filters — call
     /// [`finish`] once, after all segments of the picture are decoded.
     pub(crate) fn decode_slice(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
-        let ctb = 1usize << self.log2_ctb;
+        let _ctb = 1usize << self.log2_ctb;
         let wpp = self.pps.entropy_coding_sync_enabled;
         let total = self.ctb_cols * self.ctb_rows;
         let start_ctb = start_ctb.min(total);
@@ -311,20 +522,8 @@ impl FullDecoder {
 
             let mut terminated = false;
             for rx in rx_start..self.ctb_cols {
-                if self.sps.sao_enabled {
-                    self.parse_sao(rx, ry);
-                }
-                // New CTB → QG reset handled inside coding_unit via QG tracking.
-                self.coding_quadtree(rx * ctb, ry * ctb, self.log2_ctb, 0);
-
-                // WPP: save context snapshot after the 2nd CTB of each row.
-                if wpp && rx == 1 {
-                    self.wpp_ctx_snap[ry] = Some(self.ctx.clone());
-                    self.wpp_ictx_snap[ry] = Some(self.ictx);
-                }
-
-                let end = self.cab.decode_terminate();
-                if end != 0 {
+                let end = self.decode_one_ctb(rx, ry, wpp);
+                if end {
                     // end_of_slice_segment_flag: this slice segment is complete.
                     terminated = true;
                     break;
@@ -354,20 +553,32 @@ impl FullDecoder {
 
     /// Apply in-loop filters (deblocking then SAO) over the fully-reconstructed
     /// picture and return the planes. Call once, after all slice segments.
-    pub(crate) fn finish(&mut self) -> YuvPlanes {
+    pub(crate) fn finish(&mut self, pool: Option<&crate::threadpool::ThreadPool>) -> YuvPlanes {
         // In-loop filters run in HEVC order: deblocking first, then SAO. They
         // are independently gated: deblocking runs unless it is disabled (PPS or
         // a slice-level override), while SAO runs only when the SPS enables it.
         if !self.deblocking_disabled {
-            self.apply_deblocking();
+            match pool {
+                Some(p) if p.threads() > 1 && self.ctb_rows > 1 => {
+                    self.apply_deblocking_parallel(p)
+                }
+                _ => self.apply_deblocking(),
+            }
         }
         if self.sps.sao_enabled {
-            self.apply_sao();
+            // Parallel SAO only when a pool is supplied (single-item path where
+            // SAO is the only parallelism available). In the grid path each tile
+            // already runs on a pool worker, so `None` keeps SAO serial there to
+            // avoid oversubscription.
+            match pool {
+                Some(p) if p.threads() > 1 && self.ctb_rows > 1 => self.apply_sao_parallel(p),
+                _ => self.apply_sao(),
+            }
         }
         YuvPlanes {
-            y: std::mem::take(&mut self.y),
-            cb: std::mem::take(&mut self.cb),
-            cr: std::mem::take(&mut self.cr),
+            y: self.y.take_vec(),
+            cb: self.cb.take_vec(),
+            cr: self.cr.take_vec(),
             width: self.w,
             height: self.h,
             chroma: self.sps.chroma,
@@ -471,6 +682,40 @@ impl FullDecoder {
         self.sao[idx] = s;
     }
 
+    /// Parallel deblocking: dispatch CTB-aligned row bands across the pool.
+    /// Bit-identical to [`Self::apply_deblocking`]; see
+    /// [`crate::deblock::apply_deblocking_parallel`].
+    fn apply_deblocking_parallel(&mut self, pool: &crate::threadpool::ThreadPool) {
+        // Move planes out first so the immutable borrows in `ctx` (qp_y_map,
+        // tqb) don't conflict with taking `&mut self.y/cb/cr`.
+        let y = self.y.take_vec();
+        let cb = self.cb.take_vec();
+        let cr = self.cr.take_vec();
+        let ctx = crate::deblock::DeblockCtx {
+            w: self.w,
+            h: self.h,
+            cw: self.cw,
+            ch: self.ch,
+            gw: self.grid_w,
+            gh: self.grid_h,
+            sub_w: self.sub_w,
+            sub_h: self.sub_h,
+            bd: self.bd,
+            bd_c: self.bd_c,
+            beta_offset: self.beta_offset_div2 * 2,
+            tc_offset: self.tc_offset_div2 * 2,
+            qp_bd_offset_y: 6 * (self.bd as i32 - 8),
+            qp_bd_offset_c: 6 * (self.bd_c as i32 - 8),
+            default_qp: self.slice_qp as i16,
+            qp_y_map: &self.qp_y_map[..],
+            tqb: &self.tqb[..],
+        };
+        let out = crate::deblock::apply_deblocking_parallel(pool, &ctx, self.log2_ctb, y, cb, cr);
+        self.y = crate::plane::Plane::owned(out.y);
+        self.cb = crate::plane::Plane::owned(out.cb);
+        self.cr = crate::plane::Plane::owned(out.cr);
+    }
+
     fn apply_deblocking(&mut self) {
         // HEVC §8.7.2.4 Tables 8-10 / 8-11 (beta, tC)
         #[rustfmt::skip]
@@ -554,8 +799,8 @@ impl FullDecoder {
                     if pass == 0 {
                         // vertical edge at x=edge, rows scan..scan+3
                         let mid = scan + 1; // representative row
-                        let qp_p = qp_at(&self.qp_y_map, edge - 1, mid);
-                        let qp_q = qp_at(&self.qp_y_map, edge, mid);
+                        let qp_p = qp_at(&self.qp_y_map[..], edge - 1, mid);
+                        let qp_q = qp_at(&self.qp_y_map[..], edge, mid);
                         // Lossless (transquant-bypass) CUs are exempt from deblocking
                         // (HEVC §8.7.2): if either side is bypass, skip this segment.
                         if self.tqb_at(edge - 1, mid) || self.tqb_at(edge, mid) {
@@ -654,8 +899,8 @@ impl FullDecoder {
                     } else {
                         // horizontal edge at y=edge, cols scan..scan+3
                         let mid = scan + 1;
-                        let qp_p = qp_at(&self.qp_y_map, mid, edge - 1);
-                        let qp_q = qp_at(&self.qp_y_map, mid, edge);
+                        let qp_p = qp_at(&self.qp_y_map[..], mid, edge - 1);
+                        let qp_q = qp_at(&self.qp_y_map[..], mid, edge);
                         if self.tqb_at(mid, edge - 1) || self.tqb_at(mid, edge) {
                             scan += 4;
                             continue;
@@ -778,7 +1023,7 @@ impl FullDecoder {
                     } else {
                         (mid * self.sub_w, edge * self.sub_h)
                     };
-                    let avg_qp_l = qp_at(&self.qp_y_map, qlx.min(w - 1), qly.min(h - 1));
+                    let avg_qp_l = qp_at(&self.qp_y_map[..], qlx.min(w - 1), qly.min(h - 1));
                     let tc_prime_c = (avg_qp_l + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
                     let tc_c = TC[tc_prime_c as usize];
                     if tc_c == 0 {
@@ -851,12 +1096,51 @@ impl FullDecoder {
         }
     }
 
+    /// Parallel SAO: flatten per-CTB params and dispatch CTB-row bands across
+    /// the pool. Bit-identical to [`Self::apply_sao`]; see
+    /// [`crate::sao::apply_sao_parallel`].
+    fn apply_sao_parallel(&mut self, pool: &crate::threadpool::ThreadPool) {
+        let params: Vec<crate::sao::SaoCtbParams> = self
+            .sao
+            .iter()
+            .map(|s| crate::sao::SaoCtbParams {
+                type_idx: s.type_idx,
+                offsets: s.offsets,
+                band_pos: s.band_pos,
+                eo_class: s.eo_class,
+            })
+            .collect();
+        let ctx = crate::sao::SaoPlanesCtx {
+            params: &params,
+            ctb_cols: self.ctb_cols,
+            ctb_rows: self.ctb_rows,
+            log2_ctb: self.log2_ctb,
+            w: self.w,
+            h: self.h,
+            cw: self.cw,
+            ch: self.ch,
+            sub_w: self.sub_w,
+            sub_h: self.sub_h,
+            bd: self.bd,
+            bd_c: self.bd_c,
+            sao_luma: self.sao_luma,
+            sao_chroma: self.sao_chroma,
+        };
+        let y = self.y.take_vec();
+        let cb = self.cb.take_vec();
+        let cr = self.cr.take_vec();
+        let (y, cb, cr) = crate::sao::apply_sao_parallel(pool, &ctx, y, cb, cr);
+        self.y = crate::plane::Plane::owned(y);
+        self.cb = crate::plane::Plane::owned(cb);
+        self.cr = crate::plane::Plane::owned(cr);
+    }
+
     fn apply_sao(&mut self) {
         let ctb = 1usize << self.log2_ctb;
         // Work on clones so EO neighbor lookups always use original values.
-        let orig_y = self.y.clone();
-        let orig_cb = self.cb.clone();
-        let orig_cr = self.cr.clone();
+        let orig_y = self.y.to_vec_clone();
+        let orig_cb = self.cb.to_vec_clone();
+        let orig_cr = self.cr.to_vec_clone();
 
         for ry in 0..self.ctb_rows {
             for rx in 0..self.ctb_cols {
@@ -870,7 +1154,7 @@ impl FullDecoder {
                     let x_end = (x0 + ctb).min(self.w);
                     let y_end = (y0 + ctb).min(self.h);
                     Self::apply_sao_plane(
-                        &mut self.y,
+                        &mut self.y[..],
                         &orig_y,
                         self.w,
                         self.h,
@@ -896,7 +1180,7 @@ impl FullDecoder {
 
                     if sao.type_idx[1] != 0 {
                         Self::apply_sao_plane(
-                            &mut self.cb,
+                            &mut self.cb[..],
                             &orig_cb,
                             cw,
                             ch,
@@ -913,7 +1197,7 @@ impl FullDecoder {
                     }
                     if sao.type_idx[2] != 0 {
                         Self::apply_sao_plane(
-                            &mut self.cr,
+                            &mut self.cr[..],
                             &orig_cr,
                             cw,
                             ch,
@@ -2054,6 +2338,136 @@ impl FullDecoder {
     }
 }
 
+/// Captured aliasing pointers + immutable config for building per-row decoders
+/// in the WPP wavefront. Holds `*mut` into a live [`FullDecoder`]'s shared
+/// picture buffers; sound to share across threads under the wavefront lag.
+pub(crate) struct RowFactory {
+    y: (*mut u16, usize),
+    cb: (*mut u16, usize),
+    cr: (*mut u16, usize),
+    mode_y: (*mut u8, usize),
+    decoded: (*mut bool, usize),
+    tqb: (*mut bool, usize),
+    ct_depth: (*mut u8, usize),
+    qp_y_map: (*mut i16, usize),
+    sao: (*mut SaoCtb, usize),
+    sps: Sps,
+    pps: Pps,
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    sub_w: usize,
+    sub_h: usize,
+    bd: u8,
+    bd_c: u8,
+    log2_ctb: u32,
+    log2_min_cb: u32,
+    log2_min_tb: u32,
+    log2_max_tb: u32,
+    max_trafo_depth_intra: u32,
+    grid_w: usize,
+    grid_h: usize,
+    slice_qp: i32,
+    log2_qg: u32,
+    ctb_cols: usize,
+    ctb_rows: usize,
+    sao_luma: bool,
+    sao_chroma: bool,
+    slice_cb_qp_offset: i32,
+    slice_cr_qp_offset: i32,
+    deblocking_disabled: bool,
+    beta_offset_div2: i32,
+    tc_offset_div2: i32,
+    sign_hiding: bool,
+    strong_smoothing: bool,
+}
+
+// SAFETY: the raw pointers address buffers kept alive by the template decoder
+// for the whole wavefront scope. Concurrent access from row workers is disjoint
+// by the 2-CTB lag, so sharing/sending the factory is sound.
+unsafe impl Send for RowFactory {}
+unsafe impl Sync for RowFactory {}
+
+impl RowFactory {
+    /// Build a per-row [`FullDecoder`] whose picture buffers alias the shared
+    /// storage and whose engine is seeded from `row_cabac` + the given contexts.
+    ///
+    /// SAFETY: caller upholds the lag discipline so this row's writes never race
+    /// another live row's, and the backing buffers outlive the returned decoder.
+    pub(crate) unsafe fn make(
+        &self,
+        row_cabac: &[u8],
+        ctx: ContextSet,
+        ictx: IntraModeContexts,
+    ) -> Result<FullDecoder, DecodeError> {
+        let cab = CabacDecoder::new(row_cabac)
+            .map_err(|_| DecodeError::Bitstream("row cabac init".into()))?;
+        let mk = |p: (*mut u16, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
+        let mk8 = |p: (*mut u8, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
+        let mkb = |p: (*mut bool, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
+        let mki = |p: (*mut i16, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
+        let mks = |p: (*mut SaoCtb, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
+        Ok(FullDecoder {
+            cab,
+            ctx,
+            ictx,
+            sps: self.sps.clone(),
+            pps: self.pps.clone(),
+            y: mk(self.y),
+            cb: mk(self.cb),
+            cr: mk(self.cr),
+            w: self.w,
+            h: self.h,
+            cw: self.cw,
+            ch: self.ch,
+            sub_w: self.sub_w,
+            sub_h: self.sub_h,
+            bd: self.bd,
+            bd_c: self.bd_c,
+            log2_ctb: self.log2_ctb,
+            log2_min_cb: self.log2_min_cb,
+            log2_min_tb: self.log2_min_tb,
+            log2_max_tb: self.log2_max_tb,
+            max_trafo_depth_intra: self.max_trafo_depth_intra,
+            mode_y: mk8(self.mode_y),
+            decoded: mkb(self.decoded),
+            tqb: mkb(self.tqb),
+            cu_tqb: false,
+            grid_w: self.grid_w,
+            grid_h: self.grid_h,
+            ct_depth: mk8(self.ct_depth),
+            slice_qp: self.slice_qp,
+            qp_y_prev: self.slice_qp,
+            qp_y_map: mki(self.qp_y_map),
+            cu_qp_delta_val: 0,
+            is_cu_qp_delta_coded: false,
+            log2_qg: self.log2_qg,
+            cur_qp: self.slice_qp,
+            sao: mks(self.sao),
+            ctb_cols: self.ctb_cols,
+            ctb_rows: self.ctb_rows,
+            sao_luma: self.sao_luma,
+            sao_chroma: self.sao_chroma,
+            slice_cb_qp_offset: self.slice_cb_qp_offset,
+            slice_cr_qp_offset: self.slice_cr_qp_offset,
+            deblocking_disabled: self.deblocking_disabled,
+            beta_offset_div2: self.beta_offset_div2,
+            tc_offset_div2: self.tc_offset_div2,
+            sign_hiding: self.sign_hiding,
+            // Row-views capture the WPP snapshot directly from live contexts, so
+            // these arrays are never indexed here — keep them empty (no O(rows)
+            // allocation per row).
+            wpp_ctx_snap: Vec::new(),
+            wpp_ictx_snap: Vec::new(),
+            scratch: intra::IntraScratch::new(),
+            deq_scratch: vec![0i32; 1024],
+            res_scratch: vec![0i32; 1024],
+            strong_smoothing: self.strong_smoothing,
+        })
+    }
+}
+
 /// Chroma QP mapping (Table 8-10). ChromaArrayType 1 (4:2:0) uses the table;
 /// 2/3 clamp differently but share the <30 / table / -6 structure.
 fn qpc(qpi: i32, chroma_idc: u8) -> i32 {
@@ -2073,7 +2487,7 @@ fn qpc(qpi: i32, chroma_idc: u8) -> i32 {
 }
 
 /// Parsed slice-segment header fields the reconstruction path needs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SliceHeader {
     /// SliceQpY = init_qp + slice_qp_delta.
     pub(crate) slice_qp: i32,
@@ -2098,6 +2512,13 @@ pub(crate) struct SliceHeader {
     /// True for a dependent slice segment (inherits the previous segment's
     /// header state and CABAC contexts rather than re-initialising).
     pub(crate) dependent_slice_segment: bool,
+    /// WPP/tiles entry-point sub-stream byte lengths, i.e.
+    /// `entry_point_offset_minus1[i] + 1` for each `i`. For WPP these are the
+    /// byte lengths of every CTB-row sub-stream except the last (whose length is
+    /// implied by the end of the CABAC payload). Empty when the stream carries
+    /// no entry points. Used to position an independent CABAC engine per row for
+    /// the parallel wavefront decode.
+    pub(crate) entry_points: Vec<u32>,
 }
 
 /// Parse a slice header from the RBSP (after 2-byte NAL header has been consumed
@@ -2163,6 +2584,7 @@ pub(crate) fn parse_slice_header_full(
             slice_segment_address,
             first_slice_in_pic: false,
             dependent_slice_segment: true,
+            entry_points: Vec::new(),
         });
     }
 
@@ -2215,12 +2637,16 @@ pub(crate) fn parse_slice_header_full(
         r.read_flag()
             .map_err(|_| e("loop_filter_across_slices_flag"))?;
     }
+    let mut entry_points: Vec<u32> = Vec::new();
     if pps.tiles_enabled || pps.entropy_coding_sync_enabled {
         let n = r.read_ue().map_err(|_| e("num_entry_points"))?;
         if n > 0 {
             let len = r.read_ue().map_err(|_| e("offset_len"))? + 1;
+            entry_points.reserve(n as usize);
             for _ in 0..n {
-                r.read_bits(len).map_err(|_| e("entry_point"))?;
+                // entry_point_offset_minus1[i] → sub-stream byte length.
+                let off = r.read_bits(len).map_err(|_| e("entry_point"))?;
+                entry_points.push(off + 1);
             }
         }
     }
@@ -2247,6 +2673,7 @@ pub(crate) fn parse_slice_header_full(
         slice_segment_address,
         first_slice_in_pic: first_slice,
         dependent_slice_segment: false,
+        entry_points,
     })
 }
 

@@ -33,5 +33,5 @@ mod transform;
 
 pub(crate) use intra::predict_into_sse41;
 pub(crate) use reconstruct::add_residual_into_sse41;
-pub(crate) use sao::apply_sao_plane_sse41;
+pub(crate) use sao::{apply_sao_plane_banded_sse41, apply_sao_plane_sse41};
 pub(crate) use transform::{inv_transform_dst_into_sse41, inv_transform_into_sse41};
