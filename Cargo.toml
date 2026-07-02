@@ -24,3 +24,6 @@ neon = []
 sse = []
 
 [dependencies]
+
+[profile.release]
+debug = true

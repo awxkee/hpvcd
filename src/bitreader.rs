@@ -154,7 +154,6 @@ pub(crate) fn unescape_rbsp_with_map(src: &[u8]) -> (Vec<u8>, Vec<usize>) {
     (out, src_of)
 }
 
-/// Compute only the NAL→RBSP source-index map
 pub(crate) fn rbsp_src_map(src: &[u8]) -> Vec<usize> {
     let mut src_of = Vec::with_capacity(src.len());
     let mut i = 0usize;
