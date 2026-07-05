@@ -242,9 +242,11 @@ pub(crate) fn residual_coding(
     sign_data_hiding: bool,
     transform_skip_ctx: Option<usize>, // Some(ctx_idx) if transform_skip allowed (TU≤4)
     transquant_bypass: bool,
-) -> (Vec<i32>, bool) {
+    coeffs: &mut [i32],
+) -> (bool, usize, usize) {
     let n = 1usize << log2_ts;
-    let mut coeffs = vec![0i32; n * n];
+    coeffs[..n * n].fill(0);
+    let mut max_x = 0usize;
 
     // transform_skip_flag
     let mut transform_skip = false;
@@ -286,7 +288,8 @@ pub(crate) fn residual_coding(
     let last_in_sb = scan_index(pos_scan, last_x & 3, last_y & 3);
 
     // csbf neighbour tracking
-    let mut csbf = vec![0u8; sb_w * sb_w];
+    let mut csbf = [0u8; 64];
+    let csbf = &mut csbf[..sb_w * sb_w];
     let mut c1_carry = 1i32; // greater1 ctx carried across sub-blocks
     let mut first_subblock = true;
 
@@ -371,18 +374,21 @@ pub(crate) fn residual_coding(
             }
         }
 
-        // Collect significant scan positions (high→low).
-        let mut sig_scan: Vec<usize> = Vec::new();
+        // Collect significant scan positions (high→low). ≤16 per 4×4 sub-block.
+        let mut sig_scan = [0usize; 16];
+        let mut sig_len = 0usize;
         for k in (0..16).rev() {
             if sig[k] {
-                sig_scan.push(k);
+                sig_scan[sig_len] = k;
+                sig_len += 1;
             }
         }
-        if sig_scan.is_empty() {
+        if sig_len == 0 {
             continue;
         }
-        let last_sig_pos = *sig_scan.first().unwrap(); // highest k
-        let first_sig_pos = *sig_scan.last().unwrap(); // lowest k
+        let sig_scan = &sig_scan[..sig_len];
+        let last_sig_pos = sig_scan[0]; // highest k
+        let first_sig_pos = sig_scan[sig_len - 1]; // lowest k
 
         // ── greater1 ──
         let mut ctx_set: i32 = if i == 0 || !is_luma { 0 } else { 2 };
@@ -392,9 +398,9 @@ pub(crate) fn residual_coding(
         first_subblock = false;
         let mut c1 = 1i32;
         let chroma_off = if is_luma { 0 } else { 16 };
-        let mut gr1 = vec![false; sig_scan.len()];
+        let mut gr1 = [false; 16];
         let mut last_gr1_idx: Option<usize> = None;
-        let n_gr1 = sig_scan.len().min(8);
+        let n_gr1 = sig_len.min(8);
         for (j, dst) in gr1[..n_gr1].iter_mut().enumerate() {
             let g1ctx = c1.min(3);
             let ci = ((ctx_set * 4 + g1ctx) as usize + chroma_off)
@@ -427,7 +433,7 @@ pub(crate) fn residual_coding(
             && !transquant_bypass;
 
         // ── signs (bypass) ──
-        let mut signs = vec![0i32; sig_scan.len()];
+        let mut signs = [0i32; 16];
         for (j, &k) in sig_scan.iter().enumerate() {
             if sign_hidden && k == first_sig_pos {
                 signs[j] = 0; // inferred later
@@ -472,6 +478,7 @@ pub(crate) fn residual_coding(
                 val = -val;
             }
             coeffs[yc * n + xc] = val;
+            max_x = max_x.max(xc);
             sum_abs += level as i64;
             if k == first_sig_pos {
                 first_sig_j = j;
@@ -492,5 +499,6 @@ pub(crate) fn residual_coding(
         }
     }
 
-    (coeffs, transform_skip)
+    // max_x = true max nonzero column; caller uses (max_x + 1) to bound stage-1 columns.
+    (transform_skip, max_x, last_y)
 }

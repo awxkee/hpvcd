@@ -366,7 +366,7 @@ fn idct_raw_s32x4<const N: usize>(c: [__m128i; N]) -> [__m128i; N] {
 }
 
 #[target_feature(enable = "sse4.1")]
-fn inv_dct_n_into_sse41<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
+fn inv_dct_n_into_sse41<const N: usize>(coeff: &[i32], bit_depth: u8, nx: usize, out: &mut [i32]) {
     debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
     debug_assert!(coeff.len() >= N * N);
     debug_assert!(out.len() >= N * N);
@@ -377,7 +377,9 @@ fn inv_dct_n_into_sse41<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut 
     let add2 = 1i32 << (shift2 - 1);
     let mut tmp = [0i32; 32 * 32];
 
-    for c in (0..N).step_by(4) {
+    // Columns >= nx are zero on input; skip them (tmp stays zero there).
+    let ncol = ((nx.min(N) + 3) & !3).max(4);
+    for c in (0..ncol).step_by(4) {
         let src = std::array::from_fn(|k| load_s32x4(&coeff[k * N + c..]));
         let raw = idct_raw_s32x4::<N>(src);
         for (m, raw) in raw.iter().copied().enumerate() {
@@ -430,18 +432,483 @@ fn inv_transform_dst4_into_sse41(coeff: &[i32], bit_depth: u8, out: &mut [i32]) 
     }
 }
 
-pub(crate) fn inv_transform_into_sse41(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+pub(crate) fn inv_transform_into_sse41(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i32],
+) {
     unsafe {
         match n {
-            4 => inv_dct_n_into_sse41::<4>(coeff, bit_depth, out),
-            8 => inv_dct_n_into_sse41::<8>(coeff, bit_depth, out),
-            16 => inv_dct_n_into_sse41::<16>(coeff, bit_depth, out),
-            32 => inv_dct_n_into_sse41::<32>(coeff, bit_depth, out),
-            _ => inv_transform_into_scalar(coeff, n, bit_depth, out),
+            4 => inv_dct_n_into_sse41::<4>(coeff, bit_depth, nx, out),
+            8 => inv_dct_n_into_sse41::<8>(coeff, bit_depth, nx, out),
+            16 => inv_dct_n_into_sse41::<16>(coeff, bit_depth, nx, out),
+            32 => inv_dct_n_into_sse41::<32>(coeff, bit_depth, nx, out),
+            _ => inv_transform_into_scalar(coeff, n, bit_depth, nx, out),
         }
     }
 }
 
 pub(crate) fn inv_transform_dst_into_sse41(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     unsafe { inv_transform_dst4_into_sse41(coeff, bit_depth, out) }
+}
+
+use crate::transform::inv_transform_into_scalar16;
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn ld_i16x4(src: &[i16]) -> __m128i {
+    debug_assert!(src.len() >= 4);
+    unsafe { _mm_loadl_epi64(src.as_ptr().cast::<__m128i>()) }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn st_i16x4(dst: &mut [i16], v: __m128i) {
+    debug_assert!(dst.len() >= 4);
+    unsafe { _mm_storel_epi64(dst.as_mut_ptr().cast::<__m128i>(), v) }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn pr(a: __m128i, b: __m128i) -> __m128i {
+    _mm_unpacklo_epi16(a, b)
+}
+
+/// (k0,k1) i16 pair times interleaved lanes: one pmaddwd = two mul-adds.
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn pmadd(p: __m128i, k0: i32, k1: i32) -> __m128i {
+    _mm_madd_epi16(p, _mm_set1_epi32(((k1 & 0xffff) << 16) | (k0 & 0xffff)))
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn odd8_p(c: &[__m128i; 8]) -> [__m128i; 4] {
+    let p0 = pr(c[1], c[3]);
+    let p1 = pr(c[5], c[7]);
+    [
+        add(pmadd(p0, 89, 75), pmadd(p1, 50, 18)),
+        add(pmadd(p0, 75, -18), pmadd(p1, -89, -50)),
+        add(pmadd(p0, 50, -89), pmadd(p1, 18, 75)),
+        add(pmadd(p0, 18, -50), pmadd(p1, 75, -89)),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn odd16_p(c: &[__m128i; 16]) -> [__m128i; 8] {
+    let p0 = pr(c[1], c[3]);
+    let p1 = pr(c[5], c[7]);
+    let p2 = pr(c[9], c[11]);
+    let p3 = pr(c[13], c[15]);
+    [
+        add(
+            add(pmadd(p0, 90, 87), pmadd(p1, 80, 70)),
+            add(pmadd(p2, 57, 43), pmadd(p3, 25, 9)),
+        ),
+        add(
+            add(pmadd(p0, 87, 57), pmadd(p1, 9, -43)),
+            add(pmadd(p2, -80, -90), pmadd(p3, -70, -25)),
+        ),
+        add(
+            add(pmadd(p0, 80, 9), pmadd(p1, -70, -87)),
+            add(pmadd(p2, -25, 57), pmadd(p3, 90, 43)),
+        ),
+        add(
+            add(pmadd(p0, 70, -43), pmadd(p1, -87, 9)),
+            add(pmadd(p2, 90, 25), pmadd(p3, -80, -57)),
+        ),
+        add(
+            add(pmadd(p0, 57, -80), pmadd(p1, -25, 90)),
+            add(pmadd(p2, -9, -87), pmadd(p3, 43, 70)),
+        ),
+        add(
+            add(pmadd(p0, 43, -90), pmadd(p1, 57, 25)),
+            add(pmadd(p2, -87, 70), pmadd(p3, 9, -80)),
+        ),
+        add(
+            add(pmadd(p0, 25, -70), pmadd(p1, 90, -80)),
+            add(pmadd(p2, 43, 9), pmadd(p3, -57, 87)),
+        ),
+        add(
+            add(pmadd(p0, 9, -25), pmadd(p1, 43, -57)),
+            add(pmadd(p2, 70, -80), pmadd(p3, 87, -90)),
+        ),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn odd32_p(c: &[__m128i; 32]) -> [__m128i; 16] {
+    let p0 = pr(c[1], c[3]);
+    let p1 = pr(c[5], c[7]);
+    let p2 = pr(c[9], c[11]);
+    let p3 = pr(c[13], c[15]);
+    let p4 = pr(c[17], c[19]);
+    let p5 = pr(c[21], c[23]);
+    let p6 = pr(c[25], c[27]);
+    let p7 = pr(c[29], c[31]);
+    [
+        add(
+            add(
+                add(pmadd(p0, 90, 90), pmadd(p1, 88, 85)),
+                add(pmadd(p2, 82, 78), pmadd(p3, 73, 67)),
+            ),
+            add(
+                add(pmadd(p4, 61, 54), pmadd(p5, 46, 38)),
+                add(pmadd(p6, 31, 22), pmadd(p7, 13, 4)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 90, 82), pmadd(p1, 67, 46)),
+                add(pmadd(p2, 22, -4), pmadd(p3, -31, -54)),
+            ),
+            add(
+                add(pmadd(p4, -73, -85), pmadd(p5, -90, -88)),
+                add(pmadd(p6, -78, -61), pmadd(p7, -38, -13)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 88, 67), pmadd(p1, 31, -13)),
+                add(pmadd(p2, -54, -82), pmadd(p3, -90, -78)),
+            ),
+            add(
+                add(pmadd(p4, -46, -4), pmadd(p5, 38, 73)),
+                add(pmadd(p6, 90, 85), pmadd(p7, 61, 22)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 85, 46), pmadd(p1, -13, -67)),
+                add(pmadd(p2, -90, -73), pmadd(p3, -22, 38)),
+            ),
+            add(
+                add(pmadd(p4, 82, 88), pmadd(p5, 54, -4)),
+                add(pmadd(p6, -61, -90), pmadd(p7, -78, -31)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 82, 22), pmadd(p1, -54, -90)),
+                add(pmadd(p2, -61, 13), pmadd(p3, 78, 85)),
+            ),
+            add(
+                add(pmadd(p4, 31, -46), pmadd(p5, -90, -67)),
+                add(pmadd(p6, 4, 73), pmadd(p7, 88, 38)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 78, -4), pmadd(p1, -82, -73)),
+                add(pmadd(p2, 13, 85), pmadd(p3, 67, -22)),
+            ),
+            add(
+                add(pmadd(p4, -88, -61), pmadd(p5, 31, 90)),
+                add(pmadd(p6, 54, -38), pmadd(p7, -90, -46)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 73, -31), pmadd(p1, -90, -22)),
+                add(pmadd(p2, 78, 67), pmadd(p3, -38, -90)),
+            ),
+            add(
+                add(pmadd(p4, -13, 82), pmadd(p5, 61, -46)),
+                add(pmadd(p6, -88, -4), pmadd(p7, 85, 54)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 67, -54), pmadd(p1, -78, 38)),
+                add(pmadd(p2, 85, -22), pmadd(p3, -90, 4)),
+            ),
+            add(
+                add(pmadd(p4, 90, 13), pmadd(p5, -88, -31)),
+                add(pmadd(p6, 82, 46), pmadd(p7, -73, -61)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 61, -73), pmadd(p1, -46, 82)),
+                add(pmadd(p2, 31, -88), pmadd(p3, -13, 90)),
+            ),
+            add(
+                add(pmadd(p4, -4, -90), pmadd(p5, 22, 85)),
+                add(pmadd(p6, -38, -78), pmadd(p7, 54, 67)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 54, -85), pmadd(p1, -4, 88)),
+                add(pmadd(p2, -46, -61), pmadd(p3, 82, 13)),
+            ),
+            add(
+                add(pmadd(p4, -90, 38), pmadd(p5, 67, -78)),
+                add(pmadd(p6, -22, 90), pmadd(p7, -31, -73)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 46, -90), pmadd(p1, 38, 54)),
+                add(pmadd(p2, -90, 31), pmadd(p3, 61, -88)),
+            ),
+            add(
+                add(pmadd(p4, 22, 67), pmadd(p5, -85, 13)),
+                add(pmadd(p6, 73, -82), pmadd(p7, 4, 78)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 38, -88), pmadd(p1, 73, -4)),
+                add(pmadd(p2, -67, 90), pmadd(p3, -46, -31)),
+            ),
+            add(
+                add(pmadd(p4, 85, -78), pmadd(p5, 13, 61)),
+                add(pmadd(p6, -90, 54), pmadd(p7, 22, -82)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 31, -78), pmadd(p1, 90, -61)),
+                add(pmadd(p2, 4, 54), pmadd(p3, -88, 82)),
+            ),
+            add(
+                add(pmadd(p4, -38, -22), pmadd(p5, 73, -90)),
+                add(pmadd(p6, 67, -13), pmadd(p7, -46, 85)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 22, -61), pmadd(p1, 85, -90)),
+                add(pmadd(p2, 73, -38), pmadd(p3, -4, 46)),
+            ),
+            add(
+                add(pmadd(p4, -78, 90), pmadd(p5, -82, 54)),
+                add(pmadd(p6, -13, -31), pmadd(p7, 67, -88)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 13, -38), pmadd(p1, 61, -78)),
+                add(pmadd(p2, 88, -90), pmadd(p3, 85, -73)),
+            ),
+            add(
+                add(pmadd(p4, 54, -31), pmadd(p5, 4, 22)),
+                add(pmadd(p6, -46, 67), pmadd(p7, -82, 90)),
+            ),
+        ),
+        add(
+            add(
+                add(pmadd(p0, 4, -13), pmadd(p1, 22, -31)),
+                add(pmadd(p2, 38, -46), pmadd(p3, 54, -61)),
+            ),
+            add(
+                add(pmadd(p4, 67, -73), pmadd(p5, 78, -82)),
+                add(pmadd(p6, 85, -88), pmadd(p7, 90, -90)),
+            ),
+        ),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn idct4_p(c: [__m128i; 4]) -> [__m128i; 4] {
+    let pe = pr(c[0], c[2]);
+    let po = pr(c[1], c[3]);
+    let e0 = pmadd(pe, 64, 64);
+    let e1 = pmadd(pe, 64, -64);
+    let o0 = pmadd(po, 83, 36);
+    let o1 = pmadd(po, 36, -83);
+    [add(e0, o0), add(e1, o1), sub(e1, o1), sub(e0, o0)]
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn idct8_p(c: &[__m128i; 8]) -> [__m128i; 8] {
+    let ee = idct4_p([c[0], c[2], c[4], c[6]]);
+    let oo = odd8_p(c);
+    let mut out = [zero(); 8];
+    for k in 0..4 {
+        out[k] = add(ee[k], oo[k]);
+        out[7 - k] = sub(ee[k], oo[k]);
+    }
+    out
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn idct16_p(c: &[__m128i; 16]) -> [__m128i; 16] {
+    let ee = idct8_p(&std::array::from_fn(|j| c[2 * j]));
+    let oo = odd16_p(c);
+    let mut out = [zero(); 16];
+    for k in 0..8 {
+        out[k] = add(ee[k], oo[k]);
+        out[15 - k] = sub(ee[k], oo[k]);
+    }
+    out
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn idct32_p(c: &[__m128i; 32]) -> [__m128i; 32] {
+    let ee = idct16_p(&std::array::from_fn(|j| c[2 * j]));
+    let oo = odd32_p(c);
+    let mut out = [zero(); 32];
+    for k in 0..16 {
+        out[k] = add(ee[k], oo[k]);
+        out[31 - k] = sub(ee[k], oo[k]);
+    }
+    out
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn idct_p<const N: usize>(c: &[__m128i; N]) -> [__m128i; N] {
+    debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
+    match N {
+        4 => {
+            let r = idct4_p([c[0], c[1], c[2], c[3]]);
+            std::array::from_fn(|i| r[i])
+        }
+        8 => {
+            let src = std::array::from_fn(|i| c[i]);
+            let r = idct8_p(&src);
+            std::array::from_fn(|i| r[i])
+        }
+        16 => {
+            let src = std::array::from_fn(|i| c[i]);
+            let r = idct16_p(&src);
+            std::array::from_fn(|i| r[i])
+        }
+        32 => {
+            let src = std::array::from_fn(|i| c[i]);
+            let r = idct32_p(&src);
+            std::array::from_fn(|i| r[i])
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Narrow 4 shifted i32x4 (lanes = 4 blocks) to i16 and store transposed 4x4.
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn tr_store_4x4(
+    dst: &mut [i16],
+    stride: usize,
+    lane_base: usize,
+    elem_base: usize,
+    v: [__m128i; 4],
+) {
+    let a = _mm_packs_epi32(v[0], v[1]);
+    let b = _mm_packs_epi32(v[2], v[3]);
+    let x0 = _mm_unpacklo_epi16(a, _mm_srli_si128::<8>(a));
+    let x1 = _mm_unpacklo_epi16(b, _mm_srli_si128::<8>(b));
+    let y0 = _mm_unpacklo_epi32(x0, x1);
+    let y1 = _mm_unpackhi_epi32(x0, x1);
+    st_i16x4(&mut dst[lane_base * stride + elem_base..], y0);
+    st_i16x4(
+        &mut dst[(lane_base + 1) * stride + elem_base..],
+        _mm_srli_si128::<8>(y0),
+    );
+    st_i16x4(&mut dst[(lane_base + 2) * stride + elem_base..], y1);
+    st_i16x4(
+        &mut dst[(lane_base + 3) * stride + elem_base..],
+        _mm_srli_si128::<8>(y1),
+    );
+}
+
+#[target_feature(enable = "sse4.1")]
+fn inv_dct_n_into_sse41_16<const N: usize>(
+    coeff: &[i16],
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i16],
+) {
+    debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
+    let shift1 = 7i32;
+    let add1 = 1i32 << (shift1 - 1);
+    let shift2 = 20 - bit_depth as i32;
+    let add2 = 1i32 << (shift2 - 1);
+    let mut tmp = [0i16; 32 * 32];
+
+    // Columns >= nx are zero on input; skip them (tmp stays zero there).
+    let ncol = ((nx.min(N) + 3) & !3).max(4);
+    for c in (0..ncol).step_by(4) {
+        let src: [__m128i; N] = std::array::from_fn(|k| ld_i16x4(&coeff[k * N + c..]));
+        let raw = idct_p::<N>(&src);
+        for m in (0..N).step_by(4) {
+            let v = std::array::from_fn(|j| round_shift_s32x4(raw[m + j], add1, shift1));
+            tr_store_4x4(&mut tmp, N, c, m, v);
+        }
+    }
+
+    for r in (0..N).step_by(4) {
+        let src: [__m128i; N] = std::array::from_fn(|k| ld_i16x4(&tmp[k * N + r..]));
+        let raw = idct_p::<N>(&src);
+        for x in (0..N).step_by(4) {
+            let v = std::array::from_fn(|j| round_shift_s32x4(raw[x + j], add2, shift2));
+            tr_store_4x4(out, N, r, x, v);
+        }
+    }
+}
+
+#[target_feature(enable = "sse4.1")]
+fn inv_transform_dst4_into_sse41_16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
+    debug_assert!(coeff.len() >= 16);
+    debug_assert!(out.len() >= 16);
+    let shift1 = 7i32;
+    let add1 = 1i32 << (shift1 - 1);
+    let shift2 = 20 - bit_depth as i32;
+    let add2 = 1i32 << (shift2 - 1);
+    let mut tmp = [0i16; 16];
+
+    let c: [__m128i; 4] = std::array::from_fn(|k| ld_i16x4(&coeff[k * 4..]));
+    let p01 = pr(c[0], c[1]);
+    let p23 = pr(c[2], c[3]);
+    let v = std::array::from_fn(|m| {
+        let acc = add(
+            pmadd(p01, DST4[0][m], DST4[1][m]),
+            pmadd(p23, DST4[2][m], DST4[3][m]),
+        );
+        round_shift_s32x4(acc, add1, shift1)
+    });
+    tr_store_4x4(&mut tmp, 4, 0, 0, v);
+
+    let c: [__m128i; 4] = std::array::from_fn(|k| ld_i16x4(&tmp[k * 4..]));
+    let p01 = pr(c[0], c[1]);
+    let p23 = pr(c[2], c[3]);
+    let v = std::array::from_fn(|m| {
+        let acc = add(
+            pmadd(p01, DST4[0][m], DST4[1][m]),
+            pmadd(p23, DST4[2][m], DST4[3][m]),
+        );
+        round_shift_s32x4(acc, add2, shift2)
+    });
+    tr_store_4x4(out, 4, 0, 0, v);
+}
+
+pub(crate) fn inv_transform_into_sse41_16(
+    coeff: &[i16],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i16],
+) {
+    unsafe {
+        match n {
+            4 => inv_dct_n_into_sse41_16::<4>(coeff, bit_depth, nx, out),
+            8 => inv_dct_n_into_sse41_16::<8>(coeff, bit_depth, nx, out),
+            16 => inv_dct_n_into_sse41_16::<16>(coeff, bit_depth, nx, out),
+            32 => inv_dct_n_into_sse41_16::<32>(coeff, bit_depth, nx, out),
+            _ => inv_transform_into_scalar16(coeff, n, bit_depth, nx, out),
+        }
+    }
+}
+
+pub(crate) fn inv_transform_dst_into_sse41_16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
+    unsafe { inv_transform_dst4_into_sse41_16(coeff, bit_depth, out) }
 }

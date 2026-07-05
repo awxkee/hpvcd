@@ -26,79 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 use core::arch::aarch64::*;
 
+use super::common::*;
 use crate::transform::{DST4, inv_transform_into_scalar};
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn load_s32x4(src: &[i32]) -> int32x4_t {
-    debug_assert!(src.len() >= 4);
-    unsafe { vld1q_s32(src.as_ptr()) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn load_rows4_s32x4(src: &[i32], stride: usize, x: usize) -> int32x4_t {
-    debug_assert!(src.len() > 3 * stride + x);
-    let lanes = [
-        src[x],
-        src[stride + x],
-        src[2 * stride + x],
-        src[3 * stride + x],
-    ];
-    unsafe { vld1q_s32(lanes.as_ptr()) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn store_s32x4(dst: &mut [i32], v: int32x4_t) {
-    debug_assert!(dst.len() >= 4);
-    unsafe { vst1q_s32(dst.as_mut_ptr(), v) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn store_rows4_s32x4(dst: &mut [i32], stride: usize, x: usize, v: int32x4_t) {
-    debug_assert!(dst.len() > 3 * stride + x);
-    let mut lanes = [0i32; 4];
-    unsafe { vst1q_s32(lanes.as_mut_ptr(), v) };
-    dst[x] = lanes[0];
-    dst[stride + x] = lanes[1];
-    dst[2 * stride + x] = lanes[2];
-    dst[3 * stride + x] = lanes[3];
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn zero() -> int32x4_t {
-    vdupq_n_s32(0)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn add(a: int32x4_t, b: int32x4_t) -> int32x4_t {
-    vaddq_s32(a, b)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn sub(a: int32x4_t, b: int32x4_t) -> int32x4_t {
-    vsubq_s32(a, b)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn mul_const(v: int32x4_t, c: i32) -> int32x4_t {
-    vmulq_s32(v, vdupq_n_s32(c))
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn madd_const(acc: int32x4_t, v: int32x4_t, c: i32) -> int32x4_t {
-    add(acc, mul_const(v, c))
-}
 
 macro_rules! lin_s32x4 {
     ($v0:expr, $k0:expr $(, $v:expr, $k:expr)+ $(,)?) => {{
@@ -108,19 +39,6 @@ macro_rules! lin_s32x4 {
         )+
         acc
     }};
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn round_shift_s32x4(v: int32x4_t, add: i32, shift: i32) -> int32x4_t {
-    vshlq_s32(vaddq_s32(v, vdupq_n_s32(add)), vdupq_n_s32(-shift))
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn round_shift_clip_i16_s32x4(v: int32x4_t, add: i32, shift: i32) -> int32x4_t {
-    let v = round_shift_s32x4(v, add, shift);
-    vmaxq_s32(vminq_s32(v, vdupq_n_s32(32767)), vdupq_n_s32(-32768))
 }
 
 #[inline]
@@ -359,7 +277,7 @@ fn idct_raw_s32x4<const N: usize>(c: [int32x4_t; N]) -> [int32x4_t; N] {
 }
 
 #[target_feature(enable = "neon")]
-fn inv_dct_n_into_neon<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
+fn inv_dct_n_into_neon<const N: usize>(coeff: &[i32], bit_depth: u8, nx: usize, out: &mut [i32]) {
     debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
     debug_assert!(coeff.len() >= N * N);
     debug_assert!(out.len() >= N * N);
@@ -370,7 +288,9 @@ fn inv_dct_n_into_neon<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [
     let add2 = 1i32 << (shift2 - 1);
     let mut tmp = [0i32; 32 * 32];
 
-    for c in (0..N).step_by(4) {
+    // Columns >= nx are zero on input; skip them (tmp stays zero there).
+    let ncol = ((nx.min(N) + 3) & !3).max(4);
+    for c in (0..ncol).step_by(4) {
         let src = std::array::from_fn(|k| load_s32x4(&coeff[k * N + c..]));
         let raw = idct_raw_s32x4::<N>(src);
         for (m, raw) in raw.iter().copied().enumerate() {
@@ -423,14 +343,20 @@ fn inv_transform_dst4_into_neon(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     }
 }
 
-pub(crate) fn inv_transform_into_neon(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+pub(crate) fn inv_transform_into_neon(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i32],
+) {
     unsafe {
         match n {
-            4 => inv_dct_n_into_neon::<4>(coeff, bit_depth, out),
-            8 => inv_dct_n_into_neon::<8>(coeff, bit_depth, out),
-            16 => inv_dct_n_into_neon::<16>(coeff, bit_depth, out),
-            32 => inv_dct_n_into_neon::<32>(coeff, bit_depth, out),
-            _ => inv_transform_into_scalar(coeff, n, bit_depth, out),
+            4 => inv_dct_n_into_neon::<4>(coeff, bit_depth, nx, out),
+            8 => inv_dct_n_into_neon::<8>(coeff, bit_depth, nx, out),
+            16 => inv_dct_n_into_neon::<16>(coeff, bit_depth, nx, out),
+            32 => inv_dct_n_into_neon::<32>(coeff, bit_depth, nx, out),
+            _ => inv_transform_into_scalar(coeff, n, bit_depth, nx, out),
         }
     }
 }

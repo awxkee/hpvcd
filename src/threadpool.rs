@@ -154,6 +154,53 @@ impl<T> Drop for DisjointMutGuard<'_, T> {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Monotonic progress counter: waiters spin briefly, then park on a condvar.
+/// `publish` only touches the lock when someone is actually parked.
+pub(crate) struct ProgressGate {
+    v: AtomicUsize,
+    waiters: AtomicUsize,
+    lock: Mutex<()>,
+    cvar: Condvar,
+}
+
+impl ProgressGate {
+    pub(crate) fn new() -> Self {
+        ProgressGate {
+            v: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
+            lock: Mutex::new(()),
+            cvar: Condvar::new(),
+        }
+    }
+
+    /// Publish a new (monotonically increasing) value.
+    pub(crate) fn publish(&self, x: usize) {
+        // SeqCst store/loads make the sleep-vs-publish handshake race-free.
+        self.v.store(x, Ordering::SeqCst);
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.cvar.notify_all();
+        }
+    }
+
+    /// Block until the published value reaches `x`.
+    pub(crate) fn wait_at_least(&self, x: usize) {
+        for _ in 0..512 {
+            if self.v.load(Ordering::Acquire) >= x {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let mut g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        while self.v.load(Ordering::SeqCst) < x {
+            g = self.cvar.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+        drop(g);
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct Deque {
     jobs: Mutex<VecDeque<Job>>,
 }
@@ -182,7 +229,9 @@ struct Shared {
     injector: Mutex<VecDeque<Job>>,
     /// Number of jobs not yet finished across all queues, for `wait_idle`.
     pending: AtomicUsize,
-    /// Signalled when new work arrives or a job completes.
+    /// Number of jobs sitting in queues (not yet picked up); workers sleep on 0.
+    queued: AtomicUsize,
+    /// Signaled when new work arrives or a job completes.
     cvar: Condvar,
     /// Paired with `cvar`; guards the "there might be work / progress" signal.
     lock: Mutex<()>,
@@ -194,6 +243,14 @@ impl Shared {
     /// injector. `me` is the calling worker's index (or `deques.len()` for the
     /// external submitter, which owns no deque).
     fn find_job(&self, me: usize) -> Option<Job> {
+        let job = self.find_job_inner(me);
+        if job.is_some() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        job
+    }
+
+    fn find_job_inner(&self, me: usize) -> Option<Job> {
         if let Some(d) = self.deques.get(me)
             && let Some(j) = d.pop()
         {
@@ -212,7 +269,12 @@ impl Shared {
         self.injector.lock().unwrap().pop_front()
     }
 
-    fn notify_work(&self) {
+    fn notify_one_job(&self) {
+        let _g = self.lock.lock().unwrap();
+        self.cvar.notify_one();
+    }
+
+    fn notify_all_workers(&self) {
         let _g = self.lock.lock().unwrap();
         self.cvar.notify_all();
     }
@@ -245,6 +307,7 @@ impl ThreadPool {
             deques,
             injector: Mutex::new(VecDeque::new()),
             pending: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
             cvar: Condvar::new(),
             lock: Mutex::new(()),
             shutdown: AtomicBool::new(false),
@@ -267,7 +330,6 @@ impl ThreadPool {
         }
     }
 
-    /// Build a pool sized to the machine's available parallelism.
     pub(crate) fn with_available_parallelism() -> Self {
         let n = thread::available_parallelism()
             .map(|n| n.get())
@@ -283,10 +345,11 @@ impl ThreadPool {
     /// Submit a `'static` job onto the least-recently-fed worker's deque.
     fn submit(&self, job: Job) {
         self.shared.pending.fetch_add(1, Ordering::Relaxed);
+        self.shared.queued.fetch_add(1, Ordering::Relaxed);
         let n = self.shared.deques.len();
         let idx = self.round_robin.fetch_add(1, Ordering::Relaxed) % n;
         self.shared.deques[idx].push(job);
-        self.shared.notify_work();
+        self.shared.notify_one_job();
     }
 
     /// Run `f` with a [`Scope`] that can spawn jobs borrowing stack data. All
@@ -310,7 +373,7 @@ impl ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        self.shared.notify_work();
+        self.shared.notify_all_workers();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
@@ -339,15 +402,12 @@ fn worker_loop(shared: Arc<Shared>, id: usize) {
             break;
         }
         // Re-check for work before sleeping to avoid a lost-wakeup race.
-        let has_work = shared.pending.load(Ordering::Acquire) > 0;
+        let has_work = shared.queued.load(Ordering::Acquire) > 0;
         if has_work {
             drop(guard);
             continue;
         }
-        let _unused = shared
-            .cvar
-            .wait_timeout(guard, std::time::Duration::from_millis(1))
-            .unwrap();
+        let _unused = shared.cvar.wait(guard).unwrap();
     }
 }
 
@@ -431,11 +491,8 @@ impl<'scope> Scope<'scope> {
                 return;
             }
             // Some jobs are still running on other workers. Block until one
-            // signals completion (or the short timeout, to re-attempt stealing).
-            let _unused = self
-                .done
-                .wait_timeout(guard, std::time::Duration::from_millis(1))
-                .unwrap();
+            // signals completion, then retry stealing.
+            let _unused = self.done.wait(guard).unwrap();
         }
     }
 }

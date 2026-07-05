@@ -129,6 +129,11 @@ pub(crate) struct FullDecoder {
     deq_scratch: Vec<i32>,
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
     res_scratch: Vec<i32>,
+    /// i16 dequant/residual scratch, used on the 8-bit-depth path (half the width).
+    deq_scratch16: Vec<i16>,
+    res_scratch16: Vec<i16>,
+    /// Parsed residual levels scratch (max 32×32), reused across TUs.
+    coeff_scratch: Vec<i32>,
     /// Cached strong_intra_smoothing (avoids env-var lookup per TU)
     strong_smoothing: bool,
 }
@@ -242,6 +247,9 @@ impl FullDecoder {
             scratch: intra::IntraScratch::new(),
             deq_scratch: vec![0i32; 1024],
             res_scratch: vec![0i32; 1024],
+            deq_scratch16: vec![0i16; 1024],
+            res_scratch16: vec![0i16; 1024],
+            coeff_scratch: vec![0i32; 1024],
             strong_smoothing: true,
             sps,
             pps,
@@ -446,18 +454,15 @@ impl FullDecoder {
     pub(crate) fn decode_wavefront_row(
         &mut self,
         ry: usize,
-        progress: &std::sync::atomic::AtomicUsize,
-        above_progress: Option<&std::sync::atomic::AtomicUsize>,
+        progress: &crate::threadpool::ProgressGate,
+        above_progress: Option<&crate::threadpool::ProgressGate>,
         snapshot_out: &std::sync::OnceLock<(ContextSet, IntraModeContexts)>,
     ) -> Result<(), DecodeError> {
-        use std::sync::atomic::Ordering;
         let cols = self.ctb_cols;
         for rx in 0..cols {
             // Wavefront gate: wait until the row above is ≥ 2 CTBs ahead.
             if let Some(above) = above_progress {
-                while above.load(Ordering::Acquire) < rx + 2 {
-                    std::hint::spin_loop();
-                }
+                above.wait_at_least(rx + 2);
             }
             let terminated = self.decode_one_ctb_inner(rx, ry, true, false);
 
@@ -469,7 +474,7 @@ impl FullDecoder {
 
             // Publish progress *after* the CTB is fully reconstructed so a waiter
             // observing `rx+1` can safely read our columns ≤ rx.
-            progress.store(rx + 1, Ordering::Release);
+            progress.publish(rx + 1);
             if terminated {
                 break;
             }
@@ -481,7 +486,7 @@ impl FullDecoder {
             let _ = snapshot_out.set((self.ctx.clone(), self.ictx));
         }
         // Ensure the row below can always advance past our last column.
-        progress.store(cols + 2, Ordering::Release);
+        progress.publish(cols + 2);
         Ok(())
     }
 
@@ -1790,7 +1795,8 @@ impl FullDecoder {
             } else {
                 None
             };
-            let (levels, _tskip) = residual_coding(
+            let mut coeffs = std::mem::take(&mut self.coeff_scratch);
+            let (_tskip, max_x, _last_y) = residual_coding(
                 &mut self.cab,
                 &mut self.ctx,
                 log2_ts,
@@ -1799,8 +1805,10 @@ impl FullDecoder {
                 self.sign_hiding,
                 ts_ctx,
                 self.cu_tqb,
+                &mut coeffs,
             );
-            self.reconstruct_luma(x0, y0, log2_ts, luma_mode, &levels);
+            self.reconstruct_luma(x0, y0, log2_ts, luma_mode, &coeffs, max_x + 1);
+            self.coeff_scratch = coeffs;
         } else {
             // prediction only (no residual) still needs to fill rec for neighbors
             self.predict_only_luma(x0, y0, log2_ts, luma_mode);
@@ -1994,16 +2002,71 @@ impl FullDecoder {
         corner
     }
 
-    fn reconstruct_luma(&mut self, x0: usize, y0: usize, log2_ts: u32, mode: u8, levels: &[i32]) {
+    fn reconstruct_luma(
+        &mut self,
+        x0: usize,
+        y0: usize,
+        log2_ts: u32,
+        mode: u8,
+        levels: &[i32],
+        nx: usize,
+    ) {
         let n = 1usize << log2_ts;
         self.predict_luma_block_into(x0, y0, n, mode);
+        let stride = self.w;
+        let valid_w = self.w.saturating_sub(x0).min(n);
+        let valid_h = self.h.saturating_sub(y0).min(n);
+        // 8-bit depth: residuals fit i16, halving memory traffic and widening SIMD.
+        if self.bd <= 8 {
+            if self.cu_tqb {
+                for (o, &l) in self.res_scratch16[..n * n].iter_mut().zip(levels.iter()) {
+                    *o = l.clamp(-32768, 32767) as i16;
+                }
+            } else {
+                let qp = self.cur_qp.clamp(0, 51) as u8;
+                transform::dequantize_into(
+                    levels,
+                    n,
+                    qp,
+                    self.bd,
+                    &mut self.deq_scratch16[..n * n],
+                );
+                if n == 4 {
+                    transform::inv_transform_dst_into16(
+                        &self.deq_scratch16[..n * n],
+                        self.bd,
+                        &mut self.res_scratch16[..n * n],
+                    );
+                } else {
+                    transform::inv_transform_into16(
+                        &self.deq_scratch16[..n * n],
+                        n,
+                        self.bd,
+                        nx,
+                        &mut self.res_scratch16[..n * n],
+                    );
+                }
+            }
+            let pred = &self.scratch.pred[..n * n];
+            let res = &self.res_scratch16[..n * n];
+            if valid_w != 0
+                && valid_h != 0
+                && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+            {
+                reconstruct::add_residual_into16(
+                    dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+                );
+            }
+            self.mark_decoded(x0, y0, n);
+            return;
+        }
         if self.cu_tqb {
             // Lossless: residual is the parsed level array verbatim (row-major),
             // no scaling or inverse transform (HEVC §8.6.5).
             self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
         } else {
             let qp = self.cur_qp.clamp(0, 51) as u8;
-            transform::dequantize_i32_into(levels, n, qp, self.bd, &mut self.deq_scratch[..n * n]);
+            transform::dequantize_into(levels, n, qp, self.bd, &mut self.deq_scratch[..n * n]);
             if n == 4 {
                 transform::inv_transform_dst_into(
                     &self.deq_scratch[..n * n],
@@ -2015,15 +2078,13 @@ impl FullDecoder {
                     &self.deq_scratch[..n * n],
                     n,
                     self.bd,
+                    nx,
                     &mut self.res_scratch[..n * n],
                 );
             }
         }
         let pred = &self.scratch.pred[..n * n];
         let res = &self.res_scratch[..n * n];
-        let stride = self.w;
-        let valid_w = self.w.saturating_sub(x0).min(n);
-        let valid_h = self.h.saturating_sub(y0).min(n);
         if valid_w != 0
             && valid_h != 0
             && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
@@ -2123,7 +2184,8 @@ impl FullDecoder {
         for (t, &cb) in cbf_cb[0..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cb {
-                let (levels, _) = residual_coding(
+                let mut coeffs = std::mem::take(&mut self.coeff_scratch);
+                let (_, max_x, _) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     clog2,
@@ -2132,8 +2194,10 @@ impl FullDecoder {
                     self.sign_hiding,
                     None,
                     self.cu_tqb,
+                    &mut coeffs,
                 );
-                self.reconstruct_chroma(true, cx0, ty, cn, mode, &levels, qp_cb);
+                self.reconstruct_chroma(true, cx0, ty, cn, mode, &coeffs, qp_cb, max_x + 1);
+                self.coeff_scratch = coeffs;
             } else {
                 self.predict_only_chroma(true, cx0, ty, cn, mode);
             }
@@ -2145,7 +2209,8 @@ impl FullDecoder {
         for (t, &cr) in cbf_cr[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cr {
-                let (levels, _) = residual_coding(
+                let mut coeffs = std::mem::take(&mut self.coeff_scratch);
+                let (_, max_x, _) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     clog2,
@@ -2154,8 +2219,10 @@ impl FullDecoder {
                     self.sign_hiding,
                     None,
                     self.cu_tqb,
+                    &mut coeffs,
                 );
-                self.reconstruct_chroma(false, cx0, ty, cn, mode, &levels, qp_cr);
+                self.reconstruct_chroma(false, cx0, ty, cn, mode, &coeffs, qp_cr, max_x + 1);
+                self.coeff_scratch = coeffs;
             } else {
                 self.predict_only_chroma(false, cx0, ty, cn, mode);
             }
@@ -2280,33 +2347,63 @@ impl FullDecoder {
         mode: u8,
         levels: &[i32],
         qp: i32,
+        nx: usize,
     ) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
-        if self.cu_tqb {
-            // Lossless: chroma residual is the parsed levels verbatim.
-            self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
-        } else {
-            let qp_c = qp.clamp(0, 51) as u8;
-            transform::dequantize_i32_into(
-                levels,
-                n,
-                qp_c,
-                self.bd_c,
-                &mut self.deq_scratch[..n * n],
-            );
-            transform::inv_transform_into(
-                &self.deq_scratch[..n * n],
-                n,
-                self.bd_c,
-                &mut self.res_scratch[..n * n],
-            );
-        }
         let n2 = n * n;
-        let pred = &self.scratch.pred[..n2];
-        let res = &self.res_scratch[..n2];
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
+        if self.bd_c <= 8 {
+            if self.cu_tqb {
+                for (o, &l) in self.res_scratch16[..n2].iter_mut().zip(levels.iter()) {
+                    *o = l.clamp(-32768, 32767) as i16;
+                }
+            } else {
+                let qp_c = qp.clamp(0, 51) as u8;
+                transform::dequantize_into(
+                    levels,
+                    n,
+                    qp_c,
+                    self.bd_c,
+                    &mut self.deq_scratch16[..n2],
+                );
+                transform::inv_transform_into16(
+                    &self.deq_scratch16[..n2],
+                    n,
+                    self.bd_c,
+                    nx,
+                    &mut self.res_scratch16[..n2],
+                );
+            }
+            let pred = &self.scratch.pred[..n2];
+            let res = &self.res_scratch16[..n2];
+            if valid_w != 0 && valid_h != 0 {
+                let plane = if is_cb { &mut self.cb } else { &mut self.cr };
+                if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
+                    reconstruct::add_residual_into16(
+                        dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+                    );
+                }
+            }
+            return;
+        }
+        if self.cu_tqb {
+            // Lossless: chroma residual is the parsed levels verbatim.
+            self.res_scratch[..n2].copy_from_slice(&levels[..n2]);
+        } else {
+            let qp_c = qp.clamp(0, 51) as u8;
+            transform::dequantize_into(levels, n, qp_c, self.bd_c, &mut self.deq_scratch[..n2]);
+            transform::inv_transform_into(
+                &self.deq_scratch[..n2],
+                n,
+                self.bd_c,
+                nx,
+                &mut self.res_scratch[..n2],
+            );
+        }
+        let pred = &self.scratch.pred[..n2];
+        let res = &self.res_scratch[..n2];
         if valid_w != 0 && valid_h != 0 {
             let plane = if is_cb { &mut self.cb } else { &mut self.cr };
             if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
@@ -2463,6 +2560,9 @@ impl RowFactory {
             scratch: intra::IntraScratch::new(),
             deq_scratch: vec![0i32; 1024],
             res_scratch: vec![0i32; 1024],
+            deq_scratch16: vec![0i16; 1024],
+            res_scratch16: vec![0i16; 1024],
+            coeff_scratch: vec![0i32; 1024],
             strong_smoothing: self.strong_smoothing,
         })
     }

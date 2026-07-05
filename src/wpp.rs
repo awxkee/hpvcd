@@ -32,6 +32,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::threadpool::ProgressGate;
+
 use crate::cabac::{ContextSet, IntraModeContexts};
 use crate::decode::FullDecoder;
 use crate::error::DecodeError;
@@ -177,8 +179,8 @@ pub(crate) fn run_wavefront(
     let ctb_rows = rows.len();
     debug_assert_eq!(ctb_rows, template.ctb_rows_pub());
 
-    // Per-row completed-column counters and context-snapshot hand-off slots.
-    let progress: Vec<AtomicUsize> = (0..ctb_rows).map(|_| AtomicUsize::new(0)).collect();
+    // Per-row completed-column gates and context-snapshot hand-off slots.
+    let progress: Vec<ProgressGate> = (0..ctb_rows).map(|_| ProgressGate::new()).collect();
     let snapshots: Vec<OnceLock<(ContextSet, IntraModeContexts)>> =
         (0..ctb_rows).map(|_| OnceLock::new()).collect();
 
@@ -208,8 +210,14 @@ pub(crate) fn run_wavefront(
                     // Claim the next row. Stop once all rows are taken or an
                     // error has been recorded (so we drain instead of spinning).
                     let ry = next_row_ref.fetch_add(1, Ordering::Relaxed);
-                    if ry >= ctb_rows || first_err_ref.get().is_some() {
+                    if ry >= ctb_rows {
                         break;
+                    }
+                    if first_err_ref.get().is_some() {
+                        // Claimed rows must always publish, or the row below hangs.
+                        let _ = snapshots_ref[ry].set(default_contexts());
+                        progress_ref[ry].publish(usize::MAX);
+                        continue;
                     }
 
                     let sub = rows[ry];
@@ -218,7 +226,7 @@ pub(crate) fn run_wavefront(
                             first_err_ref.set(DecodeError::Bitstream("wpp substream range".into()));
                         // Unblock the row below so its runner never stalls.
                         let _ = snapshots_ref[ry].set(default_contexts());
-                        progress_ref[ry].store(usize::MAX, Ordering::Release);
+                        progress_ref[ry].publish(usize::MAX);
                         continue;
                     }
                     let row_cabac = &rbsp[sub.start..sub.end];
@@ -227,18 +235,16 @@ pub(crate) fn run_wavefront(
                     // waits for the row above to publish its post-CTB-1 snapshot.
                     // The row above has a smaller index, hence was claimed
                     // earlier and is in flight, so this wait always resolves.
+                    // Row above publishes its snapshot before progress 2, and every
+                    // claimed row publishes even on error/abandon, so this resolves.
                     let (ctx, ictx) = if ry == 0 {
                         (init_ctx.clone(), init_ictx)
                     } else {
-                        loop {
-                            if let Some(snap) = snapshots_ref[ry - 1].get() {
-                                break snap.clone();
-                            }
-                            if first_err_ref.get().is_some() {
-                                break default_contexts();
-                            }
-                            std::hint::spin_loop();
-                        }
+                        progress_ref[ry - 1].wait_at_least(2);
+                        snapshots_ref[ry - 1]
+                            .get()
+                            .cloned()
+                            .unwrap_or_else(default_contexts)
                     };
 
                     // SAFETY: disjointness upheld by the 2-CTB lag; buffers live
@@ -248,7 +254,7 @@ pub(crate) fn run_wavefront(
                         Err(e) => {
                             let _ = first_err_ref.set(e);
                             let _ = snapshots_ref[ry].set(default_contexts());
-                            progress_ref[ry].store(usize::MAX, Ordering::Release);
+                            progress_ref[ry].publish(usize::MAX);
                             continue;
                         }
                     };

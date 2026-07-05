@@ -4,7 +4,7 @@ exclude = []
 
 [package]
 name = "hpvcd"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "HEVC/HEIC tiny image decoder"
 readme = "README.md"

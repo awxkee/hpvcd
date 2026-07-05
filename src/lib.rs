@@ -658,7 +658,8 @@ pub(crate) fn decode_heic_with(
     } else {
         heif.primary.color.cicp.unwrap_or_else(Cicp::srgb)
     };
-    let rgb = yuv::yuv_to_rgb_with_color(&yuv_planes, dw, dh, &color_enc);
+    let rgb =
+        yuv::yuv_to_rgb_with_color_pool(&yuv_planes, dw, dh, &color_enc, Some(decoder.pool()));
 
     let alpha = if let Some(a) = &heif.alpha {
         if !a.hvcc.is_empty() {

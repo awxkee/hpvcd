@@ -36,6 +36,33 @@ pub(crate) static DST4: [[i32; 4]; 4] = [
 
 static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
+/// Coefficient/residual storage element: `i16` for 8-bit depth, `i32` for 10/12-bit.
+/// Butterfly accumulators are always i32; this only picks the in/out storage width.
+pub(crate) trait Coeff: Copy + Default + Send + Sync + 'static {
+    fn from_i32(v: i32) -> Self;
+    fn to_i32(self) -> i32;
+}
+impl Coeff for i32 {
+    #[inline(always)]
+    fn from_i32(v: i32) -> Self {
+        v
+    }
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        self
+    }
+}
+impl Coeff for i16 {
+    #[inline(always)]
+    fn from_i32(v: i32) -> Self {
+        v as i16
+    }
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+}
+
 #[inline(always)]
 fn idct_odd_8(c: [i32; 8]) -> [i32; 4] {
     [
@@ -459,7 +486,7 @@ fn idct_raw<const N: usize>(c: [i32; N]) -> [i32; N] {
 
 /// 2-D partial-butterfly inverse DCT into `out[..N*N]`.
 #[inline]
-fn inv_dct_n_into<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
+fn inv_dct_n_into<const N: usize, S: Coeff>(coeff: &[S], bit_depth: u8, nx: usize, out: &mut [S]) {
     debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
     debug_assert!(coeff.len() >= N * N);
     debug_assert!(out.len() >= N * N);
@@ -468,13 +495,16 @@ fn inv_dct_n_into<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [i32])
     let add1 = 1i32 << (shift1 - 1);
     let shift2 = 20 - bit_depth as i32;
     let add2 = 1i32 << (shift2 - 1);
-    let mut tmp = [0i32; 32 * 32];
+    // Stage-1 output is always clamped to i16 range regardless of storage width.
+    let mut tmp = [0i16; 32 * 32];
 
-    for c in 0..N {
-        let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c]);
+    // Columns >= nx are all-zero on input, so their stage-1 output stays zero in tmp.
+    let nx = nx.min(N);
+    for c in 0..nx {
+        let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c].to_i32());
         let raw = idct_raw::<N>(col);
         for (m, &raw) in raw.iter().enumerate() {
-            tmp[m * N + c] = ((raw + add1) >> shift1).clamp(-32768, 32767);
+            tmp[m * N + c] = ((raw + add1) >> shift1).clamp(-32768, 32767) as i16;
         }
     }
 
@@ -484,20 +514,21 @@ fn inv_dct_n_into<const N: usize>(coeff: &[i32], bit_depth: u8, out: &mut [i32])
         .iter()
         .zip(out.as_chunks_mut::<N>().0.iter_mut())
     {
-        let row: [i32; N] = std::array::from_fn(|k| tmp_row[k]);
+        let row: [i32; N] = std::array::from_fn(|k| tmp_row[k] as i32);
         let raw = idct_raw::<N>(row);
         for (dst, &raw) in out_row.iter_mut().zip(raw.iter()) {
-            *dst = (raw + add2) >> shift2;
+            *dst = S::from_i32((raw + add2) >> shift2);
         }
     }
 }
 
 #[inline]
-fn inv_transform_n_into<const N: usize>(
-    coeff: &[i32],
+fn inv_transform_n_into<const N: usize, S: Coeff>(
+    coeff: &[S],
     t: &[[i32; N]; N],
     bit_depth: u8,
-    out: &mut [i32],
+    nx: usize,
+    out: &mut [S],
 ) {
     let bd = bit_depth as i32;
     let shift1 = 7i32;
@@ -505,13 +536,14 @@ fn inv_transform_n_into<const N: usize>(
     let shift2 = 20 - bd;
     let add2 = 1i32 << (shift2 - 1);
 
-    let mut tmp = [0i32; 32 * 32];
+    let mut tmp = [0i16; 32 * 32];
     let mut acc = [0i32; N];
 
-    for c in 0..N {
+    let nx = nx.min(N);
+    for c in 0..nx {
         acc[..N].fill(0);
         for k in 0..N {
-            let ck = coeff[k * N + c];
+            let ck = coeff[k * N + c].to_i32();
             if ck == 0 {
                 continue; // sparse skip — most residual coeffs are zero
             }
@@ -521,7 +553,7 @@ fn inv_transform_n_into<const N: usize>(
             }
         }
         for (m, &acc) in acc[..N].iter().enumerate() {
-            tmp[m * N + c] = ((acc + add1) >> shift1).clamp(-32768, 32767);
+            tmp[m * N + c] = ((acc + add1) >> shift1).clamp(-32768, 32767) as i16;
         }
     }
 
@@ -536,23 +568,25 @@ fn inv_transform_n_into<const N: usize>(
             if rk == 0 {
                 continue;
             }
+            let rk = rk as i32;
             for (acc, &tm) in acc[..N].iter_mut().zip(trow.iter()) {
                 *acc += tm * rk;
             }
         }
         for (dst, &acc) in out_row.iter_mut().zip(acc[..N].iter()) {
-            *dst = (acc + add2) >> shift2;
+            *dst = S::from_i32((acc + add2) >> shift2);
         }
     }
 }
 
-/// Dequantize into `out[..n*n]` — avoids a heap allocation per transform block.
-pub(crate) fn dequantize_i32_into(
+/// Dequantize into `out[..n*n]`. Output is always within i16 range (spec clamp),
+/// so it stores exactly whether `S` is `i16` or `i32`.
+pub(crate) fn dequantize_into<S: Coeff>(
     levels: &[i32],
     n: usize,
     qp: u8,
     bit_depth: u8,
-    out: &mut [i32],
+    out: &mut [S],
 ) {
     let log2n = (n as u32).trailing_zeros() as i64;
     let bd = bit_depth as i64;
@@ -564,17 +598,21 @@ pub(crate) fn dequantize_i32_into(
     let per = 1i64 << (qp_scaled / 6);
     let factor = scale * per * 16;
     for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
-        // Intermediate stays i64 (l*factor can exceed i32 for high QP); the
-        // clamped result is always within i16 range, so storing as i32 is exact.
-        *o = ((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32;
+        // l*factor can exceed i32 at high QP, so the intermediate stays i64.
+        *o = S::from_i32(((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32);
     }
 }
 
-type InvTransformFn = fn(&[i32], usize, u8, &mut [i32]);
+// `nx` = number of nonzero input columns (last_x + 1); stage 1 skips the rest.
+type InvTransformFn = fn(&[i32], usize, u8, usize, &mut [i32]);
 type InvTransform4Fn = fn(&[i32], u8, &mut [i32]);
+type InvTransformFn16 = fn(&[i16], usize, u8, usize, &mut [i16]);
+type InvTransform4Fn16 = fn(&[i16], u8, &mut [i16]);
 
 static INV_TRANSFORM: std::sync::OnceLock<InvTransformFn> = std::sync::OnceLock::new();
 static INV_TRANSFORM_DST4: std::sync::OnceLock<InvTransform4Fn> = std::sync::OnceLock::new();
+static INV_TRANSFORM16: std::sync::OnceLock<InvTransformFn16> = std::sync::OnceLock::new();
+static INV_TRANSFORM_DST4_16: std::sync::OnceLock<InvTransform4Fn16> = std::sync::OnceLock::new();
 
 #[inline]
 fn resolve_inv_transform() -> InvTransformFn {
@@ -618,28 +656,120 @@ fn resolve_inv_transform_dst4() -> InvTransform4Fn {
     })
 }
 
+#[inline]
+fn resolve_inv_transform16() -> InvTransformFn16 {
+    *INV_TRANSFORM16.get_or_init(|| {
+        let mut _f: InvTransformFn16 = inv_transform_into_scalar16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::inv_transform_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::inv_transform_into_sse41_16;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_inv_transform_dst4_16() -> InvTransform4Fn16 {
+    *INV_TRANSFORM_DST4_16.get_or_init(|| {
+        let mut _f: InvTransform4Fn16 = inv_transform_dst_into_scalar16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::inv_transform_dst_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::inv_transform_dst_into_sse41_16;
+            }
+        }
+
+        _f
+    })
+}
+
 /// Scalar inverse DCT into `out[..n*n]` — no heap allocation.
-pub(crate) fn inv_transform_into_scalar(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
+pub(crate) fn inv_transform_into_scalar(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i32],
+) {
     match n {
-        4 => inv_dct_n_into::<4>(coeff, bit_depth, out),
-        8 => inv_dct_n_into::<8>(coeff, bit_depth, out),
-        16 => inv_dct_n_into::<16>(coeff, bit_depth, out),
-        32 => inv_dct_n_into::<32>(coeff, bit_depth, out),
+        4 => inv_dct_n_into::<4, i32>(coeff, bit_depth, nx, out),
+        8 => inv_dct_n_into::<8, i32>(coeff, bit_depth, nx, out),
+        16 => inv_dct_n_into::<16, i32>(coeff, bit_depth, nx, out),
+        32 => inv_dct_n_into::<32, i32>(coeff, bit_depth, nx, out),
         _ => panic!("unsupported transform size {n}"),
     }
 }
 
 /// Scalar inverse 4×4 DST/ADST-like intra transform into `out[..16]`.
 pub(crate) fn inv_transform_dst_into_scalar(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
-    inv_transform_n_into::<4>(coeff, &DST4, bit_depth, out);
+    inv_transform_n_into::<4, i32>(coeff, &DST4, bit_depth, 4, out);
 }
 
-/// Inverse DCT into `out[..n*n]` — no heap allocation.
-pub(crate) fn inv_transform_into(coeff: &[i32], n: usize, bit_depth: u8, out: &mut [i32]) {
-    resolve_inv_transform()(coeff, n, bit_depth, out);
+/// Scalar i16 inverse DCT (8-bit depth path).
+pub(crate) fn inv_transform_into_scalar16(
+    coeff: &[i16],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i16],
+) {
+    match n {
+        4 => inv_dct_n_into::<4, i16>(coeff, bit_depth, nx, out),
+        8 => inv_dct_n_into::<8, i16>(coeff, bit_depth, nx, out),
+        16 => inv_dct_n_into::<16, i16>(coeff, bit_depth, nx, out),
+        32 => inv_dct_n_into::<32, i16>(coeff, bit_depth, nx, out),
+        _ => panic!("unsupported transform size {n}"),
+    }
+}
+
+/// Scalar i16 inverse 4×4 DST (8-bit depth path).
+pub(crate) fn inv_transform_dst_into_scalar16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
+    inv_transform_n_into::<4, i16>(coeff, &DST4, bit_depth, 4, out);
+}
+
+/// Inverse DCT into `out[..n*n]`. `nx` = nonzero column count (last_x + 1).
+pub(crate) fn inv_transform_into(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i32],
+) {
+    resolve_inv_transform()(coeff, n, bit_depth, nx, out);
 }
 
 /// Inverse 4×4 DST/ADST-like intra transform into `out[..16]` — no heap allocation.
 pub(crate) fn inv_transform_dst_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
     resolve_inv_transform_dst4()(coeff, bit_depth, out);
+}
+
+/// i16 inverse DCT (8-bit depth). `nx` = nonzero column count (last_x + 1).
+pub(crate) fn inv_transform_into16(
+    coeff: &[i16],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i16],
+) {
+    resolve_inv_transform16()(coeff, n, bit_depth, nx, out);
+}
+
+/// i16 inverse 4×4 DST (8-bit depth).
+pub(crate) fn inv_transform_dst_into16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
+    resolve_inv_transform_dst4_16()(coeff, bit_depth, out);
 }

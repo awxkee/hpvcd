@@ -29,7 +29,9 @@
 
 use core::arch::aarch64::*;
 
-use crate::reconstruct::{add_residual_into_scalar, can_reconstruct_full_block, sample_max};
+use crate::reconstruct::{
+    add_residual_into_scalar, add_residual_into_scalar16, can_reconstruct_full_block, sample_max,
+};
 
 #[inline]
 fn supported_n(n: usize) -> bool {
@@ -218,4 +220,117 @@ pub(crate) fn add_residual_into_neon(
     }
 
     unsafe { add_residual_into_neon_impl(dst, stride, pred, res, n, bit_depth) }
+}
+
+// 8-bit i16-residual path: saturating i16 adds, 8 px per op.
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_i16x2(src: &[i16]) -> int16x4_t {
+    debug_assert!(src.len() >= 2);
+    unsafe {
+        let v = vld1_lane_s16::<0>(src.as_ptr(), vdup_n_s16(0));
+        vld1_lane_s16::<1>(src.as_ptr().add(1), v)
+    }
+}
+
+/// Saturating add equals widen+clamp because the result is clamped to max <= 32767.
+#[inline]
+#[target_feature(enable = "neon")]
+fn add_clip_i16q(pred: int16x8_t, res: int16x8_t, zero: int16x8_t, max: int16x8_t) -> int16x8_t {
+    vminq_s16(vmaxq_s16(vqaddq_s16(pred, res), zero), max)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn add_clip_i16(pred: int16x4_t, res: int16x4_t, max: int16x4_t) -> int16x4_t {
+    vmin_s16(vmax_s16(vqadd_s16(pred, res), vdup_n_s16(0)), max)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn add_clip_row_neon_16(dst: &mut [u16], pred: &[u16], res: &[i16], n: usize, max: int16x8_t) {
+    let zero = vdupq_n_s16(0);
+
+    if n == 2 {
+        let p = vget_low_s16(vreinterpretq_s16_u16(load_u16x2(pred)));
+        let s = add_clip_i16(p, load_i16x2(res), vget_low_s16(max));
+        store_u16x2(dst, vreinterpretq_u16_s16(vcombine_s16(s, vdup_n_s16(0))));
+        return;
+    }
+    if n == 4 {
+        let p = vget_low_s16(vreinterpretq_s16_u16(load_u16x4(pred)));
+        let s = add_clip_i16(p, unsafe { vld1_s16(res.as_ptr()) }, vget_low_s16(max));
+        unsafe { vst1_u16(dst.as_mut_ptr(), vreinterpret_u16_s16(s)) };
+        return;
+    }
+
+    let mut x = 0usize;
+    while x < n {
+        let p = vreinterpretq_s16_u16(load_u16x8(&pred[x..]));
+        let r = unsafe { vld1q_s16(res[x..].as_ptr()) };
+        let s = add_clip_i16q(p, r, zero, max);
+        store_u16x8(&mut dst[x..], vreinterpretq_u16_s16(s));
+        x += 8;
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn add_residual_into_neon_impl_16(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    bit_depth: u8,
+) {
+    debug_assert!(supported_n(n));
+    let Some(n2) = n.checked_mul(n) else {
+        return;
+    };
+    let Some(pred) = pred.get(..n2) else {
+        return;
+    };
+    let Some(res) = res.get(..n2) else {
+        return;
+    };
+    let max = vdupq_n_s16(sample_max(bit_depth) as i16);
+
+    for y in 0..n {
+        let row_off = y * n;
+        let dst_off = y * stride;
+        let Some(dst_row) = dst.get_mut(dst_off..dst_off.saturating_add(n)) else {
+            break;
+        };
+        let (Some(pred_row), Some(res_row)) = (
+            pred.get(row_off..row_off + n),
+            res.get(row_off..row_off + n),
+        ) else {
+            break;
+        };
+        add_clip_row_neon_16(dst_row, pred_row, res_row, n, max);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_residual_into_neon16(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    if !supported_n(n)
+        || sample_max(bit_depth) > 32767
+        || !can_reconstruct_full_block(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
+    {
+        add_residual_into_scalar16(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
+        return;
+    }
+
+    unsafe { add_residual_into_neon_impl_16(dst, stride, pred, res, n, bit_depth) }
 }

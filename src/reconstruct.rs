@@ -28,8 +28,10 @@
  */
 
 type ReconstructFn = fn(&mut [u16], usize, &[u16], &[i32], usize, usize, usize, u8);
+type ReconstructFn16 = fn(&mut [u16], usize, &[u16], &[i16], usize, usize, usize, u8);
 
 static RECONSTRUCT_ADD_CLIP: std::sync::OnceLock<ReconstructFn> = std::sync::OnceLock::new();
+static RECONSTRUCT_ADD_CLIP16: std::sync::OnceLock<ReconstructFn16> = std::sync::OnceLock::new();
 
 #[inline]
 fn resolve_reconstruct_add_clip() -> ReconstructFn {
@@ -45,6 +47,27 @@ fn resolve_reconstruct_add_clip() -> ReconstructFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::add_residual_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_reconstruct_add_clip16() -> ReconstructFn16 {
+    *RECONSTRUCT_ADD_CLIP16.get_or_init(|| {
+        let mut _f: ReconstructFn16 = add_residual_into_scalar16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::add_residual_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::add_residual_into_sse41_16;
             }
         }
 
@@ -79,11 +102,11 @@ pub(crate) fn has_full_dst(dst: &[u16], stride: usize, n: usize) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(crate) fn can_reconstruct_full_block(
+pub(crate) fn can_reconstruct_full_block<R>(
     dst: &[u16],
     stride: usize,
     pred: &[u16],
-    res: &[i32],
+    res: &[R],
     n: usize,
     valid_w: usize,
     valid_h: usize,
@@ -119,12 +142,78 @@ pub(crate) fn add_residual_into(
     resolve_reconstruct_add_clip()(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
 }
 
+/// i16-residual reconstruct (8-bit depth path).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn add_residual_into16(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    if !can_reconstruct_full_block(dst, stride, pred, res, n, valid_w, valid_h, bit_depth) {
+        add_residual_into_scalar16(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
+        return;
+    }
+    resolve_reconstruct_add_clip16()(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn add_residual_into_scalar(
     dst: &mut [u16],
     stride: usize,
     pred: &[u16],
     res: &[i32],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    add_residual_generic(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
+}
+
+/// i16-residual scalar reconstruct (8-bit depth path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_residual_into_scalar16(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    add_residual_generic(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
+}
+
+/// Residual element: `i16` for 8-bit depth, `i32` for 10/12-bit.
+pub(crate) trait Res: Copy {
+    fn widen(self) -> i32;
+}
+impl Res for i32 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        self
+    }
+}
+impl Res for i16 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        self as i32
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_residual_generic<R: Res>(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[R],
     n: usize,
     valid_w: usize,
     valid_h: usize,
@@ -165,7 +254,7 @@ pub(crate) fn add_residual_into_scalar(
         let pred_row = &pred[row_off..row_off + cols];
         let res_row = &res[row_off..row_off + cols];
         for ((dst, &pred), &res) in dst_row.iter_mut().zip(pred_row.iter()).zip(res_row.iter()) {
-            *dst = (pred as i32 + res).clamp(0, max) as u16;
+            *dst = (pred as i32 + res.widen()).clamp(0, max) as u16;
         }
     }
 }

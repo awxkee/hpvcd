@@ -48,6 +48,232 @@ pub(crate) struct YuvPlanes {
     pub(crate) bit_depth: BitDepth,
 }
 
+use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
+
+/// Precomputed conversion constants; row-range methods let bands run in parallel.
+struct Cvt<'a> {
+    yuv: &'a YuvPlanes,
+    dw: usize,
+    max_val: i64,
+    y_black: i64,
+    neutral: i64,
+    k_y: i64,
+    cr_to_r: i64,
+    cb_to_g: i64,
+    cr_to_g: i64,
+    cb_to_b: i64,
+    sub_w: usize,
+    sub_h: usize,
+    cw: usize,
+    ch: usize,
+    identity: bool,
+}
+
+impl Cvt<'_> {
+    fn new<'a>(yuv: &'a YuvPlanes, dw: usize, color: &Cicp) -> Cvt<'a> {
+        let scale = 1i64 << yuv.bit_depth.minus8();
+        let k_y: i64 = if color.full_range {
+            Q13_ONE
+        } else {
+            Q13_KY_LIMITED
+        };
+        let k_uv: i64 = if color.full_range {
+            Q13_ONE
+        } else {
+            Q13_KUV_LIMITED
+        };
+        let (cr_r0, cb_g0, cr_g0, cb_b0) = match color.matrix {
+            MatrixCoefficients::Bt470Bg | MatrixCoefficients::Smpte170m => {
+                (11485i64, -2819i64, -5851i64, 14516i64)
+            }
+            MatrixCoefficients::Bt2020Ncl => (12080i64, -1348i64, -4681i64, 17546i64),
+            MatrixCoefficients::Identity => (0, 0, 0, 0),
+            _ => (12901i64, -1534i64, -3835i64, 15201i64), // BT.709
+        };
+        let sub_w = yuv.chroma.sub_w();
+        let sub_h = yuv.chroma.sub_h();
+        Cvt {
+            yuv,
+            dw,
+            max_val: yuv.bit_depth.max_val() as i64,
+            y_black: if color.full_range { 0 } else { 16 * scale },
+            neutral: 128 * scale,
+            k_y,
+            // Fold the chroma range scale into the matrix once, staying in Q0.13.
+            cr_to_r: (cr_r0 * k_uv + Q13_ROUND) >> Q13,
+            cb_to_g: (cb_g0 * k_uv + Q13_ROUND) >> Q13,
+            cr_to_g: (cr_g0 * k_uv + Q13_ROUND) >> Q13,
+            cb_to_b: (cb_b0 * k_uv + Q13_ROUND) >> Q13,
+            sub_w,
+            sub_h,
+            cw: yuv.width.div_ceil(sub_w),
+            ch: yuv.height.div_ceil(sub_h),
+            identity: color.matrix == MatrixCoefficients::Identity,
+        }
+    }
+
+    fn pixel(&self, y_pix: usize, x_pix: usize) -> (i64, i64, i64) {
+        let yuv = self.yuv;
+        let y_row = y_pix.min(yuv.height - 1);
+        let c_row = (y_pix / self.sub_h).min(self.ch - 1);
+        let x_col = x_pix.min(yuv.width - 1);
+        let c_col = (x_pix / self.sub_w).min(self.cw - 1);
+
+        let luma_raw = yuv.y[y_row * yuv.width + x_col] as i64;
+
+        if self.identity {
+            let y_scaled = (self.k_y * (luma_raw - self.y_black) + Q13_ROUND) >> Q13;
+            (y_scaled, y_scaled, y_scaled)
+        } else {
+            let cb_raw = yuv.cb[c_row * self.cw + c_col] as i64;
+            let cr_raw = yuv.cr[c_row * self.cw + c_col] as i64;
+            let y_term = self.k_y * (luma_raw - self.y_black);
+            let cb_c = cb_raw - self.neutral;
+            let cr_c = cr_raw - self.neutral;
+            let r = (y_term + self.cr_to_r * cr_c + Q13_ROUND) >> Q13;
+            let g = (y_term + self.cb_to_g * cb_c + self.cr_to_g * cr_c + Q13_ROUND) >> Q13;
+            let b = (y_term + self.cb_to_b * cb_c + Q13_ROUND) >> Q13;
+            (r, g, b)
+        }
+    }
+}
+
+trait PxCast: Copy + Default + Send {
+    fn cast(v: i64) -> Self;
+}
+impl PxCast for u8 {
+    fn cast(v: i64) -> Self {
+        v as u8
+    }
+}
+impl PxCast for u16 {
+    fn cast(v: i64) -> Self {
+        v as u16
+    }
+}
+
+impl Cvt<'_> {
+    fn mono_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
+        let yuv = self.yuv;
+        for (dy, dst_row) in out.chunks_exact_mut(self.dw).enumerate() {
+            let row = (y0 + dy).min(yuv.height - 1);
+            let src_row = &yuv.y[row * yuv.width..][..yuv.width];
+            let copy_w = self.dw.min(yuv.width);
+            let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
+            for (dst, &luma) in dst_copy.iter_mut().zip(src_row.iter()) {
+                let v = (self.k_y * (luma as i64 - self.y_black) + Q13_ROUND) >> Q13;
+                *dst = T::cast(v.clamp(0, cmax));
+            }
+            if let (Some(&last), false) = (src_row.last(), dst_edge.is_empty()) {
+                let v = (self.k_y * (last as i64 - self.y_black) + Q13_ROUND) >> Q13;
+                dst_edge.fill(T::cast(v.clamp(0, cmax)));
+            }
+        }
+    }
+
+    /// Non-identity fast path: requires dw ≤ width and dh ≤ height.
+    fn fast_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
+        let yuv = self.yuv;
+        for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
+            let y_pix = y0 + dy;
+            let luma_base = y_pix * yuv.width;
+            let c_base = (y_pix / self.sub_h) * self.cw;
+            let luma_row = &yuv.y[luma_base..][..self.dw];
+            let cb_row = &yuv.cb[c_base..][..self.cw];
+            let cr_row = &yuv.cr[c_base..][..self.cw];
+            for (x_pix, (dst, &luma_raw)) in row_out
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(luma_row.iter())
+                .enumerate()
+            {
+                let c_col = x_pix / self.sub_w;
+                let cb_c = cb_row[c_col] as i64 - self.neutral;
+                let cr_c = cr_row[c_col] as i64 - self.neutral;
+                let yv = self.k_y * (luma_raw as i64 - self.y_black);
+                let r = (yv + self.cr_to_r * cr_c + Q13_ROUND) >> Q13;
+                let g = (yv + self.cb_to_g * cb_c + self.cr_to_g * cr_c + Q13_ROUND) >> Q13;
+                let b = (yv + self.cb_to_b * cb_c + Q13_ROUND) >> Q13;
+                dst[0] = T::cast(r.clamp(0, cmax));
+                dst[1] = T::cast(g.clamp(0, cmax));
+                dst[2] = T::cast(b.clamp(0, cmax));
+            }
+        }
+    }
+
+    fn slow_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
+        for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
+            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let (r, g, b) = self.pixel(y0 + dy, x_pix);
+                dst[0] = T::cast(r.clamp(0, cmax));
+                dst[1] = T::cast(g.clamp(0, cmax));
+                dst[2] = T::cast(b.clamp(0, cmax));
+            }
+        }
+    }
+
+    fn ycgco_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
+        let yuv = self.yuv;
+        for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
+            let y_pix = y0 + dy;
+            let y_row = y_pix.min(yuv.height - 1);
+            let c_row = (y_pix / self.sub_h).min(self.ch - 1);
+            let l_row = &yuv.y[y_row * yuv.width..][..yuv.width];
+            let cb_row = &yuv.cb[c_row * self.cw..][..self.cw];
+            let cr_row = &yuv.cr[c_row * self.cw..][..self.cw];
+            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let x_col = x_pix.min(yuv.width - 1);
+                let c_col = (x_pix / self.sub_w).min(self.cw - 1);
+                let y = l_row[x_col] as i64;
+                let cg = cb_row[c_col] as i64 - self.neutral;
+                let co = cr_row[c_col] as i64 - self.neutral;
+                let t = y - cg;
+                dst[0] = T::cast((t + co).clamp(0, cmax)); // R
+                dst[1] = T::cast((y + cg).clamp(0, cmax)); // G
+                dst[2] = T::cast((t - co).clamp(0, cmax)); // B
+            }
+        }
+    }
+}
+
+/// Fill `dh` output rows via `f(y0, band)`, splitting into bands on the pool
+/// when profitable; serial otherwise. Output is byte-identical either way.
+fn banded<T, F>(pool: Option<&ThreadPool>, dw: usize, dh: usize, chn: usize, f: F) -> Vec<T>
+where
+    T: Default + Copy + Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let total = dw * dh * chn;
+    if let Some(p) = pool
+        && p.threads() > 1
+        && dh > 1
+    {
+        let band_rows = dh.div_ceil((p.threads() * 4).min(dh));
+        let bands = dh.div_ceil(band_rows);
+        let dm = DisjointMut::new(vec![T::default(); total]);
+        parallel_for(p, bands, |b| {
+            let y0 = b * band_rows;
+            let nr = band_rows.min(dh - y0);
+            let mut band = dm.slice_mut(y0 * dw * chn..(y0 + nr) * dw * chn);
+            f(y0, &mut band);
+        });
+        return dm.into_inner();
+    }
+    let mut v = vec![T::default(); total];
+    f(0, &mut v);
+    v
+}
+
+pub(crate) fn yuv_to_rgb_with_color(
+    yuv: &YuvPlanes,
+    dw: usize,
+    dh: usize,
+    color: &Cicp,
+) -> ImageBuffer {
+    yuv_to_rgb_with_color_pool(yuv, dw, dh, color, None)
+}
+
 ///
 /// Matrix coefficients supported (ISO/IEC 23091-2):
 /// * 1  – BT.709 (default for HD content)
@@ -56,11 +282,13 @@ pub(crate) struct YuvPlanes {
 /// * other – fall back to BT.709
 ///
 /// Output length = `dw * dh * 3`, each channel at `bit_depth`'s native scale.
-pub(crate) fn yuv_to_rgb_with_color(
+/// Rows are converted in parallel bands when `pool` has more than one thread.
+pub(crate) fn yuv_to_rgb_with_color_pool(
     yuv: &YuvPlanes,
     dw: usize,
     dh: usize,
     color: &Cicp,
+    pool: Option<&ThreadPool>,
 ) -> ImageBuffer {
     if dw == 0 || dh == 0 || yuv.width == 0 || yuv.height == 0 {
         return if yuv.chroma.is_monochrome() {
@@ -76,236 +304,54 @@ pub(crate) fn yuv_to_rgb_with_color(
         };
     }
 
+    let cvt = Cvt::new(yuv, dw, color);
+
     if yuv.chroma.is_monochrome() {
-        let y_black = if color.full_range {
-            0i64
-        } else {
-            16i64 << yuv.bit_depth.minus8()
-        };
-        let k_y: i64 = if color.full_range {
-            Q13_ONE
-        } else {
-            Q13_KY_LIMITED
-        };
-        let max_val = yuv.bit_depth.max_val() as i64;
         return if yuv.bit_depth == BitDepth::Eight {
-            let mut out = vec![0u8; dw * dh];
-            for (y, dst_row) in out.chunks_exact_mut(dw).enumerate() {
-                let row = y.min(yuv.height - 1);
-                let src_row = &yuv.y[row * yuv.width..][..yuv.width];
-                let copy_w = dw.min(yuv.width);
-                let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
-                for (dst, &luma) in dst_copy.iter_mut().zip(src_row.iter()) {
-                    *dst = ((k_y * (luma as i64 - y_black) + Q13_ROUND) >> Q13).clamp(0, 255) as u8;
-                }
-                if let (Some(&last), false) = (src_row.last(), dst_edge.is_empty()) {
-                    let last =
-                        ((k_y * (last as i64 - y_black) + Q13_ROUND) >> Q13).clamp(0, 255) as u8;
-                    dst_edge.fill(last);
-                }
-            }
-            ImageBuffer::Luma8(out)
+            ImageBuffer::Luma8(banded(pool, dw, dh, 1, |y0, out| {
+                cvt.mono_rows::<u8>(y0, out, 255)
+            }))
         } else {
-            let mut out = vec![0u16; dw * dh];
-            for (y, dst_row) in out.chunks_exact_mut(dw).enumerate() {
-                let row = y.min(yuv.height - 1);
-                let src_row = &yuv.y[row * yuv.width..][..yuv.width];
-                let copy_w = dw.min(yuv.width);
-                let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
-                for (dst, &luma) in dst_copy.iter_mut().zip(src_row.iter()) {
-                    *dst = ((k_y * (luma as i64 - y_black) + Q13_ROUND) >> Q13).clamp(0, max_val)
-                        as u16;
-                }
-                if let (Some(&last), false) = (src_row.last(), dst_edge.is_empty()) {
-                    let last = ((k_y * (last as i64 - y_black) + Q13_ROUND) >> Q13)
-                        .clamp(0, max_val) as u16;
-                    dst_edge.fill(last);
-                }
-            }
-            ImageBuffer::Luma16(out)
+            ImageBuffer::Luma16(banded(pool, dw, dh, 1, |y0, out| {
+                cvt.mono_rows::<u16>(y0, out, cvt.max_val)
+            }))
         };
     }
 
     if color.matrix == MatrixCoefficients::YCgCo {
-        return ycgco_to_rgb(yuv, dw, dh);
-    }
-
-    let max_val = yuv.bit_depth.max_val() as i64;
-    let scale = 1i64 << (yuv.bit_depth.minus8());
-
-    let sub_w = yuv.chroma.sub_w();
-    let sub_h = yuv.chroma.sub_h();
-    let cw = yuv.width.div_ceil(sub_w);
-
-    let y_black = if color.full_range { 0 } else { 16 * scale };
-    let neutral = 128 * scale;
-    let k_y: i64 = if color.full_range {
-        Q13_ONE
-    } else {
-        Q13_KY_LIMITED
-    };
-    let k_uv: i64 = if color.full_range {
-        Q13_ONE
-    } else {
-        Q13_KUV_LIMITED
-    };
-
-    let (cr_r0, cb_g0, cr_g0, cb_b0) = match color.matrix {
-        MatrixCoefficients::Bt470Bg | MatrixCoefficients::Smpte170m => {
-            (11485i64, -2819i64, -5851i64, 14516i64)
-        }
-        MatrixCoefficients::Bt2020Ncl => (12080i64, -1348i64, -4681i64, 17546i64),
-        MatrixCoefficients::Identity => (0, 0, 0, 0),
-        _ => (12901i64, -1534i64, -3835i64, 15201i64), // BT.709
-    };
-    // Fold the chroma range scale into the matrix once (not per pixel), keeping
-    // everything in Q0.13: effective = round(coeff * k_uv / 8192).
-    let cr_to_r = (cr_r0 * k_uv + Q13_ROUND) >> Q13;
-    let cb_to_g = (cb_g0 * k_uv + Q13_ROUND) >> Q13;
-    let cr_to_g = (cr_g0 * k_uv + Q13_ROUND) >> Q13;
-    let cb_to_b = (cb_b0 * k_uv + Q13_ROUND) >> Q13;
-
-    let pixel = |y_pix: usize, x_pix: usize| -> (i64, i64, i64) {
-        let y_row = y_pix.min(yuv.height - 1);
-        let c_row = (y_pix / sub_h).min(yuv.height.div_ceil(sub_h) - 1);
-        let x_col = x_pix.min(yuv.width - 1);
-        let c_col = (x_pix / sub_w).min(cw - 1);
-
-        let luma_raw = yuv.y[y_row * yuv.width + x_col] as i64;
-
-        if color.matrix == MatrixCoefficients::Identity {
-            let y_scaled = (k_y * (luma_raw - y_black) + Q13_ROUND) >> Q13;
-            (y_scaled, y_scaled, y_scaled)
-        } else {
-            let cb_raw = yuv.cb[c_row * cw + c_col] as i64;
-            let cr_raw = yuv.cr[c_row * cw + c_col] as i64;
-            let y_term = k_y * (luma_raw - y_black);
-            let cb_c = cb_raw - neutral;
-            let cr_c = cr_raw - neutral;
-            let r = (y_term + cr_to_r * cr_c + Q13_ROUND) >> Q13;
-            let g = (y_term + cb_to_g * cb_c + cr_to_g * cr_c + Q13_ROUND) >> Q13;
-            let b = (y_term + cb_to_b * cb_c + Q13_ROUND) >> Q13;
-            (r, g, b)
-        }
-    };
-
-    // Fast paths below assume the visible window fits inside the coded planes
-    // (always true: display dims ≤ coded dims), so the per-pixel `.min()` edge
-    // clamps in `pixel` are provably no-ops and are omitted. The arithmetic is
-    // otherwise identical to `pixel`, so output is bit-exact.
-    let fast = dw <= yuv.width && dh <= yuv.height;
-    let ch = yuv.height.div_ceil(sub_h);
-
-    if fast && color.matrix != MatrixCoefficients::Identity {
-        macro_rules! convert_loop {
-            ($T:ty, $clampmax:expr, $variant:path) => {{
-                let mut rgb = vec![0 as $T; dw * dh * 3];
-                for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
-                    let luma_base = y_pix * yuv.width;
-                    let c_base = (y_pix / sub_h) * cw;
-                    let luma_row = &yuv.y[luma_base..][..dw];
-                    let cb_row = &yuv.cb[c_base..][..cw];
-                    let cr_row = &yuv.cr[c_base..][..cw];
-                    for (x_pix, (dst, &luma_raw)) in row_out
-                        .as_chunks_mut::<3>()
-                        .0
-                        .iter_mut()
-                        .zip(luma_row.iter())
-                        .enumerate()
-                    {
-                        let c_col = x_pix / sub_w;
-                        let cb_c = cb_row[c_col] as i64 - neutral;
-                        let cr_c = cr_row[c_col] as i64 - neutral;
-                        let yv = k_y * (luma_raw as i64 - y_black);
-                        let r = (yv + cr_to_r * cr_c + Q13_ROUND) >> Q13;
-                        let g = (yv + cb_to_g * cb_c + cr_to_g * cr_c + Q13_ROUND) >> Q13;
-                        let b = (yv + cb_to_b * cb_c + Q13_ROUND) >> Q13;
-                        dst[0] = r.clamp(0, $clampmax) as $T;
-                        dst[1] = g.clamp(0, $clampmax) as $T;
-                        dst[2] = b.clamp(0, $clampmax) as $T;
-                    }
-                }
-                return $variant(rgb);
-            }};
-        }
-        if yuv.bit_depth == BitDepth::Eight {
-            convert_loop!(u8, 255, ImageBuffer::Rgb8);
-        } else {
-            convert_loop!(u16, max_val, ImageBuffer::Rgb16);
-        }
-    }
-    let _ = ch;
-
-    if yuv.bit_depth == BitDepth::Eight {
-        let mut rgb = vec![0u8; dw * dh * 3];
-        for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
-            for (x_pix, out) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let (r, g, b) = pixel(y_pix, x_pix);
-                out[0] = r.clamp(0, 255) as u8;
-                out[1] = g.clamp(0, 255) as u8;
-                out[2] = b.clamp(0, 255) as u8;
-            }
-        }
-        ImageBuffer::Rgb8(rgb)
-    } else {
-        let mut rgb = vec![0u16; dw * dh * 3];
-        for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
-            for (x_pix, out) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let (r, g, b) = pixel(y_pix, x_pix);
-                out[0] = r.clamp(0, max_val) as u16;
-                out[1] = g.clamp(0, max_val) as u16;
-                out[2] = b.clamp(0, max_val) as u16;
-            }
-        }
-        ImageBuffer::Rgb16(rgb)
-    }
-}
-
-pub(crate) fn ycgco_to_rgb(yuv: &YuvPlanes, dw: usize, dh: usize) -> ImageBuffer {
-    if dw == 0 || dh == 0 || yuv.width == 0 || yuv.height == 0 {
         return if yuv.bit_depth == BitDepth::Eight {
-            ImageBuffer::Rgb8(Vec::new())
+            ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+                cvt.ycgco_rows::<u8>(y0, out, 255)
+            }))
         } else {
-            ImageBuffer::Rgb16(Vec::new())
+            ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
+                cvt.ycgco_rows::<u16>(y0, out, cvt.max_val)
+            }))
         };
     }
 
-    let scale = 1i64 << yuv.bit_depth.minus8();
-    let neutral = 128 * scale; // 1 << (bit_depth - 1)
-    let max_val = yuv.bit_depth.max_val() as i64;
-    let sub_w = yuv.chroma.sub_w();
-    let sub_h = yuv.chroma.sub_h();
-    let cw = yuv.width.div_ceil(sub_w);
-    let ch = yuv.height.div_ceil(sub_h);
-
-    macro_rules! run {
-        ($T: ty, $cmax: expr, $variant: path) => {{
-            let mut rgb = vec![0 as $T; dw * dh * 3];
-            for (y_pix, row_out) in rgb.chunks_exact_mut(dw * 3).enumerate() {
-                let y_row = y_pix.min(yuv.height - 1);
-                let c_row = (y_pix / sub_h).min(ch - 1);
-                let l_row = &yuv.y[y_row * yuv.width..][..yuv.width];
-                let cb_row = &yuv.cb[c_row * cw..][..cw];
-                let cr_row = &yuv.cr[c_row * cw..][..cw];
-                for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                    let x_col = x_pix.min(yuv.width - 1);
-                    let c_col = (x_pix / sub_w).min(cw - 1);
-                    let y = l_row[x_col] as i64;
-                    let cg = cb_row[c_col] as i64 - neutral;
-                    let co = cr_row[c_col] as i64 - neutral;
-                    let t = y - cg;
-                    dst[0] = (t + co).clamp(0, $cmax) as $T; // R
-                    dst[1] = (y + cg).clamp(0, $cmax) as $T; // G
-                    dst[2] = (t - co).clamp(0, $cmax) as $T; // B
-                }
-            }
-            $variant(rgb)
-        }};
+    // Fast path assumes the visible window fits inside the coded planes, making
+    // the per-pixel edge clamps in `pixel` provably no-ops; output is bit-exact.
+    let fast = dw <= yuv.width && dh <= yuv.height;
+    if fast && !cvt.identity {
+        return if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+                cvt.fast_rows::<u8>(y0, out, 255)
+            }))
+        } else {
+            ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
+                cvt.fast_rows::<u16>(y0, out, cvt.max_val)
+            }))
+        };
     }
 
     if yuv.bit_depth == BitDepth::Eight {
-        run!(u8, 255, ImageBuffer::Rgb8)
+        ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+            cvt.slow_rows::<u8>(y0, out, 255)
+        }))
     } else {
-        run!(u16, max_val, ImageBuffer::Rgb16)
+        ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
+            cvt.slow_rows::<u16>(y0, out, cvt.max_val)
+        }))
     }
 }

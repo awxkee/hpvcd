@@ -32,7 +32,9 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-use crate::reconstruct::{add_residual_into_scalar, can_reconstruct_full_block, sample_max};
+use crate::reconstruct::{
+    add_residual_into_scalar, add_residual_into_scalar16, can_reconstruct_full_block, sample_max,
+};
 
 #[inline]
 fn supported_n(n: usize) -> bool {
@@ -198,4 +200,116 @@ pub(crate) fn add_residual_into_sse41(
     }
 
     unsafe { add_residual_into_sse41_impl(dst, stride, pred, res, n, bit_depth) }
+}
+
+// 8-bit i16-residual path: saturating i16 adds, 8 px per op.
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn load_i16x2(src: &[i16]) -> __m128i {
+    debug_assert!(src.len() >= 2);
+    unsafe { _mm_castps_si128(_mm_load_ss(src.as_ptr().cast())) }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn load_i16x4(src: &[i16]) -> __m128i {
+    debug_assert!(src.len() >= 4);
+    unsafe { _mm_loadl_epi64(src.as_ptr().cast::<__m128i>()) }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn load_i16x8(src: &[i16]) -> __m128i {
+    debug_assert!(src.len() >= 8);
+    unsafe { _mm_loadu_si128(src.as_ptr().cast::<__m128i>()) }
+}
+
+/// Saturating add equals widen+clamp because the result is clamped to max <= 32767.
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn add_clip_i16(pred: __m128i, res: __m128i, zero: __m128i, max: __m128i) -> __m128i {
+    _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(pred, res), zero), max)
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn add_clip_row_sse41_16(dst: &mut [u16], pred: &[u16], res: &[i16], n: usize, max: __m128i) {
+    let zero = _mm_setzero_si128();
+
+    if n == 2 {
+        let s = add_clip_i16(load_u16x2(pred), load_i16x2(res), zero, max);
+        store_u16x2(dst, s);
+        return;
+    }
+    if n == 4 {
+        let s = add_clip_i16(load_u16x4(pred), load_i16x4(res), zero, max);
+        store_u16x4(dst, s);
+        return;
+    }
+
+    let mut x = 0usize;
+    while x < n {
+        let s = add_clip_i16(load_u16x8(&pred[x..]), load_i16x8(&res[x..]), zero, max);
+        store_u16x8(&mut dst[x..], s);
+        x += 8;
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn add_residual_into_sse41_impl_16(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    bit_depth: u8,
+) {
+    debug_assert!(supported_n(n));
+    let Some(n2) = n.checked_mul(n) else {
+        return;
+    };
+    let Some(pred) = pred.get(..n2) else {
+        return;
+    };
+    let Some(res) = res.get(..n2) else {
+        return;
+    };
+    let max = _mm_set1_epi16(sample_max(bit_depth) as i16);
+    for y in 0..n {
+        let row_off = y * n;
+        let dst_off = y * stride;
+        let Some(dst_row) = dst.get_mut(dst_off..dst_off.saturating_add(n)) else {
+            break;
+        };
+        let (Some(pred_row), Some(res_row)) = (
+            pred.get(row_off..row_off + n),
+            res.get(row_off..row_off + n),
+        ) else {
+            break;
+        };
+        add_clip_row_sse41_16(dst_row, pred_row, res_row, n, max);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_residual_into_sse41_16(
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    if !supported_n(n)
+        || sample_max(bit_depth) > 32767
+        || !can_reconstruct_full_block(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
+    {
+        add_residual_into_scalar16(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
+        return;
+    }
+    unsafe { add_residual_into_sse41_impl_16(dst, stride, pred, res, n, bit_depth) }
 }
