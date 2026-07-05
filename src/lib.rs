@@ -72,6 +72,99 @@ fn plane_to_buf(plane: Vec<u16>, bd: BitDepth) -> SampleBuf {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct HevcVisibleCrop {
+    left: usize,
+    top: usize,
+}
+
+#[inline]
+fn visible_crop_from_hvcc(hvcc: &[u8]) -> HevcVisibleCrop {
+    config::parse_hvcc_full(hvcc)
+        .ok()
+        .map(|(sps, _)| HevcVisibleCrop {
+            left: sps.crop_left as usize,
+            top: sps.crop_top as usize,
+        })
+        .unwrap_or_default()
+}
+
+fn copy_plane_window(
+    src: &[u16],
+    src_w: usize,
+    src_h: usize,
+    crop_left: usize,
+    crop_top: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u16> {
+    let mut out = vec![0u16; dst_w * dst_h];
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 || src.is_empty() {
+        return out;
+    }
+
+    let rows_in_src = (src.len() / src_w).min(src_h);
+    if rows_in_src == 0 {
+        return out;
+    }
+
+    let src_y0 = crop_top.min(rows_in_src - 1);
+    let src_x0 = crop_left.min(src_w - 1);
+
+    for (r, dst_row) in out.chunks_exact_mut(dst_w).enumerate() {
+        let src_y = (src_y0 + r).min(rows_in_src - 1);
+        let src_base = src_y * src_w;
+        let available = (src.len() - src_base).min(src_w);
+        if available == 0 {
+            continue;
+        }
+
+        let src_x = src_x0.min(available - 1);
+        let copy_w = dst_w.min(available - src_x);
+        let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
+        dst_copy.copy_from_slice(&src[src_base + src_x..src_base + src_x + copy_w]);
+        if !dst_edge.is_empty() {
+            dst_edge.fill(src[src_base + src_x + copy_w - 1]);
+        }
+    }
+
+    out
+}
+
+fn copy_visible_yuv_planes(
+    planes: &yuv::YuvPlanes,
+    dw: usize,
+    dh: usize,
+    crop: HevcVisibleCrop,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let y = copy_plane_window(
+        &planes.y,
+        planes.width,
+        planes.height,
+        crop.left,
+        crop.top,
+        dw,
+        dh,
+    );
+
+    if planes.chroma.is_monochrome() {
+        return (y, Vec::new(), Vec::new());
+    }
+
+    let sub_w = planes.chroma.sub_w();
+    let sub_h = planes.chroma.sub_h();
+    let cw = dw.div_ceil(sub_w);
+    let ch = dh.div_ceil(sub_h);
+    let coded_cw = planes.width.div_ceil(sub_w);
+    let coded_ch = planes.height.div_ceil(sub_h);
+    let crop_cx = crop.left / sub_w;
+    let crop_cy = crop.top / sub_h;
+
+    let cb = copy_plane_window(&planes.cb, coded_cw, coded_ch, crop_cx, crop_cy, cw, ch);
+    let cr = copy_plane_window(&planes.cr, coded_cw, coded_ch, crop_cx, crop_cy, cw, ch);
+    (y, cb, cr)
+}
+
 /// A fully decoded HEIF/HEIC image.
 pub struct DecodedImage {
     pub width: u32,
@@ -114,8 +207,8 @@ pub struct DecodedYuv {
 }
 
 /// Decode the optional alpha auxiliary item (`auxl`) into a luma-only plane,
-/// cropped/limited to `dw*dh`. Returns `None` when there is no alpha item or it
-/// fails to decode. Shared by the single-tile and grid YUV paths.
+/// applying the alpha HEVC conformance-window offset and returning exactly
+/// `dw*dh` display samples. `clap` is intentionally not applied here.
 fn decode_alpha_plane(
     file: &[u8],
     heif: &heif::HeifFile,
@@ -134,7 +227,8 @@ fn decode_alpha_plane(
     decode_hevc_item(&file[astart..aend], &a.hvcc, None)
         .ok()
         .map(|(ap, _)| {
-            let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
+            let crop = visible_crop_from_hvcc(&a.hvcc);
+            let plane = copy_plane_window(&ap.y, ap.width, ap.height, crop.left, crop.top, dw, dh);
             plane_to_buf(plane, ap.bit_depth)
         })
 }
@@ -173,62 +267,11 @@ pub(crate) fn decode_heic_yuv_with(
     let dw = heif.primary.display_w as usize;
     let dh = heif.primary.display_h as usize;
     decoder.check_dims(dw, dh)?;
-    let sub_w = planes.chroma.sub_w();
-    let sub_h = planes.chroma.sub_h();
-    let cw = dw.div_ceil(sub_w);
-    let ch = dh.div_ceil(sub_h);
-
-    // Crop Y to display size
-    let coded_cw = planes.width.div_ceil(sub_w);
-    let coded_ch = planes.height.div_ceil(sub_h);
-    let mono = planes.chroma.is_monochrome();
-    let mut y_out = vec![0u16; dw * dh];
-    // Monochrome has no chroma planes; keep the output chroma buffers empty so we
-    // never index the (empty) decoded cb/cr planes below.
-    let mut cb_out = vec![0u16; if mono { 0 } else { cw * ch }];
-    let mut cr_out = vec![0u16; if mono { 0 } else { cw * ch }];
-
-    {
-        let src_h = planes.height;
-        let src_w = planes.width;
-
-        for (r, dst_row) in y_out.chunks_exact_mut(dw).enumerate() {
-            let src_row = &planes.y[r.min(src_h - 1) * src_w..][..src_w];
-            let copy_w = src_w.min(dw);
-            let (fill, edge) = dst_row.split_at_mut(copy_w);
-            fill.copy_from_slice(&src_row[..copy_w]);
-            // pad right with the last luma sample if dw > src_w
-            if let (Some(&last), false) = (fill.last(), edge.is_empty()) {
-                edge.fill(last);
-            }
-        }
-    }
-
-    if !mono {
-        for (r, (cb_row, cr_row)) in cb_out
-            .chunks_exact_mut(cw)
-            .zip(cr_out.chunks_exact_mut(cw))
-            .enumerate()
-        {
-            let src_r = r.min(coded_ch - 1) * coded_cw;
-            let src_cb = &planes.cb[src_r..][..coded_cw];
-            let src_cr = &planes.cr[src_r..][..coded_cw];
-
-            let copy_w = coded_cw.min(cw);
-            let (cb_fill, cb_edge) = cb_row.split_at_mut(copy_w);
-            let (cr_fill, cr_edge) = cr_row.split_at_mut(copy_w);
-
-            cb_fill.copy_from_slice(&src_cb[..copy_w]);
-            cr_fill.copy_from_slice(&src_cr[..copy_w]);
-            // pad right if cw > coded_cw
-            if let (Some(&last_cb), Some(&last_cr), false) =
-                (cb_fill.last(), cr_fill.last(), cb_edge.is_empty())
-            {
-                cb_edge.fill(last_cb);
-                cr_edge.fill(last_cr);
-            }
-        }
-    }
+    // HEIF `ispe` gives the consumer-visible dimensions; HEVC conformance
+    // window gives the origin inside the coded planes.  Do not apply `clap`
+    // here; it is exposed as metadata for the caller.
+    let crop = visible_crop_from_hvcc(&heif.primary.hvcc);
+    let (y_out, cb_out, cr_out) = copy_visible_yuv_planes(&planes, dw, dh, crop);
 
     let bd = planes.bit_depth;
     Ok(DecodedYuv {
@@ -262,6 +305,8 @@ struct YuvGridCtx<'a> {
     tile_h: usize,
     tile_cw: usize,
     tile_ch: usize,
+    tile_crop_left: usize,
+    tile_crop_top: usize,
     sub_w: usize,
     sub_h: usize,
     has_chroma: bool,
@@ -313,16 +358,30 @@ fn stitch_yuv_band(
         let copy_w = ctx.tile_w.min(ctx.out_w.saturating_sub(dst_x));
         let copy_h = ctx.tile_h.min(ctx.out_h.saturating_sub(dst_y_base));
 
+        let tile_crop_left = ctx.tile_crop_left.min(planes.width.saturating_sub(1));
+        let tile_crop_top = ctx.tile_crop_top.min(planes.height.saturating_sub(1));
+
         for y in 0..copy_h {
             let dst_start = y * ctx.out_w + dst_x;
             let dst = &mut y_band[dst_start..dst_start + copy_w];
-            let src_y = y.min(planes.height - 1);
-            let src_row = &planes.y[src_y * planes.width..][..planes.width];
-            let src = &src_row[..copy_w.min(planes.width)];
-            let (exact, pad) = dst.split_at_mut(src.len());
-            exact.copy_from_slice(src);
-            if let Some(&last) = src.last() {
-                pad.fill(last);
+            if planes.width == 0 || planes.height == 0 || planes.y.is_empty() {
+                continue;
+            }
+            let src_y = (tile_crop_top + y).min(planes.height - 1);
+            let src_base = src_y * planes.width;
+            if src_base >= planes.y.len() {
+                continue;
+            }
+            let available = (planes.y.len() - src_base).min(planes.width);
+            if available == 0 {
+                continue;
+            }
+            let src_x = tile_crop_left.min(available - 1);
+            let copy = copy_w.min(available - src_x);
+            let (exact, pad) = dst.split_at_mut(copy);
+            exact.copy_from_slice(&planes.y[src_base + src_x..src_base + src_x + copy]);
+            if !pad.is_empty() {
+                pad.fill(planes.y[src_base + src_x + copy - 1]);
             }
         }
 
@@ -335,25 +394,40 @@ fn stitch_yuv_band(
         let c_copy_w = ctx.tile_cw.min(ctx.cw.saturating_sub(c_dst_x));
         let c_copy_h = ctx.tile_ch.min(ctx.ch.saturating_sub(c_dst_y_base));
 
+        let crop_cx = ctx.tile_crop_left / ctx.sub_w;
+        let crop_cy = ctx.tile_crop_top / ctx.sub_h;
+
         for y in 0..c_copy_h {
             let c_start = y * ctx.cw + c_dst_x;
-            let src_y = y.min(p_ch - 1);
-            let src_cb_row = &planes.cb[src_y * p_cw..][..p_cw];
-            let src_cr_row = &planes.cr[src_y * p_cw..][..p_cw];
-            let copy = c_copy_w.min(p_cw);
+            if p_cw == 0 || p_ch == 0 || planes.cb.is_empty() || planes.cr.is_empty() {
+                continue;
+            }
+            let src_y = (crop_cy + y).min(p_ch - 1);
+            let src_base = src_y * p_cw;
+            if src_base >= planes.cb.len() || src_base >= planes.cr.len() {
+                continue;
+            }
+            let cb_available = (planes.cb.len() - src_base).min(p_cw);
+            let cr_available = (planes.cr.len() - src_base).min(p_cw);
+            let available = cb_available.min(cr_available);
+            if available == 0 {
+                continue;
+            }
+            let src_x = crop_cx.min(available - 1);
+            let copy = c_copy_w.min(available - src_x);
 
             let cb_row = &mut cb_band[c_start..c_start + c_copy_w];
             let (cb_exact, cb_pad) = cb_row.split_at_mut(copy);
-            cb_exact.copy_from_slice(&src_cb_row[..copy]);
-            if let Some(&last_cb) = src_cb_row.last() {
-                cb_pad.fill(last_cb);
+            cb_exact.copy_from_slice(&planes.cb[src_base + src_x..src_base + src_x + copy]);
+            if !cb_pad.is_empty() {
+                cb_pad.fill(planes.cb[src_base + src_x + copy - 1]);
             }
 
             let cr_row = &mut cr_band[c_start..c_start + c_copy_w];
             let (cr_exact, cr_pad) = cr_row.split_at_mut(copy);
-            cr_exact.copy_from_slice(&src_cr_row[..copy]);
-            if let Some(&last_cr) = src_cr_row.last() {
-                cr_pad.fill(last_cr);
+            cr_exact.copy_from_slice(&planes.cr[src_base + src_x..src_base + src_x + copy]);
+            if !cr_pad.is_empty() {
+                cr_pad.fill(planes.cr[src_base + src_x + copy - 1]);
             }
         }
     }
@@ -484,6 +558,13 @@ fn decode_grid_yuv(
     };
     let tile_cw = tile_w.div_ceil(sub_w);
     let tile_ch = tile_h.div_ceil(sub_h);
+    let tile_crop = parsed
+        .as_ref()
+        .map(|(sps, _)| HevcVisibleCrop {
+            left: sps.crop_left as usize,
+            top: sps.crop_top as usize,
+        })
+        .unwrap_or_default();
 
     // All tiles in a grid share one SPS, so the sample bit depth is fixed for
     // the whole grid; derive it once from the reference hvcC instead of reading
@@ -511,6 +592,8 @@ fn decode_grid_yuv(
         tile_h,
         tile_cw,
         tile_ch,
+        tile_crop_left: tile_crop.left,
+        tile_crop_top: tile_crop.top,
         sub_w,
         sub_h,
         has_chroma,
@@ -658,32 +741,18 @@ pub(crate) fn decode_heic_with(
     } else {
         heif.primary.color.cicp.unwrap_or_else(Cicp::srgb)
     };
-    let rgb =
-        yuv::yuv_to_rgb_with_color_pool(&yuv_planes, dw, dh, &color_enc, Some(decoder.pool()));
+    let crop = visible_crop_from_hvcc(&heif.primary.hvcc);
+    let rgb = yuv::yuv_to_rgb_window_with_color_pool(
+        &yuv_planes,
+        dw,
+        dh,
+        crop.left,
+        crop.top,
+        &color_enc,
+        Some(decoder.pool()),
+    );
 
-    let alpha = if let Some(a) = &heif.alpha {
-        if !a.hvcc.is_empty() {
-            let astart = a.data_offset as usize;
-            if let Some(aend) = astart.checked_add(a.data_length as usize) {
-                if aend <= file.len() {
-                    decode_hevc_item(&file[astart..aend], &a.hvcc, None)
-                        .ok()
-                        .map(|(ap, _)| {
-                            let plane = ap.y[..(dw * dh).min(ap.y.len())].to_vec();
-                            plane_to_buf(plane, ap.bit_depth)
-                        })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let alpha = decode_alpha_plane(file, &heif, dw, dh);
 
     let (width, height, buf2, alpha2) =
         apply_orientation(dw as u32, dh as u32, rgb, alpha, heif.primary.orientation);
@@ -715,6 +784,8 @@ struct GridCtx<'a> {
     out_h: usize,
     tile_w: usize,
     tile_h: usize,
+    tile_crop_left: usize,
+    tile_crop_top: usize,
     channels: usize,
 }
 
@@ -763,7 +834,14 @@ fn stitch_grid_band<T: Copy>(
             continue;
         }
 
-        let tile_buf = yuv::yuv_to_rgb_with_color(&yuv, ctx.tile_w, ctx.tile_h, ctx.color_enc);
+        let tile_buf = yuv::yuv_to_rgb_window_with_color(
+            &yuv,
+            ctx.tile_w,
+            ctx.tile_h,
+            ctx.tile_crop_left,
+            ctx.tile_crop_top,
+            ctx.color_enc,
+        );
         let src = match pick(&tile_buf) {
             Some(s) => s,
             None => continue, // depth mismatch — shouldn't happen within one grid
@@ -938,6 +1016,15 @@ fn decode_grid(
             .unwrap_or(false)
     };
 
+    let tile_crop = {
+        let hvcc_ref = if !grid.tiles[0].hvcc.is_empty() {
+            &grid.tiles[0].hvcc
+        } else {
+            &fallback_hvcc
+        };
+        visible_crop_from_hvcc(hvcc_ref)
+    };
+
     let channels = if is_mono { 1 } else { 3 };
 
     // Bundle everything a band needs so the (possibly parallel) worker closures
@@ -952,6 +1039,8 @@ fn decode_grid(
         out_h,
         tile_w,
         tile_h,
+        tile_crop_left: tile_crop.left,
+        tile_crop_top: tile_crop.top,
         channels,
     };
 
@@ -997,14 +1086,15 @@ fn decode_grid(
         }
     };
 
-    let (width, height, buf2, _alpha) =
-        apply_orientation(out_w as u32, out_h as u32, out_buf, None, grid.orientation);
+    let alpha = decode_alpha_plane(file, heif_file, out_w, out_h);
+    let (width, height, buf2, alpha2) =
+        apply_orientation(out_w as u32, out_h as u32, out_buf, alpha, grid.orientation);
 
     Ok(DecodedImage {
         width,
         height,
         pixels: buf2,
-        alpha: None,
+        alpha: alpha2,
         bit_depth,
         color: heif_file.primary.color.clone(),
         // store grid.orientation so the caller knows what rotation was applied

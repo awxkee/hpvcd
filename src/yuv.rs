@@ -54,6 +54,8 @@ use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
 struct Cvt<'a> {
     yuv: &'a YuvPlanes,
     dw: usize,
+    x0: usize,
+    y0: usize,
     max_val: i64,
     y_black: i64,
     neutral: i64,
@@ -70,7 +72,7 @@ struct Cvt<'a> {
 }
 
 impl Cvt<'_> {
-    fn new<'a>(yuv: &'a YuvPlanes, dw: usize, color: &Cicp) -> Cvt<'a> {
+    fn new<'a>(yuv: &'a YuvPlanes, dw: usize, x0: usize, y0: usize, color: &Cicp) -> Cvt<'a> {
         let scale = 1i64 << yuv.bit_depth.minus8();
         let k_y: i64 = if color.full_range {
             Q13_ONE
@@ -95,6 +97,8 @@ impl Cvt<'_> {
         Cvt {
             yuv,
             dw,
+            x0,
+            y0,
             max_val: yuv.bit_depth.max_val() as i64,
             y_black: if color.full_range { 0 } else { 16 * scale },
             neutral: 128 * scale,
@@ -114,10 +118,12 @@ impl Cvt<'_> {
 
     fn pixel(&self, y_pix: usize, x_pix: usize) -> (i64, i64, i64) {
         let yuv = self.yuv;
-        let y_row = y_pix.min(yuv.height - 1);
-        let c_row = (y_pix / self.sub_h).min(self.ch - 1);
-        let x_col = x_pix.min(yuv.width - 1);
-        let c_col = (x_pix / self.sub_w).min(self.cw - 1);
+        let src_y = self.y0.saturating_add(y_pix);
+        let src_x = self.x0.saturating_add(x_pix);
+        let y_row = src_y.min(yuv.height - 1);
+        let c_row = (src_y / self.sub_h).min(self.ch - 1);
+        let x_col = src_x.min(yuv.width - 1);
+        let c_col = (src_x / self.sub_w).min(self.cw - 1);
 
         let luma_raw = yuv.y[y_row * yuv.width + x_col] as i64;
 
@@ -155,28 +161,31 @@ impl PxCast for u16 {
 impl Cvt<'_> {
     fn mono_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
         let yuv = self.yuv;
+        let src_x = self.x0.min(yuv.width - 1);
         for (dy, dst_row) in out.chunks_exact_mut(self.dw).enumerate() {
-            let row = (y0 + dy).min(yuv.height - 1);
+            let row = self.y0.saturating_add(y0 + dy).min(yuv.height - 1);
             let src_row = &yuv.y[row * yuv.width..][..yuv.width];
-            let copy_w = self.dw.min(yuv.width);
+            let copy_w = self.dw.min(yuv.width - src_x);
             let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
-            for (dst, &luma) in dst_copy.iter_mut().zip(src_row.iter()) {
+            for (dst, &luma) in dst_copy.iter_mut().zip(src_row[src_x..].iter()) {
                 let v = (self.k_y * (luma as i64 - self.y_black) + Q13_ROUND) >> Q13;
                 *dst = T::cast(v.clamp(0, cmax));
             }
-            if let (Some(&last), false) = (src_row.last(), dst_edge.is_empty()) {
+            if !dst_edge.is_empty() {
+                let last = src_row[src_x + copy_w.saturating_sub(1)];
                 let v = (self.k_y * (last as i64 - self.y_black) + Q13_ROUND) >> Q13;
                 dst_edge.fill(T::cast(v.clamp(0, cmax)));
             }
         }
     }
 
-    /// Non-identity fast path: requires dw ≤ width and dh ≤ height.
+    /// Non-identity fast path: requires the requested visible window to fit inside
+    /// the coded planes.
     fn fast_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
         let yuv = self.yuv;
         for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
-            let y_pix = y0 + dy;
-            let luma_base = y_pix * yuv.width;
+            let y_pix = self.y0 + y0 + dy;
+            let luma_base = y_pix * yuv.width + self.x0;
             let c_base = (y_pix / self.sub_h) * self.cw;
             let luma_row = &yuv.y[luma_base..][..self.dw];
             let cb_row = &yuv.cb[c_base..][..self.cw];
@@ -188,7 +197,7 @@ impl Cvt<'_> {
                 .zip(luma_row.iter())
                 .enumerate()
             {
-                let c_col = x_pix / self.sub_w;
+                let c_col = (self.x0 + x_pix) / self.sub_w;
                 let cb_c = cb_row[c_col] as i64 - self.neutral;
                 let cr_c = cr_row[c_col] as i64 - self.neutral;
                 let yv = self.k_y * (luma_raw as i64 - self.y_black);
@@ -216,15 +225,16 @@ impl Cvt<'_> {
     fn ycgco_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
         let yuv = self.yuv;
         for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
-            let y_pix = y0 + dy;
-            let y_row = y_pix.min(yuv.height - 1);
-            let c_row = (y_pix / self.sub_h).min(self.ch - 1);
+            let src_y = self.y0.saturating_add(y0 + dy);
+            let y_row = src_y.min(yuv.height - 1);
+            let c_row = (src_y / self.sub_h).min(self.ch - 1);
             let l_row = &yuv.y[y_row * yuv.width..][..yuv.width];
             let cb_row = &yuv.cb[c_row * self.cw..][..self.cw];
             let cr_row = &yuv.cr[c_row * self.cw..][..self.cw];
             for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let x_col = x_pix.min(yuv.width - 1);
-                let c_col = (x_pix / self.sub_w).min(self.cw - 1);
+                let src_x = self.x0.saturating_add(x_pix);
+                let x_col = src_x.min(yuv.width - 1);
+                let c_col = (src_x / self.sub_w).min(self.cw - 1);
                 let y = l_row[x_col] as i64;
                 let cg = cb_row[c_col] as i64 - self.neutral;
                 let co = cr_row[c_col] as i64 - self.neutral;
@@ -265,28 +275,23 @@ where
     v
 }
 
-pub(crate) fn yuv_to_rgb_with_color(
+pub(crate) fn yuv_to_rgb_window_with_color(
     yuv: &YuvPlanes,
     dw: usize,
     dh: usize,
+    crop_left: usize,
+    crop_top: usize,
     color: &Cicp,
 ) -> ImageBuffer {
-    yuv_to_rgb_with_color_pool(yuv, dw, dh, color, None)
+    yuv_to_rgb_window_with_color_pool(yuv, dw, dh, crop_left, crop_top, color, None)
 }
 
-///
-/// Matrix coefficients supported (ISO/IEC 23091-2):
-/// * 1  – BT.709 (default for HD content)
-/// * 9  – BT.2020 NCL (HDR, recent iPhones)
-/// * 0  – Identity (GBR, no color transform)
-/// * other – fall back to BT.709
-///
-/// Output length = `dw * dh * 3`, each channel at `bit_depth`'s native scale.
-/// Rows are converted in parallel bands when `pool` has more than one thread.
-pub(crate) fn yuv_to_rgb_with_color_pool(
+pub(crate) fn yuv_to_rgb_window_with_color_pool(
     yuv: &YuvPlanes,
     dw: usize,
     dh: usize,
+    crop_left: usize,
+    crop_top: usize,
     color: &Cicp,
     pool: Option<&ThreadPool>,
 ) -> ImageBuffer {
@@ -304,7 +309,9 @@ pub(crate) fn yuv_to_rgb_with_color_pool(
         };
     }
 
-    let cvt = Cvt::new(yuv, dw, color);
+    let crop_left = crop_left.min(yuv.width - 1);
+    let crop_top = crop_top.min(yuv.height - 1);
+    let cvt = Cvt::new(yuv, dw, crop_left, crop_top, color);
 
     if yuv.chroma.is_monochrome() {
         return if yuv.bit_depth == BitDepth::Eight {
@@ -332,7 +339,7 @@ pub(crate) fn yuv_to_rgb_with_color_pool(
 
     // Fast path assumes the visible window fits inside the coded planes, making
     // the per-pixel edge clamps in `pixel` provably no-ops; output is bit-exact.
-    let fast = dw <= yuv.width && dh <= yuv.height;
+    let fast = dw <= yuv.width - crop_left && dh <= yuv.height - crop_top;
     if fast && !cvt.identity {
         return if yuv.bit_depth == BitDepth::Eight {
             ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {

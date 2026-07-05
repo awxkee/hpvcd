@@ -389,6 +389,23 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         n => return Err(DecodeError::UnsupportedChroma(n)),
     };
 
+    // HEVC stores conformance-window offsets in crop units, not pixels.
+    // Convert them once here so all users of `Sps::crop_*` see luma-sample
+    // offsets as documented above.
+    let (crop_unit_x, crop_unit_y): (u32, u32) = if separate_color_plane {
+        (1, 1)
+    } else {
+        match chroma {
+            ChromaFormat::Monochrome | ChromaFormat::Yuv444 => (1, 1),
+            ChromaFormat::Yuv422 => (2, 1),
+            ChromaFormat::Yuv420 => (2, 2),
+        }
+    };
+    let crop_left = crop_left.saturating_mul(crop_unit_x);
+    let crop_right = crop_right.saturating_mul(crop_unit_x);
+    let crop_top = crop_top.saturating_mul(crop_unit_y);
+    let crop_bottom = crop_bottom.saturating_mul(crop_unit_y);
+
     Ok(Sps {
         chroma_idc,
         chroma,
