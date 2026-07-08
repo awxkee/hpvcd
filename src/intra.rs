@@ -216,7 +216,7 @@ pub(crate) type PredictFn = fn(u8, &[u16], &[u16], usize, bool, u8, &mut [u16], 
 static PREDICT: std::sync::OnceLock<PredictFn> = std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_predict() -> PredictFn {
+pub(crate) fn resolve_predict() -> PredictFn {
     *PREDICT.get_or_init(|| {
         let mut _f: PredictFn = predict_into_scalar;
 
@@ -234,21 +234,6 @@ fn resolve_predict() -> PredictFn {
 
         _f
     })
-}
-
-/// Like `predict` but writes into `out[..n*n]`; `refs_ang` is work space (≥ 3N+1).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn predict_into(
-    mode: u8,
-    above: &[u16],
-    left: &[u16],
-    n: usize,
-    is_luma: bool,
-    bit_depth: u8,
-    out: &mut [u16],
-    refs_ang: &mut [i32],
-) {
-    resolve_predict()(mode, above, left, n, is_luma, bit_depth, out, refs_ang)
 }
 
 /// Scalar predictor fallback. Kept separate so SIMD backends can dispatch only the

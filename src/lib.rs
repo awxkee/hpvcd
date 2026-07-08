@@ -36,6 +36,7 @@ mod deblock;
 mod decode;
 mod decoder;
 mod error;
+mod exec;
 mod fast_divide;
 mod fmt;
 mod heif;

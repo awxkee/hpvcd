@@ -27,10 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-type SaoPlaneFn =
+use crate::exec::ExecContext;
+
+pub(crate) type SaoPlaneFn =
     fn(&mut [u16], &[u16], usize, usize, usize, usize, usize, usize, u8, &[i32; 4], u8, u8, u8);
 
-type SaoPlaneBandedFn = fn(
+pub(crate) type SaoPlaneBandedFn = fn(
     &mut [u16],
     &[u16],
     usize,
@@ -51,7 +53,7 @@ static APPLY_SAO_PLANE: std::sync::OnceLock<SaoPlaneFn> = std::sync::OnceLock::n
 static APPLY_SAO_PLANE_BANDED: std::sync::OnceLock<SaoPlaneBandedFn> = std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_apply_sao_plane() -> SaoPlaneFn {
+pub(crate) fn resolve_apply_sao_plane() -> SaoPlaneFn {
     *APPLY_SAO_PLANE.get_or_init(|| {
         let mut _f: SaoPlaneFn = apply_sao_plane_scalar;
 
@@ -72,7 +74,7 @@ fn resolve_apply_sao_plane() -> SaoPlaneFn {
 }
 
 #[inline]
-fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
+pub(crate) fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
     *APPLY_SAO_PLANE_BANDED.get_or_init(|| {
         let mut _f: SaoPlaneBandedFn = apply_sao_plane_banded_scalar;
 
@@ -90,28 +92,6 @@ fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
 
         _f
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(crate) fn apply_sao_plane(
-    dst: &mut [u16],
-    src: &[u16],
-    w: usize,
-    h: usize,
-    x0: usize,
-    y0: usize,
-    x_end: usize,
-    y_end: usize,
-    type_idx: u8,
-    offsets: &[i32; 4],
-    band_pos: u8,
-    eo_class: u8,
-    bd: u8,
-) {
-    resolve_apply_sao_plane()(
-        dst, src, w, h, x0, y0, x_end, y_end, type_idx, offsets, band_pos, eo_class, bd,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,6 +260,7 @@ pub(crate) struct SaoCtbParams {
 
 /// Immutable geometry + toggles shared by every SAO band worker.
 pub(crate) struct SaoPlanesCtx<'a> {
+    pub exec: ExecContext,
     pub params: &'a [SaoCtbParams],
     pub ctb_cols: usize,
     pub ctb_rows: usize,
@@ -334,7 +315,7 @@ fn apply_sao_ctb_row(
                     p.band_pos[0],
                     ctx.bd,
                 ),
-                2 => apply_sao_plane_banded(
+                2 => (ctx.exec.sao_plane_banded)(
                     luma_dst,
                     luma_src.expect("SAO EO requires luma snapshot"),
                     ctx.w,
@@ -372,7 +353,7 @@ fn apply_sao_ctb_row(
                     p.band_pos[1],
                     ctx.bd_c,
                 ),
-                2 => apply_sao_plane_banded(
+                2 => (ctx.exec.sao_plane_banded)(
                     cb_dst,
                     cb_src.expect("SAO EO requires Cb snapshot"),
                     ctx.cw,
@@ -403,7 +384,7 @@ fn apply_sao_ctb_row(
                     p.band_pos[2],
                     ctx.bd_c,
                 ),
-                2 => apply_sao_plane_banded(
+                2 => (ctx.exec.sao_plane_banded)(
                     cr_dst,
                     cr_src.expect("SAO EO requires Cr snapshot"),
                     ctx.cw,
@@ -432,30 +413,6 @@ fn apply_sao_ctb_row(
 /// analogue of the serial `apply_sao_plane`, split so disjoint bands can run on
 /// separate threads. Bit-exact with the serial path because both read only from
 /// the untouched clone and write each output pixel exactly once.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn apply_sao_plane_banded(
-    dst_band: &mut [u16],
-    src_full: &[u16],
-    w: usize,
-    h: usize,
-    band_y0: usize,
-    x0: usize,
-    y0: usize,
-    x_end: usize,
-    y_end: usize,
-    type_idx: u8,
-    offsets: &[i32; 4],
-    band_pos: u8,
-    eo_class: u8,
-    bd: u8,
-) {
-    resolve_apply_sao_plane_banded()(
-        dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, type_idx, offsets, band_pos,
-        eo_class, bd,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn apply_sao_band_offset_banded_inplace(

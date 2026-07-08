@@ -613,7 +613,7 @@ impl<'a> ScalingMatrix<'a> {
     }
 
     #[inline]
-    fn is_flat_16(self) -> bool {
+    pub(crate) fn is_flat_16(self) -> bool {
         self.flat_16
     }
 
@@ -637,7 +637,7 @@ impl<'a> ScalingMatrix<'a> {
 }
 
 #[inline]
-fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantParams {
+pub(crate) fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantParams {
     let log2n = (n as u32).trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let bd_shift = (bd + log2n - 5).max(1);
@@ -653,7 +653,7 @@ fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantParams {
 }
 
 #[inline]
-fn transform_skip_params(n: usize, qp_prime: i32, bit_depth: u8) -> TransformSkipParams {
+pub(crate) fn transform_skip_params(n: usize, qp_prime: i32, bit_depth: u8) -> TransformSkipParams {
     let dequant = dequant_params(n, qp_prime, bit_depth);
     let log2n = (n as u32).trailing_zeros() as i32;
     // getTransformShift(bitDepth, log2TrSize, maxLog2TrDynamicRange), with
@@ -827,15 +827,17 @@ pub(crate) fn dequantize_transform_skip_scaled_into_scalar_i16(
 
 // `n` = transform width/height. Output is clipped to the HEVC residual dynamic
 // range used by the rest of this decoder.
-type DequantFn = fn(&[i32], usize, DequantParams, &mut [i32]);
-type DequantFn16 = fn(&[i32], usize, DequantParams, &mut [i16]);
-type DequantSkipFn = fn(&[i32], usize, TransformSkipParams, &mut [i32]);
-type DequantSkipFn16 = fn(&[i32], usize, TransformSkipParams, &mut [i16]);
-type DequantScaledFn = for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i32]);
-type DequantScaledFn16 = for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i16]);
-type DequantSkipScaledFn =
+pub(crate) type DequantFn = fn(&[i32], usize, DequantParams, &mut [i32]);
+pub(crate) type DequantFn16 = fn(&[i32], usize, DequantParams, &mut [i16]);
+pub(crate) type DequantSkipFn = fn(&[i32], usize, TransformSkipParams, &mut [i32]);
+pub(crate) type DequantSkipFn16 = fn(&[i32], usize, TransformSkipParams, &mut [i16]);
+pub(crate) type DequantScaledFn =
+    for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i32]);
+pub(crate) type DequantScaledFn16 =
+    for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i16]);
+pub(crate) type DequantSkipScaledFn =
     for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, &mut [i32]);
-type DequantSkipScaledFn16 =
+pub(crate) type DequantSkipScaledFn16 =
     for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, &mut [i16]);
 
 static DEQUANT: std::sync::OnceLock<DequantFn> = std::sync::OnceLock::new();
@@ -849,7 +851,7 @@ static DEQUANT_SKIP_SCALED16: std::sync::OnceLock<DequantSkipScaledFn16> =
     std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_dequant() -> DequantFn {
+pub(crate) fn resolve_dequant() -> DequantFn {
     *DEQUANT.get_or_init(|| {
         let mut _f: DequantFn = dequantize_into_scalar_i32;
 
@@ -870,7 +872,7 @@ fn resolve_dequant() -> DequantFn {
 }
 
 #[inline]
-fn resolve_dequant16() -> DequantFn16 {
+pub(crate) fn resolve_dequant16() -> DequantFn16 {
     *DEQUANT16.get_or_init(|| {
         let mut _f: DequantFn16 = dequantize_into_scalar_i16;
 
@@ -891,7 +893,7 @@ fn resolve_dequant16() -> DequantFn16 {
 }
 
 #[inline]
-fn resolve_dequant_skip() -> DequantSkipFn {
+pub(crate) fn resolve_dequant_skip() -> DequantSkipFn {
     *DEQUANT_SKIP.get_or_init(|| {
         let mut _f: DequantSkipFn = dequantize_transform_skip_into_scalar_i32;
 
@@ -912,7 +914,7 @@ fn resolve_dequant_skip() -> DequantSkipFn {
 }
 
 #[inline]
-fn resolve_dequant_skip16() -> DequantSkipFn16 {
+pub(crate) fn resolve_dequant_skip16() -> DequantSkipFn16 {
     *DEQUANT_SKIP16.get_or_init(|| {
         let mut _f: DequantSkipFn16 = dequantize_transform_skip_into_scalar_i16;
 
@@ -933,7 +935,7 @@ fn resolve_dequant_skip16() -> DequantSkipFn16 {
 }
 
 #[inline]
-fn resolve_dequant_scaled() -> DequantScaledFn {
+pub(crate) fn resolve_dequant_scaled() -> DequantScaledFn {
     *DEQUANT_SCALED.get_or_init(|| {
         let mut _f: DequantScaledFn = dequantize_scaled_into_scalar_i32;
 
@@ -954,7 +956,7 @@ fn resolve_dequant_scaled() -> DequantScaledFn {
 }
 
 #[inline]
-fn resolve_dequant_scaled16() -> DequantScaledFn16 {
+pub(crate) fn resolve_dequant_scaled16() -> DequantScaledFn16 {
     *DEQUANT_SCALED16.get_or_init(|| {
         let mut _f: DequantScaledFn16 = dequantize_scaled_into_scalar_i16;
 
@@ -975,7 +977,7 @@ fn resolve_dequant_scaled16() -> DequantScaledFn16 {
 }
 
 #[inline]
-fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
+pub(crate) fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
     *DEQUANT_SKIP_SCALED.get_or_init(|| {
         let mut _f: DequantSkipScaledFn = dequantize_transform_skip_scaled_into_scalar_i32;
 
@@ -996,7 +998,7 @@ fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
 }
 
 #[inline]
-fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
+pub(crate) fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
     *DEQUANT_SKIP_SCALED16.get_or_init(|| {
         let mut _f: DequantSkipScaledFn16 = dequantize_transform_skip_scaled_into_scalar_i16;
 
@@ -1015,184 +1017,11 @@ fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
         _f
     })
 }
-
-pub(crate) trait DequantTarget: Coeff {
-    fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]);
-    fn dequantize_transform_skip(
-        levels: &[i32],
-        n: usize,
-        params: TransformSkipParams,
-        out: &mut [Self],
-    );
-    fn dequantize_scaled(
-        levels: &[i32],
-        n: usize,
-        params: DequantParams,
-        scaling: ScalingMatrix<'_>,
-        out: &mut [Self],
-    );
-    fn dequantize_transform_skip_scaled(
-        levels: &[i32],
-        n: usize,
-        params: TransformSkipParams,
-        scaling: ScalingMatrix<'_>,
-        out: &mut [Self],
-    );
-}
-
-impl DequantTarget for i32 {
-    #[inline]
-    fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]) {
-        resolve_dequant()(levels, n, params, out);
-    }
-
-    #[inline]
-    fn dequantize_transform_skip(
-        levels: &[i32],
-        n: usize,
-        params: TransformSkipParams,
-        out: &mut [Self],
-    ) {
-        resolve_dequant_skip()(levels, n, params, out);
-    }
-
-    #[inline]
-    fn dequantize_scaled(
-        levels: &[i32],
-        n: usize,
-        params: DequantParams,
-        scaling: ScalingMatrix<'_>,
-        out: &mut [Self],
-    ) {
-        resolve_dequant_scaled()(levels, n, params, scaling, out);
-    }
-
-    #[inline]
-    fn dequantize_transform_skip_scaled(
-        levels: &[i32],
-        n: usize,
-        params: TransformSkipParams,
-        scaling: ScalingMatrix<'_>,
-        out: &mut [Self],
-    ) {
-        resolve_dequant_skip_scaled()(levels, n, params, scaling, out);
-    }
-}
-
-impl DequantTarget for i16 {
-    #[inline]
-    fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]) {
-        resolve_dequant16()(levels, n, params, out);
-    }
-
-    #[inline]
-    fn dequantize_transform_skip(
-        levels: &[i32],
-        n: usize,
-        params: TransformSkipParams,
-        out: &mut [Self],
-    ) {
-        resolve_dequant_skip16()(levels, n, params, out);
-    }
-
-    #[inline]
-    fn dequantize_scaled(
-        levels: &[i32],
-        n: usize,
-        params: DequantParams,
-        scaling: ScalingMatrix<'_>,
-        out: &mut [Self],
-    ) {
-        resolve_dequant_scaled16()(levels, n, params, scaling, out);
-    }
-
-    #[inline]
-    fn dequantize_transform_skip_scaled(
-        levels: &[i32],
-        n: usize,
-        params: TransformSkipParams,
-        scaling: ScalingMatrix<'_>,
-        out: &mut [Self],
-    ) {
-        resolve_dequant_skip_scaled16()(levels, n, params, scaling, out);
-    }
-}
-
-pub(crate) fn dequantize_into<S: DequantTarget>(
-    levels: &[i32],
-    n: usize,
-    qp_prime: i32,
-    bit_depth: u8,
-    out: &mut [S],
-) {
-    let params = dequant_params(n, qp_prime, bit_depth);
-    S::dequantize(levels, n, params, out);
-}
-
-pub(crate) fn dequantize_transform_skip_into<S: DequantTarget>(
-    levels: &[i32],
-    n: usize,
-    qp_prime: i32,
-    bit_depth: u8,
-    out: &mut [S],
-) {
-    debug_assert!(
-        n == 4,
-        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
-    );
-    let params = transform_skip_params(n, qp_prime, bit_depth);
-    S::dequantize_transform_skip(levels, n, params, out);
-}
-
-pub(crate) fn dequantize_scaled_into<S: DequantTarget>(
-    levels: &[i32],
-    n: usize,
-    qp_prime: i32,
-    bit_depth: u8,
-    scaling: Option<ScalingMatrix<'_>>,
-    out: &mut [S],
-) {
-    let Some(scaling) = scaling else {
-        dequantize_into(levels, n, qp_prime, bit_depth, out);
-        return;
-    };
-    if scaling.is_flat_16() {
-        dequantize_into(levels, n, qp_prime, bit_depth, out);
-        return;
-    }
-    let params = dequant_params(n, qp_prime, bit_depth);
-    S::dequantize_scaled(levels, n, params, scaling, out);
-}
-
-pub(crate) fn dequantize_transform_skip_scaled_into<S: DequantTarget>(
-    levels: &[i32],
-    n: usize,
-    qp_prime: i32,
-    bit_depth: u8,
-    scaling: Option<ScalingMatrix<'_>>,
-    out: &mut [S],
-) {
-    debug_assert!(
-        n == 4,
-        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
-    );
-    let Some(scaling) = scaling else {
-        dequantize_transform_skip_into(levels, n, qp_prime, bit_depth, out);
-        return;
-    };
-    if scaling.is_flat_16() {
-        dequantize_transform_skip_into(levels, n, qp_prime, bit_depth, out);
-        return;
-    }
-    let params = transform_skip_params(n, qp_prime, bit_depth);
-    S::dequantize_transform_skip_scaled(levels, n, params, scaling, out);
-}
-
 // `nx` = number of nonzero input columns (last_x + 1); stage 1 skips the rest.
-type InvTransformFn = fn(&[i32], usize, u8, usize, &mut [i32]);
-type InvTransform4Fn = fn(&[i32], u8, &mut [i32]);
-type InvTransformFn16 = fn(&[i16], usize, u8, usize, &mut [i16]);
-type InvTransform4Fn16 = fn(&[i16], u8, &mut [i16]);
+pub(crate) type InvTransformFn = fn(&[i32], usize, u8, usize, &mut [i32]);
+pub(crate) type InvTransform4Fn = fn(&[i32], u8, &mut [i32]);
+pub(crate) type InvTransformFn16 = fn(&[i16], usize, u8, usize, &mut [i16]);
+pub(crate) type InvTransform4Fn16 = fn(&[i16], u8, &mut [i16]);
 
 static INV_TRANSFORM: std::sync::OnceLock<InvTransformFn> = std::sync::OnceLock::new();
 static INV_TRANSFORM_DST4: std::sync::OnceLock<InvTransform4Fn> = std::sync::OnceLock::new();
@@ -1200,7 +1029,7 @@ static INV_TRANSFORM16: std::sync::OnceLock<InvTransformFn16> = std::sync::OnceL
 static INV_TRANSFORM_DST4_16: std::sync::OnceLock<InvTransform4Fn16> = std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_inv_transform() -> InvTransformFn {
+pub(crate) fn resolve_inv_transform() -> InvTransformFn {
     *INV_TRANSFORM.get_or_init(|| {
         let mut _f: InvTransformFn = inv_transform_into_scalar;
 
@@ -1221,7 +1050,7 @@ fn resolve_inv_transform() -> InvTransformFn {
 }
 
 #[inline]
-fn resolve_inv_transform_dst4() -> InvTransform4Fn {
+pub(crate) fn resolve_inv_transform_dst4() -> InvTransform4Fn {
     *INV_TRANSFORM_DST4.get_or_init(|| {
         let mut _f: InvTransform4Fn = inv_transform_dst_into_scalar;
 
@@ -1242,7 +1071,7 @@ fn resolve_inv_transform_dst4() -> InvTransform4Fn {
 }
 
 #[inline]
-fn resolve_inv_transform16() -> InvTransformFn16 {
+pub(crate) fn resolve_inv_transform16() -> InvTransformFn16 {
     *INV_TRANSFORM16.get_or_init(|| {
         let mut _f: InvTransformFn16 = inv_transform_into_scalar16;
 
@@ -1263,7 +1092,7 @@ fn resolve_inv_transform16() -> InvTransformFn16 {
 }
 
 #[inline]
-fn resolve_inv_transform_dst4_16() -> InvTransform4Fn16 {
+pub(crate) fn resolve_inv_transform_dst4_16() -> InvTransform4Fn16 {
     *INV_TRANSFORM_DST4_16.get_or_init(|| {
         let mut _f: InvTransform4Fn16 = inv_transform_dst_into_scalar16;
 
@@ -1325,183 +1154,4 @@ pub(crate) fn inv_transform_into_scalar16(
 /// Scalar i16 inverse 4×4 DST (8-bit depth path).
 pub(crate) fn inv_transform_dst_into_scalar16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
     inv_transform_n_into::<4, i16>(coeff, &DST4, bit_depth, 4, out);
-}
-
-/// Inverse DCT into `out[..n*n]`. `nx` = nonzero column count (last_x + 1).
-pub(crate) fn inv_transform_into(
-    coeff: &[i32],
-    n: usize,
-    bit_depth: u8,
-    nx: usize,
-    out: &mut [i32],
-) {
-    resolve_inv_transform()(coeff, n, bit_depth, nx, out);
-}
-
-/// Inverse 4×4 DST/ADST-like intra transform into `out[..16]` — no heap allocation.
-pub(crate) fn inv_transform_dst_into(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
-    resolve_inv_transform_dst4()(coeff, bit_depth, out);
-}
-
-/// i16 inverse DCT (8-bit depth). `nx` = nonzero column count (last_x + 1).
-pub(crate) fn inv_transform_into16(
-    coeff: &[i16],
-    n: usize,
-    bit_depth: u8,
-    nx: usize,
-    out: &mut [i16],
-) {
-    resolve_inv_transform16()(coeff, n, bit_depth, nx, out);
-}
-
-/// i16 inverse 4×4 DST (8-bit depth).
-pub(crate) fn inv_transform_dst_into16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
-    resolve_inv_transform_dst4_16()(coeff, bit_depth, out);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transform_skip_4x4_8bit_qp22_known_values() {
-        let mut levels = [0i32; 16];
-        levels[0] = 1;
-        levels[1] = -1;
-        levels[2] = 2;
-        levels[3] = -2;
-
-        let mut out = [0i16; 16];
-        dequantize_transform_skip_into(&levels, 4, 22, 8, &mut out);
-
-        assert_eq!(out[0], 8);
-        assert_eq!(out[1], -8);
-        assert_eq!(out[2], 16);
-        assert_eq!(out[3], -16);
-        assert!(out[4..].iter().all(|&v| v == 0));
-    }
-
-    #[test]
-    fn transform_skip_is_dequant_plus_logical_inverse_skip() {
-        let levels = [3, -2, 0, 1, -1, 0, 2, -3, 0, 4, -4, 0, 1, 0, -1, 2];
-        let mut deq = [0i32; 16];
-        let mut out = [0i32; 16];
-
-        dequantize_into(&levels, 4, 18, 8, &mut deq);
-        dequantize_transform_skip_into(&levels, 4, 18, 8, &mut out);
-
-        let shift = 15 - 8 - 2;
-        let add = 1 << (shift - 1);
-        for (actual, &d) in out.iter().zip(deq.iter()) {
-            assert_eq!(*actual, (d + add) >> shift);
-        }
-    }
-
-    #[test]
-    fn scalar_dequant_matches_public_dispatch_i16() {
-        let levels = [-12, 0, 7, 19, -31, 42, 3, -4, 5, -6, 100, -100, 1, 2, -3, 4];
-        let params = dequant_params(4, 34, 8);
-        let mut expected = [0i16; 16];
-        let mut actual = [0i16; 16];
-
-        dequantize_into_scalar(&levels, 4, params, &mut expected);
-        dequantize_into(&levels, 4, 34, 8, &mut actual);
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn scalar_transform_skip_matches_public_dispatch_i32() {
-        let levels = [-12, 0, 7, 19, -31, 42, 3, -4, 5, -6, 100, -100, 1, 2, -3, 4];
-        let params = transform_skip_params(4, 34, 10);
-        let mut expected = [0i32; 16];
-        let mut actual = [0i32; 16];
-
-        dequantize_transform_skip_into_scalar(&levels, 4, params, &mut expected);
-        dequantize_transform_skip_into(&levels, 4, 34, 10, &mut actual);
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn dequant_10bit_accepts_qp_prime_zero() {
-        let mut levels = [0i32; 16];
-        levels[0] = 1;
-
-        let mut out = [0i32; 16];
-        dequantize_into(&levels, 4, 0, 10, &mut out);
-
-        // Nominal 10-bit QpY=-12 maps to qp_prime=0. The decoder must not add
-        // QpBdOffset again inside dequantization; doing so would produce 20 here.
-        assert_eq!(out[0], 5);
-        assert!(out[1..].iter().all(|&v| v == 0));
-    }
-
-    #[test]
-    fn transform_skip_10bit_accepts_qp_prime_zero() {
-        let mut levels = [0i32; 16];
-        levels[0] = 1;
-
-        let mut out = [0i32; 16];
-        dequantize_transform_skip_into(&levels, 4, 0, 10, &mut out);
-
-        // dequant=5, transform-skip shift=15-10-log2(4)=3 => (5+4)>>3.
-        assert_eq!(out[0], 1);
-        assert!(out[1..].iter().all(|&v| v == 0));
-    }
-
-    #[test]
-    fn scaled_dequant_flat_16_matches_default_dispatch() {
-        let levels = [-12, 0, 7, 19, -31, 42, 3, -4, 5, -6, 100, -100, 1, 2, -3, 4];
-        let coeffs = [16u8; 64];
-        let scaling = ScalingMatrix::new(&coeffs, 16, 4, false);
-        let mut expected = [0i16; 16];
-        let mut actual = [0i16; 16];
-
-        dequantize_into(&levels, 4, 34, 8, &mut expected);
-        dequantize_scaled_into(&levels, 4, 34, 8, Some(scaling), &mut actual);
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn scaled_dequant_uses_per_coefficient_matrix() {
-        let mut levels = [0i32; 16];
-        levels[0] = 1;
-        levels[5] = 1;
-        let mut coeffs = [16u8; 64];
-        coeffs[0] = 32;
-        coeffs[5] = 8;
-        let scaling = ScalingMatrix::new(&coeffs, 16, 4, false);
-        let mut out = [0i32; 16];
-
-        dequantize_scaled_into(&levels, 4, 0, 8, Some(scaling), &mut out);
-
-        assert_eq!(out[0], 40);
-        assert_eq!(out[5], 10);
-        assert!(
-            out.iter()
-                .enumerate()
-                .all(|(i, &v)| i == 0 || i == 5 || v == 0)
-        );
-    }
-
-    #[test]
-    fn scaled_dequant_16x16_replicates_8x8_and_uses_dc() {
-        let mut levels = [0i32; 256];
-        levels[0] = 1;
-        levels[1] = 1;
-        levels[2] = 1;
-        let mut coeffs = [16u8; 64];
-        coeffs[0] = 8;
-        coeffs[1] = 32;
-        let scaling = ScalingMatrix::new(&coeffs, 24, 16, false);
-        let mut out = [0i32; 256];
-
-        dequantize_scaled_into(&levels, 16, 0, 8, Some(scaling), &mut out);
-
-        assert_eq!(out[0], 8);
-        assert_eq!(out[1], 3);
-        assert_eq!(out[2], 10);
-    }
 }

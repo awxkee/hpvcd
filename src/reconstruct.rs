@@ -27,14 +27,14 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-type ReconstructFn = fn(&mut [u16], usize, &[u16], &[i32], usize, usize, usize, u8);
-type ReconstructFn16 = fn(&mut [u16], usize, &[u16], &[i16], usize, usize, usize, u8);
+pub(crate) type ReconstructFn = fn(&mut [u16], usize, &[u16], &[i32], usize, usize, usize, u8);
+pub(crate) type ReconstructFn16 = fn(&mut [u16], usize, &[u16], &[i16], usize, usize, usize, u8);
 
 static RECONSTRUCT_ADD_CLIP: std::sync::OnceLock<ReconstructFn> = std::sync::OnceLock::new();
 static RECONSTRUCT_ADD_CLIP16: std::sync::OnceLock<ReconstructFn16> = std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_reconstruct_add_clip() -> ReconstructFn {
+pub(crate) fn resolve_reconstruct_add_clip() -> ReconstructFn {
     *RECONSTRUCT_ADD_CLIP.get_or_init(|| {
         let mut _f: ReconstructFn = add_residual_into_scalar;
 
@@ -55,7 +55,7 @@ fn resolve_reconstruct_add_clip() -> ReconstructFn {
 }
 
 #[inline]
-fn resolve_reconstruct_add_clip16() -> ReconstructFn16 {
+pub(crate) fn resolve_reconstruct_add_clip16() -> ReconstructFn16 {
     *RECONSTRUCT_ADD_CLIP16.get_or_init(|| {
         let mut _f: ReconstructFn16 = add_residual_into_scalar16;
 
@@ -121,45 +121,6 @@ pub(crate) fn can_reconstruct_full_block<R>(
         && has_full_dst(dst, stride, n)
         && pred.len() >= n2
         && res.len() >= n2
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(crate) fn add_residual_into(
-    dst: &mut [u16],
-    stride: usize,
-    pred: &[u16],
-    res: &[i32],
-    n: usize,
-    valid_w: usize,
-    valid_h: usize,
-    bit_depth: u8,
-) {
-    if !can_reconstruct_full_block(dst, stride, pred, res, n, valid_w, valid_h, bit_depth) {
-        add_residual_into_scalar(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
-        return;
-    }
-    resolve_reconstruct_add_clip()(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
-}
-
-/// i16-residual reconstruct (8-bit depth path).
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(crate) fn add_residual_into16(
-    dst: &mut [u16],
-    stride: usize,
-    pred: &[u16],
-    res: &[i16],
-    n: usize,
-    valid_w: usize,
-    valid_h: usize,
-    bit_depth: u8,
-) {
-    if !can_reconstruct_full_block(dst, stride, pred, res, n, valid_w, valid_h, bit_depth) {
-        add_residual_into_scalar16(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
-        return;
-    }
-    resolve_reconstruct_add_clip16()(dst, stride, pred, res, n, valid_w, valid_h, bit_depth)
 }
 
 #[allow(clippy::too_many_arguments)]

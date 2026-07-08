@@ -44,6 +44,7 @@
 //!     is therefore inside exactly one band, so the pass runs in place without a
 //!     whole-plane snapshot.
 
+use crate::exec::ExecContext;
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
 
 #[rustfmt::skip]
@@ -67,6 +68,7 @@ static TC: [i32; 54] = [
 
 /// Immutable geometry, offsets and lookup tables shared by every band worker.
 pub(crate) struct DeblockCtx<'a> {
+    pub exec: ExecContext,
     pub w: usize,
     pub h: usize,
     pub cw: usize,
@@ -150,7 +152,7 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
                 s += 4;
                 continue;
             }
-            let filter = resolve_luma_vertical_plane();
+            let filter = ctx.exec.luma_deblock_vertical;
             filter(y, w, edge, s, row0, beta, tc, maxv);
             s += 4;
         }
@@ -205,7 +207,7 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
                 scan += 4;
                 continue;
             }
-            let filter = resolve_luma_horizontal_plane();
+            let filter = ctx.exec.luma_deblock_horizontal;
             filter(y, w, edge, scan, row0, beta, tc, maxv);
             scan += 4;
         }
@@ -214,13 +216,13 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
 }
 
 #[allow(clippy::too_many_arguments)]
-type LumaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
+pub(crate) type LumaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
 
 static LUMA_VERTICAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
 static LUMA_HORIZONTAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
+pub(crate) fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
     *LUMA_VERTICAL_PLANE.get_or_init(|| {
         let mut _f: LumaDeblockPlaneFn = luma_vertical_plane_scalar;
 
@@ -241,7 +243,7 @@ fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
 }
 
 #[inline]
-fn resolve_luma_horizontal_plane() -> LumaDeblockPlaneFn {
+pub(crate) fn resolve_luma_horizontal_plane() -> LumaDeblockPlaneFn {
     *LUMA_HORIZONTAL_PLANE.get_or_init(|| {
         let mut _f: LumaDeblockPlaneFn = luma_horizontal_plane_scalar;
 
@@ -431,7 +433,7 @@ fn luma_filter_lane_horizontal(
 }
 
 #[allow(clippy::too_many_arguments)]
-type ChromaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32);
+pub(crate) type ChromaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32);
 
 static CHROMA_VERTICAL_PLANE: std::sync::OnceLock<ChromaDeblockPlaneFn> =
     std::sync::OnceLock::new();
@@ -439,7 +441,7 @@ static CHROMA_HORIZONTAL_PLANE: std::sync::OnceLock<ChromaDeblockPlaneFn> =
     std::sync::OnceLock::new();
 
 #[inline]
-fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
+pub(crate) fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
     *CHROMA_VERTICAL_PLANE.get_or_init(|| {
         let mut _f: ChromaDeblockPlaneFn = chroma_vertical_plane_scalar;
 
@@ -460,7 +462,7 @@ fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
 }
 
 #[inline]
-fn resolve_chroma_horizontal_plane() -> ChromaDeblockPlaneFn {
+pub(crate) fn resolve_chroma_horizontal_plane() -> ChromaDeblockPlaneFn {
     *CHROMA_HORIZONTAL_PLANE.get_or_init(|| {
         let mut _f: ChromaDeblockPlaneFn = chroma_horizontal_plane_scalar;
 
@@ -565,7 +567,7 @@ fn chroma_vertical(
                 s += 4;
                 continue;
             }
-            let filter = resolve_chroma_vertical_plane();
+            let filter = ctx.exec.chroma_deblock_vertical;
             filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
             filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
             s += 4;
@@ -615,7 +617,7 @@ fn chroma_horizontal(
                 scan += 4;
                 continue;
             }
-            let filter = resolve_chroma_horizontal_plane();
+            let filter = ctx.exec.chroma_deblock_horizontal;
             filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
             filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
             scan += 4;

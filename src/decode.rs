@@ -32,10 +32,10 @@ use crate::cabac::{ContextSet, IntraModeContexts};
 use crate::cabac::{SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding};
 use crate::config::{Pps, ScalingList, Sps};
 use crate::error::DecodeError;
+use crate::exec::ExecContext;
 use crate::fast_divide::FastDivU32;
 use crate::fmt::BitDepth;
 use crate::intra;
-use crate::reconstruct;
 use crate::transform;
 use crate::yuv::YuvPlanes;
 
@@ -75,6 +75,7 @@ pub(crate) struct FullDecoder<'cab> {
     ictx: IntraModeContexts,
     sps: Sps,
     pps: Pps,
+    exec: ExecContext,
 
     // Reconstruction planes (coded dimensions, CTB-aligned).
     y: crate::plane::Plane<u16>,
@@ -218,6 +219,7 @@ impl FullDecoder<'static> {
             cab,
             ctx: qp,
             ictx,
+            exec: ExecContext::new(),
             bd: sps.bit_depth_luma,
             bd_c: sps.bit_depth_chroma,
             log2_ctb,
@@ -430,6 +432,7 @@ impl<'cab> FullDecoder<'cab> {
             sao: (self.sao.as_mut_ptr(), self.sao.len()),
             sps: self.sps.clone(),
             pps: self.pps.clone(),
+            exec: self.exec,
             w: self.w,
             h: self.h,
             cw: self.cw,
@@ -720,6 +723,7 @@ impl<'cab> FullDecoder<'cab> {
         let cb = self.cb.take_vec();
         let cr = self.cr.take_vec();
         let ctx = crate::deblock::DeblockCtx {
+            exec: self.exec,
             w: self.w,
             h: self.h,
             cw: self.cw,
@@ -1139,6 +1143,7 @@ impl<'cab> FullDecoder<'cab> {
             })
             .collect();
         let ctx = crate::sao::SaoPlanesCtx {
+            exec: self.exec,
             params: &params,
             ctb_cols: self.ctb_cols,
             ctb_rows: self.ctb_rows,
@@ -1217,7 +1222,7 @@ impl<'cab> FullDecoder<'cab> {
                             sao.band_pos[0],
                             self.bd,
                         ),
-                        2 => Self::apply_sao_plane(
+                        2 => (self.exec.sao_plane)(
                             &mut self.y[..],
                             orig_y.as_deref().expect("SAO EO requires luma snapshot"),
                             self.w,
@@ -1256,7 +1261,7 @@ impl<'cab> FullDecoder<'cab> {
                             sao.band_pos[1],
                             self.bd_c,
                         ),
-                        2 => Self::apply_sao_plane(
+                        2 => (self.exec.sao_plane)(
                             &mut self.cb[..],
                             orig_cb.as_deref().expect("SAO EO requires Cb snapshot"),
                             cw,
@@ -1285,7 +1290,7 @@ impl<'cab> FullDecoder<'cab> {
                             sao.band_pos[2],
                             self.bd_c,
                         ),
-                        2 => Self::apply_sao_plane(
+                        2 => (self.exec.sao_plane)(
                             &mut self.cr[..],
                             orig_cr.as_deref().expect("SAO EO requires Cr snapshot"),
                             cw,
@@ -1305,27 +1310,6 @@ impl<'cab> FullDecoder<'cab> {
                 }
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn apply_sao_plane(
-        dst: &mut [u16],
-        src: &[u16],
-        w: usize,
-        h: usize,
-        x0: usize,
-        y0: usize,
-        x_end: usize,
-        y_end: usize,
-        type_idx: u8,
-        offsets: &[i32; 4],
-        band_pos: u8,
-        eo_class: u8,
-        bd: u8,
-    ) {
-        crate::sao::apply_sao_plane(
-            dst, src, w, h, x0, y0, x_end, y_end, type_idx, offsets, band_pos, eo_class, bd,
-        );
     }
 
     fn coding_quadtree(&mut self, x0: usize, y0: usize, log2_cb: u32, depth: u8) {
@@ -2126,7 +2110,8 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                 );
                 if transform_skip {
-                    transform::dequantize_transform_skip_scaled_into(
+                    dequantize_transform_skip_scaled_into_i16(
+                        &self.exec,
                         levels,
                         n,
                         qp_prime_y,
@@ -2135,7 +2120,8 @@ impl<'cab> FullDecoder<'cab> {
                         &mut self.res_scratch16[..n * n],
                     );
                 } else {
-                    transform::dequantize_scaled_into(
+                    dequantize_scaled_into_i16(
+                        &self.exec,
                         levels,
                         n,
                         qp_prime_y,
@@ -2144,13 +2130,13 @@ impl<'cab> FullDecoder<'cab> {
                         &mut self.deq_scratch16[..n * n],
                     );
                     if n == 4 {
-                        transform::inv_transform_dst_into16(
+                        (self.exec.inv_transform_dst4_16)(
                             &self.deq_scratch16[..n * n],
                             self.bd,
                             &mut self.res_scratch16[..n * n],
                         );
                     } else {
-                        transform::inv_transform_into16(
+                        (self.exec.inv_transform16)(
                             &self.deq_scratch16[..n * n],
                             n,
                             self.bd,
@@ -2166,8 +2152,8 @@ impl<'cab> FullDecoder<'cab> {
                 && valid_h != 0
                 && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
             {
-                reconstruct::add_residual_into16(
-                    dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+                add_residual_into_i16(
+                    &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
                 );
             }
             self.mark_decoded(x0, y0, n);
@@ -2187,7 +2173,8 @@ impl<'cab> FullDecoder<'cab> {
                 n,
             );
             if transform_skip {
-                transform::dequantize_transform_skip_scaled_into(
+                dequantize_transform_skip_scaled_into_i32(
+                    &self.exec,
                     levels,
                     n,
                     qp_prime_y,
@@ -2196,7 +2183,8 @@ impl<'cab> FullDecoder<'cab> {
                     &mut self.res_scratch[..n * n],
                 );
             } else {
-                transform::dequantize_scaled_into(
+                dequantize_scaled_into_i32(
+                    &self.exec,
                     levels,
                     n,
                     qp_prime_y,
@@ -2205,13 +2193,13 @@ impl<'cab> FullDecoder<'cab> {
                     &mut self.deq_scratch[..n * n],
                 );
                 if n == 4 {
-                    transform::inv_transform_dst_into(
+                    (self.exec.inv_transform_dst4)(
                         &self.deq_scratch[..n * n],
                         self.bd,
                         &mut self.res_scratch[..n * n],
                     );
                 } else {
-                    transform::inv_transform_into(
+                    (self.exec.inv_transform)(
                         &self.deq_scratch[..n * n],
                         n,
                         self.bd,
@@ -2227,7 +2215,9 @@ impl<'cab> FullDecoder<'cab> {
             && valid_h != 0
             && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
         {
-            reconstruct::add_residual_into(dst, stride, pred, res, n, valid_w, valid_h, self.bd);
+            add_residual_into_i32(
+                &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+            );
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -2279,7 +2269,7 @@ impl<'cab> FullDecoder<'cab> {
             &mut sc.fa,
             &mut sc.fl,
         );
-        intra::predict_into(
+        (self.exec.predict)(
             mode,
             &sc.fa[..2 * n + 1],
             &sc.fl[..2 * n + 1],
@@ -2487,7 +2477,7 @@ impl<'cab> FullDecoder<'cab> {
                 &mut sc.fa,
                 &mut sc.fl,
             );
-            intra::predict_into(
+            (self.exec.predict)(
                 mode,
                 &sc.fa[..2 * n + 1],
                 &sc.fl[..2 * n + 1],
@@ -2498,7 +2488,7 @@ impl<'cab> FullDecoder<'cab> {
                 &mut sc.refs_ang,
             );
         } else {
-            intra::predict_into(
+            (self.exec.predict)(
                 mode,
                 &sc.above[..2 * n + 1],
                 &sc.left[..2 * n + 1],
@@ -2545,7 +2535,8 @@ impl<'cab> FullDecoder<'cab> {
                 }
             } else {
                 if transform_skip {
-                    transform::dequantize_transform_skip_scaled_into(
+                    dequantize_transform_skip_scaled_into_i16(
+                        &self.exec,
                         levels,
                         n,
                         qp_prime,
@@ -2554,7 +2545,8 @@ impl<'cab> FullDecoder<'cab> {
                         &mut self.res_scratch16[..n2],
                     );
                 } else {
-                    transform::dequantize_scaled_into(
+                    dequantize_scaled_into_i16(
+                        &self.exec,
                         levels,
                         n,
                         qp_prime,
@@ -2562,7 +2554,7 @@ impl<'cab> FullDecoder<'cab> {
                         scaling,
                         &mut self.deq_scratch16[..n2],
                     );
-                    transform::inv_transform_into16(
+                    (self.exec.inv_transform16)(
                         &self.deq_scratch16[..n2],
                         n,
                         self.bd_c,
@@ -2576,8 +2568,8 @@ impl<'cab> FullDecoder<'cab> {
             if valid_w != 0 && valid_h != 0 {
                 let plane = if is_cb { &mut self.cb } else { &mut self.cr };
                 if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
-                    reconstruct::add_residual_into16(
-                        dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+                    add_residual_into_i16(
+                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
                     );
                 }
             }
@@ -2588,7 +2580,8 @@ impl<'cab> FullDecoder<'cab> {
             self.res_scratch[..n2].copy_from_slice(&levels[..n2]);
         } else {
             if transform_skip {
-                transform::dequantize_transform_skip_scaled_into(
+                dequantize_transform_skip_scaled_into_i32(
+                    &self.exec,
                     levels,
                     n,
                     qp_prime,
@@ -2597,7 +2590,8 @@ impl<'cab> FullDecoder<'cab> {
                     &mut self.res_scratch[..n2],
                 );
             } else {
-                transform::dequantize_scaled_into(
+                dequantize_scaled_into_i32(
+                    &self.exec,
                     levels,
                     n,
                     qp_prime,
@@ -2605,7 +2599,7 @@ impl<'cab> FullDecoder<'cab> {
                     scaling,
                     &mut self.deq_scratch[..n2],
                 );
-                transform::inv_transform_into(
+                (self.exec.inv_transform)(
                     &self.deq_scratch[..n2],
                     n,
                     self.bd_c,
@@ -2619,8 +2613,8 @@ impl<'cab> FullDecoder<'cab> {
         if valid_w != 0 && valid_h != 0 {
             let plane = if is_cb { &mut self.cb } else { &mut self.cr };
             if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
-                reconstruct::add_residual_into(
-                    dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+                add_residual_into_i32(
+                    &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
                 );
             }
         }
@@ -2662,6 +2656,7 @@ pub(crate) struct RowFactory {
     sao: (*mut SaoCtb, usize),
     sps: Sps,
     pps: Pps,
+    exec: ExecContext,
     w: usize,
     h: usize,
     cw: usize,
@@ -2725,6 +2720,7 @@ impl RowFactory {
             ictx,
             sps: self.sps.clone(),
             pps: self.pps.clone(),
+            exec: self.exec,
             y: mk(self.y),
             cb: mk(self.cb),
             cr: mk(self.cr),
@@ -2807,6 +2803,138 @@ fn scaling_matrix_from_lists<'a>(
     let matrix_id = component.min(2);
     let (coeffs, dc, flat_16) = lists.matrix(size_id, matrix_id);
     Some(transform::ScalingMatrix::new(coeffs, dc, n, flat_16))
+}
+
+#[inline]
+fn dequantize_scaled_into_i32(
+    exec: &ExecContext,
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    scaling: Option<transform::ScalingMatrix<'_>>,
+    out: &mut [i32],
+) {
+    let params = transform::dequant_params(n, qp_prime, bit_depth);
+    match scaling {
+        Some(scaling) if !scaling.is_flat_16() => {
+            (exec.dequant_scaled)(levels, n, params, scaling, out)
+        }
+        _ => (exec.dequant)(levels, n, params, out),
+    }
+}
+
+#[inline]
+fn dequantize_scaled_into_i16(
+    exec: &ExecContext,
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    scaling: Option<transform::ScalingMatrix<'_>>,
+    out: &mut [i16],
+) {
+    let params = transform::dequant_params(n, qp_prime, bit_depth);
+    match scaling {
+        Some(scaling) if !scaling.is_flat_16() => {
+            (exec.dequant_scaled16)(levels, n, params, scaling, out)
+        }
+        _ => (exec.dequant16)(levels, n, params, out),
+    }
+}
+
+#[inline]
+fn dequantize_transform_skip_scaled_into_i32(
+    exec: &ExecContext,
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    scaling: Option<transform::ScalingMatrix<'_>>,
+    out: &mut [i32],
+) {
+    debug_assert!(
+        n == 4,
+        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
+    );
+    let params = transform::transform_skip_params(n, qp_prime, bit_depth);
+    match scaling {
+        Some(scaling) if !scaling.is_flat_16() => {
+            (exec.dequant_skip_scaled)(levels, n, params, scaling, out)
+        }
+        _ => (exec.dequant_skip)(levels, n, params, out),
+    }
+}
+
+#[inline]
+fn dequantize_transform_skip_scaled_into_i16(
+    exec: &ExecContext,
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    scaling: Option<transform::ScalingMatrix<'_>>,
+    out: &mut [i16],
+) {
+    debug_assert!(
+        n == 4,
+        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
+    );
+    let params = transform::transform_skip_params(n, qp_prime, bit_depth);
+    match scaling {
+        Some(scaling) if !scaling.is_flat_16() => {
+            (exec.dequant_skip_scaled16)(levels, n, params, scaling, out)
+        }
+        _ => (exec.dequant_skip16)(levels, n, params, out),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn add_residual_into_i32(
+    exec: &ExecContext,
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i32],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    if !crate::reconstruct::can_reconstruct_full_block(
+        dst, stride, pred, res, n, valid_w, valid_h, bit_depth,
+    ) {
+        crate::reconstruct::add_residual_into_scalar(
+            dst, stride, pred, res, n, valid_w, valid_h, bit_depth,
+        );
+        return;
+    }
+    (exec.reconstruct)(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn add_residual_into_i16(
+    exec: &ExecContext,
+    dst: &mut [u16],
+    stride: usize,
+    pred: &[u16],
+    res: &[i16],
+    n: usize,
+    valid_w: usize,
+    valid_h: usize,
+    bit_depth: u8,
+) {
+    if !crate::reconstruct::can_reconstruct_full_block(
+        dst, stride, pred, res, n, valid_w, valid_h, bit_depth,
+    ) {
+        crate::reconstruct::add_residual_into_scalar16(
+            dst, stride, pred, res, n, valid_w, valid_h, bit_depth,
+        );
+        return;
+    }
+    (exec.reconstruct16)(dst, stride, pred, res, n, valid_w, valid_h, bit_depth);
 }
 
 /// Chroma QP mapping (Table 8-10). The input qPi is a nominal signed QP, so
