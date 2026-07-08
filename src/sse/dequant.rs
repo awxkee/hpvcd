@@ -113,72 +113,53 @@ fn store_i16x8(dst: &mut [i16; 8], v: __m128i) {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn sra_epi32(v: __m128i, shift: i32) -> __m128i {
-    _mm_sra_epi32(v, _mm_cvtsi32_si128(shift))
+fn sra_epi32_count(v: __m128i, shift: __m128i) -> __m128i {
+    _mm_sra_epi32(v, shift)
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn shl_epi32(v: __m128i, shift: i32) -> __m128i {
-    _mm_sll_epi32(v, _mm_cvtsi32_si128(shift))
+fn shl_epi32_count(v: __m128i, shift: __m128i) -> __m128i {
+    _mm_sll_epi32(v, shift)
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn clip_i16_s32x4(v: __m128i) -> __m128i {
-    _mm_max_epi32(
-        _mm_min_epi32(v, _mm_set1_epi32(32767)),
-        _mm_set1_epi32(-32768),
-    )
+fn clip_i16_s32x4_with(v: __m128i, lo: __m128i, hi: __m128i) -> __m128i {
+    _mm_max_epi32(_mm_min_epi32(v, hi), lo)
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn dequant4_sse41(levels: &[i32; 4], params: DequantParams) -> __m128i {
+fn dequant4_sse41_const(
+    levels: &[i32; 4],
+    factor: __m128i,
+    add: __m128i,
+    shift: __m128i,
+    clip_lo: __m128i,
+    clip_hi: __m128i,
+) -> __m128i {
     let v = load_i32x4(levels);
-    let v = _mm_mullo_epi32(v, _mm_set1_epi32(params.factor as i32));
-    let v = _mm_add_epi32(v, _mm_set1_epi32(params.add as i32));
-    clip_i16_s32x4(sra_epi32(v, params.shift))
+    let v = _mm_mullo_epi32(v, factor);
+    let v = _mm_add_epi32(v, add);
+    clip_i16_s32x4_with(sra_epi32_count(v, shift), clip_lo, clip_hi)
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn dequant4_scaled_sse41(levels: &[i32; 4], factors: &[i32; 4], params: DequantParams) -> __m128i {
+fn dequant4_scaled_sse41_const(
+    levels: &[i32; 4],
+    factors: &[i32; 4],
+    add: __m128i,
+    shift: __m128i,
+    clip_lo: __m128i,
+    clip_hi: __m128i,
+) -> __m128i {
     let v = load_i32x4(levels);
     let f = load_i32x4(factors);
     let v = _mm_mullo_epi32(v, f);
-    let v = _mm_add_epi32(v, _mm_set1_epi32(params.add as i32));
-    clip_i16_s32x4(sra_epi32(v, params.shift))
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn transform_skip4_sse41(levels: &[i32; 4], params: TransformSkipParams) -> __m128i {
-    let deq = dequant4_sse41(levels, params.dequant);
-    let shifted = if params.tr_shift >= 0 {
-        let v = _mm_add_epi32(deq, _mm_set1_epi32(params.tr_add));
-        sra_epi32(v, params.tr_shift)
-    } else {
-        shl_epi32(deq, -params.tr_shift)
-    };
-    clip_i16_s32x4(shifted)
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn transform_skip4_scaled_sse41(
-    levels: &[i32; 4],
-    factors: &[i32; 4],
-    params: TransformSkipParams,
-) -> __m128i {
-    let deq = dequant4_scaled_sse41(levels, factors, params.dequant);
-    let shifted = if params.tr_shift >= 0 {
-        let v = _mm_add_epi32(deq, _mm_set1_epi32(params.tr_add));
-        sra_epi32(v, params.tr_shift)
-    } else {
-        shl_epi32(deq, -params.tr_shift)
-    };
-    clip_i16_s32x4(shifted)
+    let v = _mm_add_epi32(v, add);
+    clip_i16_s32x4_with(sra_epi32_count(v, shift), clip_lo, clip_hi)
 }
 
 #[target_feature(enable = "sse4.1")]
@@ -187,8 +168,31 @@ fn dequantize_into_sse41_impl(levels: &[i32], n: usize, params: DequantParams, o
     let (levels, _) = levels[..count].as_chunks::<4>();
     let (out, _) = out[..count].as_chunks_mut::<4>();
 
-    for (src, dst) in levels.iter().zip(out.iter_mut()) {
-        store_i32x4(dst, dequant4_sse41(src, params));
+    let factor = _mm_set1_epi32(params.factor as i32);
+    let add = _mm_set1_epi32(params.add as i32);
+    let shift = _mm_cvtsi32_si128(params.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<4>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<4>();
+
+    for (src, dst) in level_groups.iter().zip(out_groups.iter_mut()) {
+        let v0 = dequant4_sse41_const(&src[0], factor, add, shift, clip_lo, clip_hi);
+        let v1 = dequant4_sse41_const(&src[1], factor, add, shift, clip_lo, clip_hi);
+        let v2 = dequant4_sse41_const(&src[2], factor, add, shift, clip_lo, clip_hi);
+        let v3 = dequant4_sse41_const(&src[3], factor, add, shift, clip_lo, clip_hi);
+        store_i32x4(&mut dst[0], v0);
+        store_i32x4(&mut dst[1], v1);
+        store_i32x4(&mut dst[2], v2);
+        store_i32x4(&mut dst[3], v3);
+    }
+
+    for (src, dst) in level_tail.iter().zip(out_tail.iter_mut()) {
+        store_i32x4(
+            dst,
+            dequant4_sse41_const(src, factor, add, shift, clip_lo, clip_hi),
+        );
     }
 }
 
@@ -198,10 +202,30 @@ fn dequantize_into_sse41_16_impl(levels: &[i32], n: usize, params: DequantParams
     let (levels, _) = levels[..count].as_chunks::<8>();
     let (out, _) = out[..count].as_chunks_mut::<8>();
 
-    for (src, dst) in levels.iter().zip(out.iter_mut()) {
+    let factor = _mm_set1_epi32(params.factor as i32);
+    let add = _mm_set1_epi32(params.add as i32);
+    let shift = _mm_cvtsi32_si128(params.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<2>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<2>();
+
+    for (src, dst) in level_groups.iter().zip(out_groups.iter_mut()) {
+        let (src0, _) = src[0].as_chunks::<4>();
+        let (src1, _) = src[1].as_chunks::<4>();
+        let lo0 = dequant4_sse41_const(&src0[0], factor, add, shift, clip_lo, clip_hi);
+        let hi0 = dequant4_sse41_const(&src0[1], factor, add, shift, clip_lo, clip_hi);
+        let lo1 = dequant4_sse41_const(&src1[0], factor, add, shift, clip_lo, clip_hi);
+        let hi1 = dequant4_sse41_const(&src1[1], factor, add, shift, clip_lo, clip_hi);
+        store_i16x8(&mut dst[0], _mm_packs_epi32(lo0, hi0));
+        store_i16x8(&mut dst[1], _mm_packs_epi32(lo1, hi1));
+    }
+
+    for (src, dst) in level_tail.iter().zip(out_tail.iter_mut()) {
         let (src4, _) = src.as_chunks::<4>();
-        let lo = dequant4_sse41(&src4[0], params);
-        let hi = dequant4_sse41(&src4[1], params);
+        let lo = dequant4_sse41_const(&src4[0], factor, add, shift, clip_lo, clip_hi);
+        let hi = dequant4_sse41_const(&src4[1], factor, add, shift, clip_lo, clip_hi);
         store_i16x8(dst, _mm_packs_epi32(lo, hi));
     }
 }
@@ -217,9 +241,39 @@ fn dequantize_transform_skip_into_sse41_impl(
     let (levels, _) = levels[..16].as_chunks::<4>();
     let (out, _) = out[..16].as_chunks_mut::<4>();
 
-    for (src, dst) in levels.iter().zip(out.iter_mut()) {
-        store_i32x4(dst, transform_skip4_sse41(src, params));
+    let factor = _mm_set1_epi32(params.dequant.factor as i32);
+    let add = _mm_set1_epi32(params.dequant.add as i32);
+    let shift = _mm_cvtsi32_si128(params.dequant.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+    let tr_add = _mm_set1_epi32(params.tr_add);
+    let tr_shift = _mm_cvtsi32_si128(params.tr_shift.abs());
+
+    let d0 = dequant4_sse41_const(&levels[0], factor, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_sse41_const(&levels[1], factor, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_sse41_const(&levels[2], factor, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_sse41_const(&levels[3], factor, add, shift, clip_lo, clip_hi);
+
+    let v0;
+    let v1;
+    let v2;
+    let v3;
+    if params.tr_shift >= 0 {
+        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
+        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
+        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
+        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    } else {
+        v0 = shl_epi32_count(d0, tr_shift);
+        v1 = shl_epi32_count(d1, tr_shift);
+        v2 = shl_epi32_count(d2, tr_shift);
+        v3 = shl_epi32_count(d3, tr_shift);
     }
+
+    store_i32x4(&mut out[0], clip_i16_s32x4_with(v0, clip_lo, clip_hi));
+    store_i32x4(&mut out[1], clip_i16_s32x4_with(v1, clip_lo, clip_hi));
+    store_i32x4(&mut out[2], clip_i16_s32x4_with(v2, clip_lo, clip_hi));
+    store_i32x4(&mut out[3], clip_i16_s32x4_with(v3, clip_lo, clip_hi));
 }
 
 #[target_feature(enable = "sse4.1")]
@@ -233,12 +287,43 @@ fn dequantize_transform_skip_into_sse41_16_impl(
     let (levels, _) = levels[..16].as_chunks::<8>();
     let (out, _) = out[..16].as_chunks_mut::<8>();
 
-    for (src, dst) in levels.iter().zip(out.iter_mut()) {
-        let (src4, _) = src.as_chunks::<4>();
-        let lo = transform_skip4_sse41(&src4[0], params);
-        let hi = transform_skip4_sse41(&src4[1], params);
-        store_i16x8(dst, _mm_packs_epi32(lo, hi));
+    let factor = _mm_set1_epi32(params.dequant.factor as i32);
+    let add = _mm_set1_epi32(params.dequant.add as i32);
+    let shift = _mm_cvtsi32_si128(params.dequant.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+    let tr_add = _mm_set1_epi32(params.tr_add);
+    let tr_shift = _mm_cvtsi32_si128(params.tr_shift.abs());
+
+    let (src0, _) = levels[0].as_chunks::<4>();
+    let (src1, _) = levels[1].as_chunks::<4>();
+    let d0 = dequant4_sse41_const(&src0[0], factor, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_sse41_const(&src0[1], factor, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_sse41_const(&src1[0], factor, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_sse41_const(&src1[1], factor, add, shift, clip_lo, clip_hi);
+
+    let v0;
+    let v1;
+    let v2;
+    let v3;
+    if params.tr_shift >= 0 {
+        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
+        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
+        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
+        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    } else {
+        v0 = shl_epi32_count(d0, tr_shift);
+        v1 = shl_epi32_count(d1, tr_shift);
+        v2 = shl_epi32_count(d2, tr_shift);
+        v3 = shl_epi32_count(d3, tr_shift);
     }
+
+    let lo = clip_i16_s32x4_with(v0, clip_lo, clip_hi);
+    let hi = clip_i16_s32x4_with(v1, clip_lo, clip_hi);
+    store_i16x8(&mut out[0], _mm_packs_epi32(lo, hi));
+    let lo = clip_i16_s32x4_with(v2, clip_lo, clip_hi);
+    let hi = clip_i16_s32x4_with(v3, clip_lo, clip_hi);
+    store_i16x8(&mut out[1], _mm_packs_epi32(lo, hi));
 }
 
 #[target_feature(enable = "sse4.1")]
@@ -254,9 +339,37 @@ fn dequantize_scaled_into_sse41_impl(
     let (levels, _) = levels[..count].as_chunks::<4>();
     let (out, _) = out[..count].as_chunks_mut::<4>();
 
-    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
-        let factors = scaling_factors4(base_factor, scaling, block_idx * 4);
-        store_i32x4(dst, dequant4_scaled_sse41(src, &factors, params));
+    let add = _mm_set1_epi32(params.add as i32);
+    let shift = _mm_cvtsi32_si128(params.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<4>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<4>();
+
+    for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
+        let idx = group_idx * 16;
+        let f0 = scaling_factors4(base_factor, scaling, idx);
+        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
+        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
+        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let v0 = dequant4_scaled_sse41_const(&src[0], &f0, add, shift, clip_lo, clip_hi);
+        let v1 = dequant4_scaled_sse41_const(&src[1], &f1, add, shift, clip_lo, clip_hi);
+        let v2 = dequant4_scaled_sse41_const(&src[2], &f2, add, shift, clip_lo, clip_hi);
+        let v3 = dequant4_scaled_sse41_const(&src[3], &f3, add, shift, clip_lo, clip_hi);
+        store_i32x4(&mut dst[0], v0);
+        store_i32x4(&mut dst[1], v1);
+        store_i32x4(&mut dst[2], v2);
+        store_i32x4(&mut dst[3], v3);
+    }
+
+    let tail_base = level_groups.len() * 16;
+    for (block_idx, (src, dst)) in level_tail.iter().zip(out_tail.iter_mut()).enumerate() {
+        let factors = scaling_factors4(base_factor, scaling, tail_base + block_idx * 4);
+        store_i32x4(
+            dst,
+            dequant4_scaled_sse41_const(src, &factors, add, shift, clip_lo, clip_hi),
+        );
     }
 }
 
@@ -273,13 +386,38 @@ fn dequantize_scaled_into_sse41_16_impl(
     let (levels, _) = levels[..count].as_chunks::<8>();
     let (out, _) = out[..count].as_chunks_mut::<8>();
 
-    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
+    let add = _mm_set1_epi32(params.add as i32);
+    let shift = _mm_cvtsi32_si128(params.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<2>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<2>();
+
+    for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
+        let idx = group_idx * 16;
+        let (src0, _) = src[0].as_chunks::<4>();
+        let (src1, _) = src[1].as_chunks::<4>();
+        let f0 = scaling_factors4(base_factor, scaling, idx);
+        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
+        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
+        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let lo0 = dequant4_scaled_sse41_const(&src0[0], &f0, add, shift, clip_lo, clip_hi);
+        let hi0 = dequant4_scaled_sse41_const(&src0[1], &f1, add, shift, clip_lo, clip_hi);
+        let lo1 = dequant4_scaled_sse41_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
+        let hi1 = dequant4_scaled_sse41_const(&src1[1], &f3, add, shift, clip_lo, clip_hi);
+        store_i16x8(&mut dst[0], _mm_packs_epi32(lo0, hi0));
+        store_i16x8(&mut dst[1], _mm_packs_epi32(lo1, hi1));
+    }
+
+    let tail_base = level_groups.len() * 16;
+    for (block_idx, (src, dst)) in level_tail.iter().zip(out_tail.iter_mut()).enumerate() {
         let (src4, _) = src.as_chunks::<4>();
-        let idx = block_idx * 8;
+        let idx = tail_base + block_idx * 8;
         let factors_lo = scaling_factors4(base_factor, scaling, idx);
         let factors_hi = scaling_factors4(base_factor, scaling, idx + 4);
-        let lo = dequant4_scaled_sse41(&src4[0], &factors_lo, params);
-        let hi = dequant4_scaled_sse41(&src4[1], &factors_hi, params);
+        let lo = dequant4_scaled_sse41_const(&src4[0], &factors_lo, add, shift, clip_lo, clip_hi);
+        let hi = dequant4_scaled_sse41_const(&src4[1], &factors_hi, add, shift, clip_lo, clip_hi);
         store_i16x8(dst, _mm_packs_epi32(lo, hi));
     }
 }
@@ -297,10 +435,42 @@ fn dequantize_transform_skip_scaled_into_sse41_impl(
     let (levels, _) = levels[..16].as_chunks::<4>();
     let (out, _) = out[..16].as_chunks_mut::<4>();
 
-    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
-        let factors = scaling_factors4(base_factor, scaling, block_idx * 4);
-        store_i32x4(dst, transform_skip4_scaled_sse41(src, &factors, params));
+    let add = _mm_set1_epi32(params.dequant.add as i32);
+    let shift = _mm_cvtsi32_si128(params.dequant.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+    let tr_add = _mm_set1_epi32(params.tr_add);
+    let tr_shift = _mm_cvtsi32_si128(params.tr_shift.abs());
+
+    let f0 = scaling_factors4(base_factor, scaling, 0);
+    let f1 = scaling_factors4(base_factor, scaling, 4);
+    let f2 = scaling_factors4(base_factor, scaling, 8);
+    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let d0 = dequant4_scaled_sse41_const(&levels[0], &f0, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_scaled_sse41_const(&levels[1], &f1, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_scaled_sse41_const(&levels[2], &f2, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_scaled_sse41_const(&levels[3], &f3, add, shift, clip_lo, clip_hi);
+
+    let v0;
+    let v1;
+    let v2;
+    let v3;
+    if params.tr_shift >= 0 {
+        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
+        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
+        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
+        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    } else {
+        v0 = shl_epi32_count(d0, tr_shift);
+        v1 = shl_epi32_count(d1, tr_shift);
+        v2 = shl_epi32_count(d2, tr_shift);
+        v3 = shl_epi32_count(d3, tr_shift);
     }
+
+    store_i32x4(&mut out[0], clip_i16_s32x4_with(v0, clip_lo, clip_hi));
+    store_i32x4(&mut out[1], clip_i16_s32x4_with(v1, clip_lo, clip_hi));
+    store_i32x4(&mut out[2], clip_i16_s32x4_with(v2, clip_lo, clip_hi));
+    store_i32x4(&mut out[3], clip_i16_s32x4_with(v3, clip_lo, clip_hi));
 }
 
 #[target_feature(enable = "sse4.1")]
@@ -316,15 +486,46 @@ fn dequantize_transform_skip_scaled_into_sse41_16_impl(
     let (levels, _) = levels[..16].as_chunks::<8>();
     let (out, _) = out[..16].as_chunks_mut::<8>();
 
-    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
-        let (src4, _) = src.as_chunks::<4>();
-        let idx = block_idx * 8;
-        let factors_lo = scaling_factors4(base_factor, scaling, idx);
-        let factors_hi = scaling_factors4(base_factor, scaling, idx + 4);
-        let lo = transform_skip4_scaled_sse41(&src4[0], &factors_lo, params);
-        let hi = transform_skip4_scaled_sse41(&src4[1], &factors_hi, params);
-        store_i16x8(dst, _mm_packs_epi32(lo, hi));
+    let add = _mm_set1_epi32(params.dequant.add as i32);
+    let shift = _mm_cvtsi32_si128(params.dequant.shift);
+    let clip_lo = _mm_set1_epi32(-32768);
+    let clip_hi = _mm_set1_epi32(32767);
+    let tr_add = _mm_set1_epi32(params.tr_add);
+    let tr_shift = _mm_cvtsi32_si128(params.tr_shift.abs());
+
+    let (src0, _) = levels[0].as_chunks::<4>();
+    let (src1, _) = levels[1].as_chunks::<4>();
+    let f0 = scaling_factors4(base_factor, scaling, 0);
+    let f1 = scaling_factors4(base_factor, scaling, 4);
+    let f2 = scaling_factors4(base_factor, scaling, 8);
+    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let d0 = dequant4_scaled_sse41_const(&src0[0], &f0, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_scaled_sse41_const(&src0[1], &f1, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_scaled_sse41_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_scaled_sse41_const(&src1[1], &f3, add, shift, clip_lo, clip_hi);
+
+    let v0;
+    let v1;
+    let v2;
+    let v3;
+    if params.tr_shift >= 0 {
+        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
+        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
+        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
+        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    } else {
+        v0 = shl_epi32_count(d0, tr_shift);
+        v1 = shl_epi32_count(d1, tr_shift);
+        v2 = shl_epi32_count(d2, tr_shift);
+        v3 = shl_epi32_count(d3, tr_shift);
     }
+
+    let lo = clip_i16_s32x4_with(v0, clip_lo, clip_hi);
+    let hi = clip_i16_s32x4_with(v1, clip_lo, clip_hi);
+    store_i16x8(&mut out[0], _mm_packs_epi32(lo, hi));
+    let lo = clip_i16_s32x4_with(v2, clip_lo, clip_hi);
+    let hi = clip_i16_s32x4_with(v3, clip_lo, clip_hi);
+    store_i16x8(&mut out[1], _mm_packs_epi32(lo, hi));
 }
 
 pub(crate) fn dequantize_into_sse41(

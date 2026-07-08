@@ -89,14 +89,15 @@ fn load_chroma_vertical4x4(
 
     (
         _mm_cvtepu16_epi32(p1p0),
-        _mm_cvtepu16_epi32(_mm_srli_si128::<8>(p1p0)),
+        _mm_unpackhi_epi16(p1p0, _mm_setzero_si128()),
         _mm_cvtepu16_epi32(q0q1),
-        _mm_cvtepu16_epi32(_mm_srli_si128::<8>(q0q1)),
+        _mm_unpackhi_epi16(q0q1, _mm_setzero_si128()),
     )
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
 fn store_chroma_vertical4x4(
     pix: &mut [u16],
     cw: usize,
@@ -370,7 +371,7 @@ fn blend_i32x4(a: __m128i, b: __m128i, mask: __m128i) -> __m128i {
     _mm_blendv_epi8(a, b, mask)
 }
 
-#[allow(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "sse4.1")]
 fn luma_filter4_sse41(
@@ -561,6 +562,7 @@ fn luma_filter4_sse41(
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
 fn luma_horizontal_plane_sse41_impl(
     pix: &mut [u16],
     w: usize,
@@ -602,6 +604,7 @@ fn luma_horizontal_plane_sse41_impl(
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
 fn luma_vertical_plane_sse41_impl(
     pix: &mut [u16],
     w: usize,

@@ -83,7 +83,7 @@ fn band_offset8_sse41(
     let old = unsafe { _mm_loadu_si128(dst.as_ptr().cast::<__m128i>()) };
     let s = unsafe { _mm_loadu_si128(src.as_ptr().cast::<__m128i>()) };
     let lo = _mm_cvtepu16_epi32(s);
-    let hi = _mm_cvtepu16_epi32(_mm_srli_si128::<8>(s));
+    let hi = _mm_unpackhi_epi16(s, _mm_setzero_si128());
     let (lo, mlo) = band_offset4_sse41(lo, offsets, band_pos, shift, zero, max);
     let (hi, mhi) = band_offset4_sse41(hi, offsets, band_pos, shift, zero, max);
     let out = _mm_packus_epi32(lo, hi);
@@ -185,11 +185,11 @@ fn edge_offset8_sse41(
     let b = unsafe { _mm_loadu_si128(n2.as_ptr().cast::<__m128i>()) };
 
     let s_lo = _mm_cvtepu16_epi32(s);
-    let s_hi = _mm_cvtepu16_epi32(_mm_srli_si128::<8>(s));
+    let s_hi = _mm_unpackhi_epi16(s, _mm_setzero_si128());
     let a_lo = _mm_cvtepu16_epi32(a);
-    let a_hi = _mm_cvtepu16_epi32(_mm_srli_si128::<8>(a));
+    let a_hi = _mm_unpackhi_epi16(a, _mm_setzero_si128());
     let b_lo = _mm_cvtepu16_epi32(b);
-    let b_hi = _mm_cvtepu16_epi32(_mm_srli_si128::<8>(b));
+    let b_hi = _mm_unpackhi_epi16(b, _mm_setzero_si128());
 
     let (lo, mlo) = edge_offset4_sse41(s_lo, a_lo, b_lo, offsets, zero, max);
     let (hi, mhi) = edge_offset4_sse41(s_hi, a_hi, b_hi, offsets, zero, max);

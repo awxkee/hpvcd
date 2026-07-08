@@ -119,8 +119,20 @@ fn nx_lanes(n: usize, base: usize) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn u16x8_lo_to_i32x4(v: __m128i, zero: __m128i) -> __m128i {
+    _mm_unpacklo_epi16(v, zero)
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn u16x8_hi_to_i32x4(v: __m128i, zero: __m128i) -> __m128i {
+    _mm_unpackhi_epi16(v, zero)
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 #[allow(clippy::too_many_arguments)]
-fn planar4_sse41(
+fn planar4_wide_sse41(
     above: __m128i,
     x: usize,
     n: usize,
@@ -131,7 +143,6 @@ fn planar4_sse41(
     add: i32,
     shift: i32,
 ) -> __m128i {
-    let above = _mm_cvtepu16_epi32(above);
     let h = _mm_add_epi32(
         _mm_mullo_epi32(nx_lanes(n, x), _mm_set1_epi32(left_y)),
         mul_const(x_lanes(x), tr),
@@ -155,11 +166,12 @@ fn store_planar_row_sse41(
     let add = n as i32;
     let ny = (n - 1 - y) as i32;
     let bl_part = (y + 1) as i32 * bl;
+    let zero = _mm_setzero_si128();
 
     if n == 2 {
-        let a = load_u16x4(&above[1..]);
-        let lo = planar4_sse41(a, 0, n, left_y, tr, bl_part, ny, add, shift);
-        store_u16x2(out, pack_u16x8(lo, _mm_setzero_si128()));
+        let a = u16x8_lo_to_i32x4(load_u16x4(&above[1..]), zero);
+        let lo = planar4_wide_sse41(a, 0, n, left_y, tr, bl_part, ny, add, shift);
+        store_u16x2(out, pack_u16x8(lo, zero));
         return;
     }
 
@@ -170,9 +182,19 @@ fn store_planar_row_sse41(
         let x = block * 16;
         let a0 = load_u16x8(&a[..]);
         let a1 = load_u16x8(&a[8..]);
-        let lo0 = planar4_sse41(a0, x, n, left_y, tr, bl_part, ny, add, shift);
-        let hi0 = planar4_sse41(
-            _mm_srli_si128::<8>(a0),
+        let lo0 = planar4_wide_sse41(
+            u16x8_lo_to_i32x4(a0, zero),
+            x,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        let hi0 = planar4_wide_sse41(
+            u16x8_hi_to_i32x4(a0, zero),
             x + 4,
             n,
             left_y,
@@ -182,9 +204,19 @@ fn store_planar_row_sse41(
             add,
             shift,
         );
-        let lo1 = planar4_sse41(a1, x + 8, n, left_y, tr, bl_part, ny, add, shift);
-        let hi1 = planar4_sse41(
-            _mm_srli_si128::<8>(a1),
+        let lo1 = planar4_wide_sse41(
+            u16x8_lo_to_i32x4(a1, zero),
+            x + 8,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        let hi1 = planar4_wide_sse41(
+            u16x8_hi_to_i32x4(a1, zero),
             x + 12,
             n,
             left_y,
@@ -204,9 +236,19 @@ fn store_planar_row_sse41(
     for (block, (a, dst)) in above8.iter().zip(out8.iter_mut()).enumerate() {
         let x = x8_base + block * 8;
         let a = load_u16x8(&a[..]);
-        let lo = planar4_sse41(a, x, n, left_y, tr, bl_part, ny, add, shift);
-        let hi = planar4_sse41(
-            _mm_srli_si128::<8>(a),
+        let lo = planar4_wide_sse41(
+            u16x8_lo_to_i32x4(a, zero),
+            x,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        let hi = planar4_wide_sse41(
+            u16x8_hi_to_i32x4(a, zero),
             x + 4,
             n,
             left_y,
@@ -221,9 +263,9 @@ fn store_planar_row_sse41(
 
     if !above_tail.is_empty() {
         let x = x8_base + above8.len() * 8;
-        let a = load_u16x8(&above[1 + x..]);
-        let lo = planar4_sse41(a, x, n, left_y, tr, bl_part, ny, add, shift);
-        store_u16x4(out_tail, pack_u16x8(lo, _mm_setzero_si128()));
+        let a = u16x8_lo_to_i32x4(load_u16x8(&above[1 + x..]), zero);
+        let lo = planar4_wide_sse41(a, x, n, left_y, tr, bl_part, ny, add, shift);
+        store_u16x4(out_tail, pack_u16x8(lo, zero));
     }
 }
 

@@ -432,7 +432,7 @@ impl<'cab> FullDecoder<'cab> {
             sao: (self.sao.as_mut_ptr(), self.sao.len()),
             sps: self.sps.clone(),
             pps: self.pps.clone(),
-            exec: self.exec,
+            exec: self.exec.clone(),
             w: self.w,
             h: self.h,
             cw: self.cw,
@@ -723,7 +723,7 @@ impl<'cab> FullDecoder<'cab> {
         let cb = self.cb.take_vec();
         let cr = self.cr.take_vec();
         let ctx = crate::deblock::DeblockCtx {
-            exec: self.exec,
+            exec: self.exec.clone(),
             w: self.w,
             h: self.h,
             cw: self.cw,
@@ -1143,7 +1143,7 @@ impl<'cab> FullDecoder<'cab> {
             })
             .collect();
         let ctx = crate::sao::SaoPlanesCtx {
-            exec: self.exec,
+            exec: self.exec.clone(),
             params: &params,
             ctb_cols: self.ctb_cols,
             ctb_rows: self.ctb_rows,
@@ -1867,6 +1867,7 @@ impl<'cab> FullDecoder<'cab> {
             let (transform_skip, max_x, _last_y) = residual_coding(
                 &mut self.cab,
                 &mut self.ctx,
+                self.exec.residual_scans,
                 log2_ts,
                 true,
                 scan,
@@ -2325,6 +2326,7 @@ impl<'cab> FullDecoder<'cab> {
                 let (transform_skip, max_x, _) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
+                    self.exec.residual_scans,
                     clog2,
                     false,
                     scan,
@@ -2369,6 +2371,7 @@ impl<'cab> FullDecoder<'cab> {
                 let (transform_skip, max_x, _) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
+                    self.exec.residual_scans,
                     clog2,
                     false,
                     scan,
@@ -2720,7 +2723,7 @@ impl RowFactory {
             ictx,
             sps: self.sps.clone(),
             pps: self.pps.clone(),
-            exec: self.exec,
+            exec: self.exec.clone(),
             y: mk(self.y),
             cb: mk(self.cb),
             cr: mk(self.cr),

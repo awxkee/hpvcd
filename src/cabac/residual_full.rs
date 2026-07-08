@@ -75,31 +75,71 @@ fn build_scan_order(w: usize, scan_idx: u8) -> Vec<(usize, usize)> {
     out
 }
 
-/// Cached scan tables. Sub-block grids are at most 8×8 and the in-sub-block
-/// scan is always 4×4, so every (width, scan_idx) pair is precomputed once and
-/// returned as a slice — avoiding a per-transform-block heap allocation.
-fn scan_order(w: usize, scan_idx: u8) -> &'static [(usize, usize)] {
-    use std::sync::OnceLock;
-    #[allow(clippy::type_complexity)]
-    static TABLE: OnceLock<Vec<Vec<Vec<(usize, usize)>>>> = OnceLock::new();
-    let t = TABLE.get_or_init(|| {
-        (0..4)
-            .map(|lg| {
-                let w = 1usize << lg;
-                (0..3).map(|s| build_scan_order(w, s as u8)).collect()
-            })
-            .collect()
-    });
-    let lg = w.trailing_zeros() as usize;
-    &t[lg][scan_idx as usize]
+pub(crate) struct ResidualScanTable {
+    order: Vec<(usize, usize)>,
+    index: Vec<u8>,
+    width: usize,
 }
 
-/// Index of position `(px, py)` within a cached scan order.
-#[inline]
-fn scan_index(scan: &[(usize, usize)], px: usize, py: usize) -> usize {
-    scan.iter()
-        .position(|&(x, y)| x == px && y == py)
-        .unwrap_or(0)
+impl ResidualScanTable {
+    #[inline(always)]
+    fn order(&self) -> &[(usize, usize)] {
+        &self.order
+    }
+
+    /// Index of position `(px, py)` within this scan order.
+    #[inline(always)]
+    fn index(&self, px: usize, py: usize) -> usize {
+        if px < self.width && py < self.width {
+            self.index[py * self.width + px] as usize
+        } else {
+            0
+        }
+    }
+}
+
+pub(crate) struct ResidualScanTables {
+    by_log2: Vec<Vec<ResidualScanTable>>,
+}
+
+impl ResidualScanTables {
+    #[inline(always)]
+    fn table(&self, w: usize, scan_idx: u8) -> &ResidualScanTable {
+        let lg = w.trailing_zeros() as usize;
+        &self.by_log2[lg][scan_idx as usize]
+    }
+}
+
+fn build_scan_table(w: usize, scan_idx: u8) -> ResidualScanTable {
+    let order = build_scan_order(w, scan_idx);
+    let mut index = vec![0u8; w * w];
+    for (i, &(x, y)) in order.iter().enumerate() {
+        index[y * w + x] = i as u8;
+    }
+    ResidualScanTable {
+        order,
+        index,
+        width: w,
+    }
+}
+
+/// Cached scan tables. Sub-block grids are at most 8×8 and the in-sub-block
+/// scan is always 4×4, so every (width, scan_idx) pair is precomputed once.
+///
+/// Resolve this once through `ExecContext` and pass the returned reference into
+/// residual coding. That keeps `OnceLock`'s atomic load out of the per-TU path.
+pub(crate) fn resolve_residual_scan_tables() -> &'static ResidualScanTables {
+    use std::sync::OnceLock;
+
+    static TABLES: OnceLock<ResidualScanTables> = OnceLock::new();
+    TABLES.get_or_init(|| ResidualScanTables {
+        by_log2: (0..4)
+            .map(|lg| {
+                let w = 1usize << lg;
+                (0..3).map(|s| build_scan_table(w, s as u8)).collect()
+            })
+            .collect(),
+    })
 }
 
 /// sig_coeff_flag context (§9.3.4.2.5), all sizes.
@@ -236,6 +276,7 @@ static MIN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 pub(crate) fn residual_coding(
     dec: &mut CabacDecoder<'_>,
     ctx: &mut ContextSet,
+    scan_tables: &ResidualScanTables,
     log2_ts: u32,
     is_luma: bool,
     scan_idx: u8,
@@ -278,14 +319,16 @@ pub(crate) fn residual_coding(
     }
     // Scan tables
     let sb_w = (n / 4).max(1);
-    let sb_scan = scan_order(sb_w, scan_idx); // sub-block grid scan
-    let pos_scan = scan_order(4, scan_idx); // within 4×4 sub-block
+    let sb_table = scan_tables.table(sb_w, scan_idx); // sub-block grid scan
+    let pos_table = scan_tables.table(4, scan_idx); // within 4×4 sub-block
+    let sb_scan = sb_table.order();
+    let pos_scan = pos_table.order();
 
     // Find last scan position within its sub-block + which sub-block.
     let last_sbx = last_x >> 2;
     let last_sby = last_y >> 2;
-    let last_sb = scan_index(sb_scan, last_sbx, last_sby);
-    let last_in_sb = scan_index(pos_scan, last_x & 3, last_y & 3);
+    let last_sb = sb_table.index(last_sbx, last_sby);
+    let last_in_sb = pos_table.index(last_x & 3, last_y & 3);
 
     // csbf neighbour tracking
     let mut csbf = [0u8; 64];

@@ -27,11 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{deblock, intra, reconstruct, sao, transform};
+use crate::{cabac, deblock, intra, reconstruct, sao, transform};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ExecContext {
     pub(crate) predict: intra::PredictFn,
+    pub(crate) residual_scans: &'static cabac::ResidualScanTables,
 
     pub(crate) dequant: transform::DequantFn,
     pub(crate) dequant16: transform::DequantFn16,
@@ -71,6 +72,7 @@ impl ExecContext {
     pub(crate) fn new() -> Self {
         Self {
             predict: intra::resolve_predict(),
+            residual_scans: cabac::resolve_residual_scan_tables(),
 
             dequant: transform::resolve_dequant(),
             dequant16: transform::resolve_dequant16(),

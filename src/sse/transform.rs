@@ -75,7 +75,7 @@ fn tr_store_4x4_s32(
     debug_assert!(dst.len() >= (lane_base + 4) * stride);
     debug_assert!(elem_base + 4 <= stride);
     let t = transpose_4x4_s32(v);
-    store_s32x4(&mut dst[(lane_base + 0) * stride + elem_base..], t[0]);
+    store_s32x4(&mut dst[lane_base * stride + elem_base..], t[0]);
     store_s32x4(&mut dst[(lane_base + 1) * stride + elem_base..], t[1]);
     store_s32x4(&mut dst[(lane_base + 2) * stride + elem_base..], t[2]);
     store_s32x4(&mut dst[(lane_base + 3) * stride + elem_base..], t[3]);

@@ -94,6 +94,7 @@ fn load_chroma_vertical4x4(
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn store_chroma_vertical4x4(
     pix: &mut [u16],
     cw: usize,
@@ -308,6 +309,7 @@ fn load_luma_vertical8x4(
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn store_luma_vertical8x4(
     pix: &mut [u16],
     w: usize,
@@ -369,6 +371,7 @@ fn clamp_i32x4(v: int32x4_t, lo: int32x4_t, hi: int32x4_t) -> int32x4_t {
 #[allow(clippy::many_single_char_names)]
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn luma_filter4_neon(
     p3: int32x4_t,
     p2: int32x4_t,
@@ -524,6 +527,7 @@ fn luma_filter4_neon(
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn luma_horizontal_plane_neon_impl(
     pix: &mut [u16],
     w: usize,
@@ -564,6 +568,7 @@ fn luma_horizontal_plane_neon_impl(
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn luma_vertical_plane_neon_impl(
     pix: &mut [u16],
     w: usize,

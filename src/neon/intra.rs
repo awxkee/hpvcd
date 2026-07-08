@@ -99,8 +99,8 @@ fn pack_u16x8(lo: int32x4_t, hi: int32x4_t) -> uint16x8_t {
     )
 }
 
-const X_LANE_OFFSETS: [i32; 4] = [1, 2, 3, 4];
-const NX_LANE_OFFSETS: [i32; 4] = [0, 1, 2, 3];
+static X_LANE_OFFSETS: [i32; 4] = [1, 2, 3, 4];
+static NX_LANE_OFFSETS: [i32; 4] = [0, 1, 2, 3];
 
 #[inline]
 #[target_feature(enable = "neon")]
