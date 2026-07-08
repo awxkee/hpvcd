@@ -168,7 +168,7 @@ fn sig_ctx(
 }
 
 fn decode_last_prefix(
-    dec: &mut CabacDecoder,
+    dec: &mut CabacDecoder<'_>,
     ctx: &mut [super::contexts::CtxModel],
     log2_ts: u32,
     is_luma: bool,
@@ -197,7 +197,7 @@ fn decode_last_prefix(
     group
 }
 
-fn decode_remaining(dec: &mut CabacDecoder, rice: u32) -> u32 {
+fn decode_remaining(dec: &mut CabacDecoder<'_>, rice: u32) -> u32 {
     let mut prefix = 0u32;
     while dec.decode_bypass() != 0 {
         prefix += 1;
@@ -234,7 +234,7 @@ static MIN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 /// Decode residual coefficients for one TU. Returns row-major levels (n×n i32).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_coding(
-    dec: &mut CabacDecoder,
+    dec: &mut CabacDecoder<'_>,
     ctx: &mut ContextSet,
     log2_ts: u32,
     is_luma: bool,
@@ -258,7 +258,7 @@ pub(crate) fn residual_coding(
     // last_sig_coeff position
     let xp = decode_last_prefix(dec, &mut ctx.last_sig_coeff_x_prefix, log2_ts, is_luma);
     let yp = decode_last_prefix(dec, &mut ctx.last_sig_coeff_y_prefix, log2_ts, is_luma);
-    let read_suffix = |dec: &mut CabacDecoder, g: u32| -> u32 {
+    let read_suffix = |dec: &mut CabacDecoder<'_>, g: u32| -> u32 {
         if g <= 3 {
             return 0;
         }

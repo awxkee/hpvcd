@@ -32,6 +32,7 @@ use crate::cabac::{ContextSet, IntraModeContexts};
 use crate::cabac::{SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding};
 use crate::config::{Pps, Sps};
 use crate::error::DecodeError;
+use crate::fast_divide::FastDivU32;
 use crate::fmt::BitDepth;
 use crate::intra;
 use crate::reconstruct;
@@ -46,6 +47,20 @@ const MODE_DC: u8 = 1;
 /// and the diagonal ramp dominate). ~64 CTBs ≈ a 512×512 picture at 64×64 CTBs.
 const WAVEFRONT_MIN_CTBS: usize = 64;
 
+#[inline(always)]
+fn sort3_u8(mut v: [u8; 3]) -> [u8; 3] {
+    if v[1] < v[0] {
+        v.swap(0, 1);
+    }
+    if v[2] < v[1] {
+        v.swap(1, 2);
+    }
+    if v[1] < v[0] {
+        v.swap(0, 1);
+    }
+    v
+}
+
 #[derive(Clone, Default)]
 struct SaoCtb {
     type_idx: [u8; 3], // 0=off,1=band,2=edge
@@ -54,8 +69,8 @@ struct SaoCtb {
     eo_class: [u8; 3],
 }
 
-pub(crate) struct FullDecoder {
-    cab: CabacDecoder,
+pub(crate) struct FullDecoder<'cab> {
+    cab: CabacDecoder<'cab>,
     ctx: ContextSet,
     ictx: IntraModeContexts,
     sps: Sps,
@@ -71,6 +86,8 @@ pub(crate) struct FullDecoder {
     ch: usize, // chroma height
     sub_w: usize,
     sub_h: usize,
+    sub_w_div: FastDivU32,
+    sub_h_div: FastDivU32,
     bd: u8,
     bd_c: u8,
 
@@ -138,7 +155,7 @@ pub(crate) struct FullDecoder {
     strong_smoothing: bool,
 }
 
-impl FullDecoder {
+impl FullDecoder<'static> {
     /// Maximum allowed dimension per axis and pixel count.
     pub(crate) const MAX_DIM: usize = 16_384;
     pub(crate) const MAX_PIXELS: usize = 64 * 1024 * 1024; // 64 MP
@@ -217,6 +234,8 @@ impl FullDecoder {
             ch,
             sub_w,
             sub_h,
+            sub_w_div: FastDivU32::new(sub_w as u32),
+            sub_h_div: FastDivU32::new(sub_h as u32),
             mode_y: crate::plane::Plane::owned(vec![MODE_DC; grid_w * grid_h]),
             decoded: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             tqb: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
@@ -255,7 +274,9 @@ impl FullDecoder {
             pps,
         })
     }
+}
 
+impl<'cab> FullDecoder<'cab> {
     pub(crate) fn decode_segment(
         &mut self,
         cabac: &[u8],
@@ -415,6 +436,8 @@ impl FullDecoder {
             ch: self.ch,
             sub_w: self.sub_w,
             sub_h: self.sub_h,
+            sub_w_div: self.sub_w_div,
+            sub_h_div: self.sub_h_div,
             bd: self.bd,
             bd_c: self.bd_c,
             log2_ctb: self.log2_ctb,
@@ -1140,12 +1163,36 @@ impl FullDecoder {
         self.cr = crate::plane::Plane::owned(cr);
     }
 
+    fn sao_usage(&self) -> ([bool; 3], [bool; 3]) {
+        let mut active = [false; 3];
+        let mut needs_src = [false; 3];
+        for sao in self.sao.iter() {
+            if self.sao_luma {
+                active[0] |= sao.type_idx[0] != 0;
+                needs_src[0] |= sao.type_idx[0] == 2;
+            }
+            if self.sao_chroma && self.cw != 0 && self.ch != 0 {
+                active[1] |= sao.type_idx[1] != 0;
+                active[2] |= sao.type_idx[2] != 0;
+                needs_src[1] |= sao.type_idx[1] == 2;
+                needs_src[2] |= sao.type_idx[2] == 2;
+            }
+        }
+        (active, needs_src)
+    }
+
     fn apply_sao(&mut self) {
         let ctb = 1usize << self.log2_ctb;
-        // Work on clones so EO neighbor lookups always use original values.
-        let orig_y = self.y.to_vec_clone();
-        let orig_cb = self.cb.to_vec_clone();
-        let orig_cr = self.cr.to_vec_clone();
+        let (active, needs_src) = self.sao_usage();
+        if !active.iter().any(|&x| x) {
+            return;
+        }
+
+        // Only EO needs an untouched source snapshot. BO is pointwise and can
+        // run in place, avoiding full-plane clones for common BO-only pictures.
+        let orig_y = needs_src[0].then(|| self.y.to_vec_clone());
+        let orig_cb = needs_src[1].then(|| self.cb.to_vec_clone());
+        let orig_cr = needs_src[2].then(|| self.cr.to_vec_clone());
 
         for ry in 0..self.ctb_rows {
             for rx in 0..self.ctb_cols {
@@ -1158,21 +1205,35 @@ impl FullDecoder {
                 if self.sao_luma && sao.type_idx[0] != 0 {
                     let x_end = (x0 + ctb).min(self.w);
                     let y_end = (y0 + ctb).min(self.h);
-                    Self::apply_sao_plane(
-                        &mut self.y[..],
-                        &orig_y,
-                        self.w,
-                        self.h,
-                        x0,
-                        y0,
-                        x_end,
-                        y_end,
-                        sao.type_idx[0],
-                        &sao.offsets[0],
-                        sao.band_pos[0],
-                        sao.eo_class[0],
-                        self.bd,
-                    );
+                    match sao.type_idx[0] {
+                        1 => crate::sao::apply_sao_band_offset_inplace_scalar(
+                            &mut self.y[..],
+                            self.w,
+                            x0,
+                            y0,
+                            x_end,
+                            y_end,
+                            &sao.offsets[0],
+                            sao.band_pos[0],
+                            self.bd,
+                        ),
+                        2 => Self::apply_sao_plane(
+                            &mut self.y[..],
+                            orig_y.as_deref().expect("SAO EO requires luma snapshot"),
+                            self.w,
+                            self.h,
+                            x0,
+                            y0,
+                            x_end,
+                            y_end,
+                            2,
+                            &sao.offsets[0],
+                            sao.band_pos[0],
+                            sao.eo_class[0],
+                            self.bd,
+                        ),
+                        _ => {}
+                    }
                 }
                 // Chroma (Cb, Cr share eo_class)
                 if self.sao_chroma {
@@ -1183,39 +1244,63 @@ impl FullDecoder {
                     let cx_end = ((x0 + ctb) / self.sub_w).min(cw);
                     let cy_end = ((y0 + ctb) / self.sub_h).min(ch);
 
-                    if sao.type_idx[1] != 0 {
-                        Self::apply_sao_plane(
+                    match sao.type_idx[1] {
+                        1 => crate::sao::apply_sao_band_offset_inplace_scalar(
                             &mut self.cb[..],
-                            &orig_cb,
+                            cw,
+                            cx0,
+                            cy0,
+                            cx_end,
+                            cy_end,
+                            &sao.offsets[1],
+                            sao.band_pos[1],
+                            self.bd_c,
+                        ),
+                        2 => Self::apply_sao_plane(
+                            &mut self.cb[..],
+                            orig_cb.as_deref().expect("SAO EO requires Cb snapshot"),
                             cw,
                             ch,
                             cx0,
                             cy0,
                             cx_end,
                             cy_end,
-                            sao.type_idx[1],
+                            2,
                             &sao.offsets[1],
                             sao.band_pos[1],
                             sao.eo_class[1],
                             self.bd_c,
-                        );
+                        ),
+                        _ => {}
                     }
-                    if sao.type_idx[2] != 0 {
-                        Self::apply_sao_plane(
+                    match sao.type_idx[2] {
+                        1 => crate::sao::apply_sao_band_offset_inplace_scalar(
                             &mut self.cr[..],
-                            &orig_cr,
+                            cw,
+                            cx0,
+                            cy0,
+                            cx_end,
+                            cy_end,
+                            &sao.offsets[2],
+                            sao.band_pos[2],
+                            self.bd_c,
+                        ),
+                        2 => Self::apply_sao_plane(
+                            &mut self.cr[..],
+                            orig_cr.as_deref().expect("SAO EO requires Cr snapshot"),
                             cw,
                             ch,
                             cx0,
                             cy0,
                             cx_end,
                             cy_end,
-                            sao.type_idx[2],
+                            2,
                             &sao.offsets[2],
                             sao.band_pos[2],
                             sao.eo_class[2],
                             self.bd_c,
-                        );
+                        ),
+                        _ => {}
                     }
                 }
             }
@@ -1526,8 +1611,7 @@ impl FullDecoder {
         if prev {
             mpm[val as usize]
         } else {
-            let mut sorted = mpm;
-            sorted.sort_unstable();
+            let sorted = sort3_u8(mpm);
             let mut mode = val;
             for &m in sorted.iter() {
                 if mode >= m {
@@ -1611,7 +1695,7 @@ fn mpm_list(mut cand_a: u8, cand_b: u8, y0: usize, log2_ctb: u32) -> [u8; 3] {
     }
 }
 
-impl FullDecoder {
+impl<'cab> FullDecoder<'cab> {
     #[allow(clippy::too_many_arguments)]
     fn transform_tree(
         &mut self,
@@ -1947,7 +2031,7 @@ fn chroma_scan(mode: u8, log2_ts: u32, is_444: bool) -> u8 {
     }
 }
 
-impl FullDecoder {
+impl<'cab> FullDecoder<'cab> {
     fn luma_avail(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
             return false;
@@ -2167,8 +2251,8 @@ impl FullDecoder {
         let idc = self.sps.chroma_idc;
         let clog2 = if idc == 3 { luma_log2 } else { luma_log2 - 1 };
         let cn = 1usize << clog2;
-        let cx0 = lx / self.sub_w;
-        let cy0 = ly / self.sub_h;
+        let cx0 = ((lx as u32) / self.sub_w_div) as usize;
+        let cy0 = ((ly as u32) / self.sub_h_div) as usize;
         // 4:2:2 stacks two square chroma TBs vertically per luma TB (ChromaArrayType
         // 2); 4:2:0 and 4:4:4 have a single chroma TB. The bitstream codes them
         // component-major: all Cb TBs, then all Cr TBs (HEVC §7.3.8.11). Each TB is
@@ -2181,7 +2265,7 @@ impl FullDecoder {
             self.cur_qp + self.pps.cb_qp_offset + self.slice_cb_qp_offset,
             idc,
         );
-        for (t, &cb) in cbf_cb[0..n_tb].iter().enumerate() {
+        for (t, &cb) in cbf_cb[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cb {
                 let mut coeffs = std::mem::take(&mut self.coeff_scratch);
@@ -2456,6 +2540,8 @@ pub(crate) struct RowFactory {
     ch: usize,
     sub_w: usize,
     sub_h: usize,
+    sub_w_div: FastDivU32,
+    sub_h_div: FastDivU32,
     bd: u8,
     bd_c: u8,
     log2_ctb: u32,
@@ -2492,13 +2578,13 @@ impl RowFactory {
     ///
     /// SAFETY: caller upholds the lag discipline so this row's writes never race
     /// another live row's, and the backing buffers outlive the returned decoder.
-    pub(crate) unsafe fn make(
+    pub(crate) unsafe fn make<'row>(
         &self,
-        row_cabac: &[u8],
+        row_cabac: &'row [u8],
         ctx: ContextSet,
         ictx: IntraModeContexts,
-    ) -> Result<FullDecoder, DecodeError> {
-        let cab = CabacDecoder::new(row_cabac)
+    ) -> Result<FullDecoder<'row>, DecodeError> {
+        let cab = CabacDecoder::new_borrowed(row_cabac)
             .map_err(|_| DecodeError::Bitstream("row cabac init".into()))?;
         let mk = |p: (*mut u16, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
         let mk8 = |p: (*mut u8, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
@@ -2520,6 +2606,8 @@ impl RowFactory {
             ch: self.ch,
             sub_w: self.sub_w,
             sub_h: self.sub_h,
+            sub_w_div: self.sub_w_div,
+            sub_h_div: self.sub_h_div,
             bd: self.bd,
             bd_c: self.bd_c,
             log2_ctb: self.log2_ctb,

@@ -4,7 +4,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let bytes = fs::read("./assets/lossless.heic").unwrap();
+    let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
@@ -14,7 +14,7 @@ fn main() {
         durations.push(elapsed);
     }
 
-    let total: std::time::Duration = durations.iter().sum();
+    /*let total: std::time::Duration = durations.iter().sum();
     let avg = total / durations.len() as u32;
     println!("Average: {:?}", avg);
     let instant = Instant::now();
@@ -50,5 +50,5 @@ fn main() {
         )
         .unwrap(),
     );
-    img.save("./out.jpg").unwrap();
+    img.save("./out.jpg").unwrap();*/
 }

@@ -36,6 +36,7 @@ mod deblock;
 mod decode;
 mod decoder;
 mod error;
+mod fast_divide;
 mod fmt;
 mod heif;
 mod info;
@@ -643,7 +644,7 @@ fn decode_hevc_item(
     // segment is its own VCL NAL and must be reconstructed into the same planes.
     // Non-VCL NALs (VPS/SPS/PPS/SEI, types >= 32) are skipped — parameter sets
     // come from the hvcC box.
-    let mut dec: Option<FullDecoder> = None;
+    let mut dec: Option<FullDecoder<'static>> = None;
     let mut pos = 0;
     while pos + 4 <= sample.len() {
         let nlen = u32::from_be_bytes(sample[pos..pos + 4].try_into().unwrap()) as usize;
@@ -658,7 +659,7 @@ fn decode_hevc_item(
             continue; // non-VCL
         }
 
-        let rbsp = crate::bitreader::unescape_rbsp(nal_bytes);
+        let rbsp = bitreader::unescape_rbsp(nal_bytes);
         let hdr = match parse_slice_header_full(&rbsp, &sps, &pps, nal_type) {
             Ok(h) => h,
             Err(_) => continue, // skip a slice we can't parse rather than failing whole image

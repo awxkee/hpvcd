@@ -112,66 +112,10 @@ pub(crate) fn row_substreams(
     Some(rows)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bitreader::unescape_rbsp_with_map;
-
-    #[test]
-    fn substreams_without_emulation_bytes() {
-        // RBSP == NAL (no 0x00 0x00 03). 3 rows, entry points 4 and 5 bytes.
-        let nal = vec![0xAAu8; 20];
-        let (_rbsp, src_of) = unescape_rbsp_with_map(&nal);
-        // cabac starts at offset 2 (after a 2-byte header, say).
-        let rows = row_substreams(&src_of, 2, &[4, 5], 20, 3).unwrap();
-        assert_eq!(rows[0], RowSubstream { start: 2, end: 6 });
-        assert_eq!(rows[1], RowSubstream { start: 6, end: 11 });
-        assert_eq!(rows[2], RowSubstream { start: 11, end: 20 });
-    }
-
-    #[test]
-    fn wrong_entry_point_count_rejected() {
-        let nal = vec![0xAAu8; 20];
-        let (_r, src_of) = unescape_rbsp_with_map(&nal);
-        // 3 rows need 2 entry points; give 1 → None.
-        assert!(row_substreams(&src_of, 2, &[4], 20, 3).is_none());
-    }
-
-    #[test]
-    fn emulation_bytes_shift_rbsp_offsets() {
-        // NAL: 00 00 03 00 AA ...  the 03 at index 2 is removed.
-        // RBSP indices:        0  1     2  3
-        // src_of:              0  1     3  4 ...
-        let mut nal = vec![0x00, 0x00, 0x03, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        nal.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-        let (rbsp, src_of) = unescape_rbsp_with_map(&nal);
-        // RBSP is one byte shorter than NAL.
-        assert_eq!(rbsp.len(), nal.len() - 1);
-        // Single row: whole payload from cabac offset 0.
-        let rows = row_substreams(&src_of, 0, &[], rbsp.len(), 1).unwrap();
-        assert_eq!(
-            rows[0],
-            RowSubstream {
-                start: 0,
-                end: rbsp.len()
-            }
-        );
-        // Two rows, first sub-stream 5 NAL bytes long starting at NAL 0.
-        // NAL boundary at 5 → RBSP offset: src_of.partition_point(s<5).
-        // src_of = [0,1,3,4,5,6,7,8,9,10,11,12] (index 2 removed).
-        let rows2 = row_substreams(&src_of, 0, &[5], rbsp.len(), 2).unwrap();
-        // NAL offset 5 maps to first RBSP index whose src >= 5 → that's rbsp idx 4.
-        assert_eq!(rows2[0].start, 0);
-        assert_eq!(rows2[0].end, 4);
-        assert_eq!(rows2[1].start, 4);
-        assert_eq!(rows2[1].end, rbsp.len());
-    }
-}
-
 /// Run the WPP wavefront over `template`'s picture. On success `template`'s
 /// planes/grids hold the fully reconstructed (pre-loop-filter) picture.
 pub(crate) fn run_wavefront(
-    template: &mut FullDecoder,
+    template: &mut FullDecoder<'_>,
     rbsp: &[u8],
     rows: &[RowSubstream],
     pool: &ThreadPool,
@@ -287,4 +231,60 @@ fn default_contexts() -> (ContextSet, IntraModeContexts) {
         ContextSet::init_islice(26),
         IntraModeContexts::init_islice(26),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitreader::unescape_rbsp_with_map;
+
+    #[test]
+    fn substreams_without_emulation_bytes() {
+        // RBSP == NAL (no 0x00 0x00 03). 3 rows, entry points 4 and 5 bytes.
+        let nal = vec![0xAAu8; 20];
+        let (_rbsp, src_of) = unescape_rbsp_with_map(&nal);
+        // cabac starts at offset 2 (after a 2-byte header, say).
+        let rows = row_substreams(&src_of, 2, &[4, 5], 20, 3).unwrap();
+        assert_eq!(rows[0], RowSubstream { start: 2, end: 6 });
+        assert_eq!(rows[1], RowSubstream { start: 6, end: 11 });
+        assert_eq!(rows[2], RowSubstream { start: 11, end: 20 });
+    }
+
+    #[test]
+    fn wrong_entry_point_count_rejected() {
+        let nal = vec![0xAAu8; 20];
+        let (_r, src_of) = unescape_rbsp_with_map(&nal);
+        // 3 rows need 2 entry points; give 1 → None.
+        assert!(row_substreams(&src_of, 2, &[4], 20, 3).is_none());
+    }
+
+    #[test]
+    fn emulation_bytes_shift_rbsp_offsets() {
+        // NAL: 00 00 03 00 AA ...  the 03 at index 2 is removed.
+        // RBSP indices:        0  1     2  3
+        // src_of:              0  1     3  4 ...
+        let mut nal = vec![0x00, 0x00, 0x03, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        nal.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let (rbsp, src_of) = unescape_rbsp_with_map(&nal);
+        // RBSP is one byte shorter than NAL.
+        assert_eq!(rbsp.len(), nal.len() - 1);
+        // Single row: whole payload from cabac offset 0.
+        let rows = row_substreams(&src_of, 0, &[], rbsp.len(), 1).unwrap();
+        assert_eq!(
+            rows[0],
+            RowSubstream {
+                start: 0,
+                end: rbsp.len()
+            }
+        );
+        // Two rows, first sub-stream 5 NAL bytes long starting at NAL 0.
+        // NAL boundary at 5 → RBSP offset: src_of.partition_point(s<5).
+        // src_of = [0,1,3,4,5,6,7,8,9,10,11,12] (index 2 removed).
+        let rows2 = row_substreams(&src_of, 0, &[5], rbsp.len(), 2).unwrap();
+        // NAL offset 5 maps to first RBSP index whose src >= 5 → that's rbsp idx 4.
+        assert_eq!(rows2[0].start, 0);
+        assert_eq!(rows2[0].end, 4);
+        assert_eq!(rows2[1].start, 4);
+        assert_eq!(rows2[1].end, rbsp.len());
+    }
 }

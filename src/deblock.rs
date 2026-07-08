@@ -39,10 +39,10 @@
 //!     bands are perfectly disjoint with no halo. CTB alignment (a multiple of
 //!     both 4 and 8) keeps each 4-row filter segment inside one band, so the
 //!     joint `d_total` decision is identical to the serial path.
-//!   * Horizontal pass — an edge at `y=e` writes rows `[e-3, e+2]` and reads
-//!     `[e-4, e+3]`. CTB-aligned bands keep every edge's writes inside one band
-//!     (edges sit at multiples of 8 ≤ CTB), but the ±4 read halo crosses band
-//!     rows, so workers read from a whole-plane snapshot taken before the pass.
+//!   * Horizontal pass — `horiz_bands` places each band boundary in the row gap
+//!     between neighboring horizontal filters. Every edge's read/write footprint
+//!     is therefore inside exactly one band, so the pass runs in place without a
+//!     whole-plane snapshot.
 
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
 
@@ -206,17 +206,16 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
     }
 }
 
-/// Luma horizontal edges writing into global rows `[row0, row1)`. `dst` is that
-/// band (local row 0 == `row0`); `src` is the whole post-vertical plane, read
-/// for the ±4-row halo that crosses band boundaries.
-fn luma_horizontal(ctx: &DeblockCtx<'_>, dst: &mut [u16], src: &[u16], row0: usize, row1: usize) {
+/// Luma horizontal edges writing into global rows `[row0, row1)`. The band is
+/// laid out with local row 0 == `row0`. Horizontal edges are 8 samples apart and
+/// their write spans do not overlap, so the pass is safe in-place; every row the
+/// filter reads for an edge inside this band is also inside this band because
+/// `horiz_bands` places boundaries at the row gap between neighboring edges.
+fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) {
     let w = ctx.w;
     let h = ctx.h;
     let maxv = (1i32 << ctx.bd) - 1;
     let last_full_edge = h.saturating_sub(4);
-    // Edges whose center row lies in this band. An edge at `e` writes rows
-    // [e-3, e+2]; keeping edges with e in [row0, row1) inside CTB-aligned bands
-    // guarantees those writes stay within the band.
     let mut edge = (row0.div_ceil(8) * 8).max(8);
     while edge <= last_full_edge {
         if edge >= row1 {
@@ -240,13 +239,14 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, dst: &mut [u16], src: &[u16], row0: usi
                 scan += 4;
                 continue;
             }
+            let at = |buf: &[u16], gy: usize, x: usize| -> i32 { buf[(gy - row0) * w + x] as i32 };
             let mut d_total = 0i32;
             for c in scan..scan + 4 {
                 if c >= w {
                     break;
                 }
-                let p = |o: usize| src[(edge - 1 - o) * w + c] as i32;
-                let q = |o: usize| src[(edge + o) * w + c] as i32;
+                let p = |o: usize| at(y, edge - 1 - o, c);
+                let q = |o: usize| at(y, edge + o, c);
                 d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
             }
             if d_total >= beta {
@@ -258,24 +258,16 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, dst: &mut [u16], src: &[u16], row0: usi
                     continue;
                 }
                 let (p0, p1, p2, p3) = (
-                    src[(edge - 1) * w + c] as i32,
-                    src[(edge - 2) * w + c] as i32,
-                    src[(edge - 3) * w + c] as i32,
-                    if edge >= 4 {
-                        src[(edge - 4) * w + c] as i32
-                    } else {
-                        0
-                    },
+                    at(y, edge - 1, c),
+                    at(y, edge - 2, c),
+                    at(y, edge - 3, c),
+                    if edge >= 4 { at(y, edge - 4, c) } else { 0 },
                 );
                 let (q0, q1, q2, q3) = (
-                    src[(edge) * w + c] as i32,
-                    src[(edge + 1) * w + c] as i32,
-                    src[(edge + 2) * w + c] as i32,
-                    if edge + 3 < h {
-                        src[(edge + 3) * w + c] as i32
-                    } else {
-                        0
-                    },
+                    at(y, edge, c),
+                    at(y, edge + 1, c),
+                    at(y, edge + 2, c),
+                    if edge + 3 < h { at(y, edge + 3, c) } else { 0 },
                 );
                 let dp = (p2 - 2 * p1 + p0).abs();
                 let dq = (q2 - 2 * q1 + q0).abs();
@@ -283,31 +275,30 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, dst: &mut [u16], src: &[u16], row0: usi
                 let strong = d < (beta >> 2)
                     && (p0 - q0).abs() < (5 * tc + 1) >> 1
                     && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
-                // Write into the band: local row = global row - row0.
                 let put = |dst: &mut [u16], gy: usize, val: i32| {
                     dst[(gy - row0) * w + c] = val.clamp(0, maxv) as u16;
                 };
                 if strong {
-                    put(dst, edge - 1, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-                    put(dst, edge - 2, (p2 + p1 + p0 + q0 + 2) >> 2);
-                    put(dst, edge - 3, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-                    put(dst, edge, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-                    put(dst, edge + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
-                    put(dst, edge + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+                    put(y, edge - 1, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                    put(y, edge - 2, (p2 + p1 + p0 + q0 + 2) >> 2);
+                    put(y, edge - 3, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+                    put(y, edge, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                    put(y, edge + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
+                    put(y, edge + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
                 } else {
                     let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-                    put(dst, edge - 1, p0 + delta);
-                    put(dst, edge, q0 - delta);
+                    put(y, edge - 1, p0 + delta);
+                    put(y, edge, q0 - delta);
                     let thres = (tc * 10 + 1) >> 1;
                     if (2 * (p0 - p1) - delta).abs() < thres {
                         let dp1 =
                             (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-                        put(dst, edge - 2, p1 + dp1);
+                        put(y, edge - 2, p1 + dp1);
                     }
                     if (2 * (q0 - q1) + delta).abs() < thres {
                         let dq1 =
                             (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-                        put(dst, edge + 1, q1 + dq1);
+                        put(y, edge + 1, q1 + dq1);
                     }
                 }
             }
@@ -380,14 +371,13 @@ fn chroma_vertical(
     }
 }
 
-/// Chroma horizontal edges writing chroma rows `[crow0, crow1)`. `src_*` are the
-/// whole post-vertical chroma planes, read for the ±1-row halo.
+/// Chroma horizontal edges writing chroma rows `[crow0, crow1)`. Like the
+/// luma horizontal pass, this is safe in-place because neighboring horizontal
+/// chroma edges are 8 samples apart and write only `[e-1, e]`.
 fn chroma_horizontal(
     ctx: &DeblockCtx<'_>,
-    cb_dst: &mut [u16],
-    cr_dst: &mut [u16],
-    cb_src: &[u16],
-    cr_src: &[u16],
+    cb: &mut [u16],
+    cr: &mut [u16],
     crow0: usize,
     crow1: usize,
 ) {
@@ -423,23 +413,20 @@ fn chroma_horizontal(
                 continue;
             }
             for plane in 0..2 {
-                let (dst, src): (&mut [u16], &[u16]) = if plane == 0 {
-                    (&mut *cb_dst, cb_src)
-                } else {
-                    (&mut *cr_dst, cr_src)
-                };
+                let pix: &mut [u16] = if plane == 0 { &mut *cb } else { &mut *cr };
                 for c in scan..scan + 4 {
                     if c >= cw {
                         continue;
                     }
-                    let p0 = src[(edge - 1) * cw + c] as i32;
-                    let p1 = src[(edge - 2) * cw + c] as i32;
-                    let q0 = src[(edge) * cw + c] as i32;
-                    let q1 = src[(edge + 1) * cw + c] as i32;
+                    let base = |gy: usize| (gy - crow0) * cw + c;
+                    let p0 = pix[base(edge - 1)] as i32;
+                    let p1 = pix[base(edge - 2)] as i32;
+                    let q0 = pix[base(edge)] as i32;
+                    let q1 = pix[base(edge + 1)] as i32;
                     let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc_c, tc_c);
                     if delta != 0 {
-                        dst[(edge - 1 - crow0) * cw + c] = (p0 + delta).clamp(0, maxv_c) as u16;
-                        dst[(edge - crow0) * cw + c] = (q0 - delta).clamp(0, maxv_c) as u16;
+                        pix[base(edge - 1)] = (p0 + delta).clamp(0, maxv_c) as u16;
+                        pix[base(edge)] = (q0 - delta).clamp(0, maxv_c) as u16;
                     }
                 }
             }
@@ -530,15 +517,14 @@ pub(crate) fn apply_deblocking_parallel(
         y = y_dm.into_inner();
     }
 
-    // ---- Luma horizontal: row bands, read from snapshot ----
+    // ---- Luma horizontal: row bands, in place ----
     {
-        let src = y.clone();
         let bands = horiz_bands(ctx.h, ctb);
         let y_dm = DisjointMut::new(std::mem::take(&mut y));
         parallel_for(pool, bands.len(), |bi| {
             let (r0, r1) = bands[bi];
             let mut band = y_dm.slice_mut(r0 * w..r1 * w);
-            luma_horizontal(ctx, &mut band, &src, r0, r1);
+            luma_horizontal(ctx, &mut band, r0, r1);
         });
         y = y_dm.into_inner();
     }
@@ -560,10 +546,8 @@ pub(crate) fn apply_deblocking_parallel(
         cr = cr_dm.into_inner();
     }
 
-    // ---- Chroma horizontal: chroma-row bands, read from snapshot ----
+    // ---- Chroma horizontal: chroma-row bands, in place ----
     if ctx.cw > 0 && ctx.ch > 0 {
-        let cb_src = cb.clone();
-        let cr_src = cr.clone();
         let cband = (ctb / ctx.sub_h).max(1);
         let bands = horiz_bands(ctx.ch, cband);
         let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
@@ -572,7 +556,7 @@ pub(crate) fn apply_deblocking_parallel(
             let (r0, r1) = bands[bi];
             let mut cbb = cb_dm.slice_mut(r0 * cw..r1 * cw);
             let mut crb = cr_dm.slice_mut(r0 * cw..r1 * cw);
-            chroma_horizontal(ctx, &mut cbb, &mut crb, &cb_src, &cr_src, r0, r1);
+            chroma_horizontal(ctx, &mut cbb, &mut crb, r0, r1);
         });
         cb = cb_dm.into_inner();
         cr = cr_dm.into_inner();

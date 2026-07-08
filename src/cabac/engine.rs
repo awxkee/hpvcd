@@ -29,6 +29,8 @@
 
 pub(crate) use crate::cabac::contexts::CtxModel;
 
+use std::borrow::Cow;
+
 #[rustfmt::skip]
 pub(crate) static RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128,176,208,240],[128,167,197,227],[128,158,187,216],[123,150,178,205],
@@ -67,10 +69,10 @@ pub(crate) static TRANS_IDX_LPS: [u8; 64] = [
 
 /// CABAC decoder. Feed it EBSP-unescaped slice payload bytes.
 /// Initialises by consuming 9 seed bits.
-pub(crate) struct CabacDecoder {
+pub(crate) struct CabacDecoder<'a> {
     pub(crate) range: u32,
     pub(crate) offset: u32,
-    data: Box<[u8]>,
+    data: Cow<'a, [u8]>,
     /// Index of the next byte in `data` not yet loaded into `bitbuf`.
     pub(crate) byte_pos: usize,
     /// Bit reservoir, left-aligned: the next bit to consume is bit 63.
@@ -79,8 +81,18 @@ pub(crate) struct CabacDecoder {
     bitcnt: u32,
 }
 
-impl CabacDecoder {
+impl CabacDecoder<'static> {
     pub(crate) fn new(data: &[u8]) -> Result<Self, crate::error::DecodeError> {
+        Self::from_cow(Cow::Owned(data.to_vec()))
+    }
+}
+
+impl<'a> CabacDecoder<'a> {
+    pub(crate) fn new_borrowed(data: &'a [u8]) -> Result<Self, crate::error::DecodeError> {
+        CabacDecoder::from_cow(Cow::Borrowed(data))
+    }
+
+    fn from_cow(data: Cow<'a, [u8]>) -> Result<Self, crate::error::DecodeError> {
         if data.len() < 2 {
             return Err(crate::error::DecodeError::Bitstream(
                 "CABAC payload too short to initialise".into(),
@@ -89,7 +101,7 @@ impl CabacDecoder {
         let mut dec = CabacDecoder {
             range: 510,
             offset: 0,
-            data: data.into(),
+            data,
             byte_pos: 0,
             bitbuf: 0,
             bitcnt: 0,
@@ -98,15 +110,15 @@ impl CabacDecoder {
         Ok(dec)
     }
 
-    /// Reset the engine onto a new byte buffer (e.g. the next slice segment's
-    /// CABAC data) and prime it, reusing this decoder instance.
+    /// Reset the engine onto a new owned byte buffer (e.g. the next slice
+    /// segment's CABAC data) and prime it, reusing this decoder instance.
     pub(crate) fn reset_with(&mut self, data: &[u8]) -> Result<(), crate::error::DecodeError> {
         if data.len() < 2 {
             return Err(crate::error::DecodeError::Bitstream(
                 "CABAC payload too short to initialise".into(),
             ));
         }
-        self.data = data.into();
+        self.data = Cow::Owned(data.to_vec());
         self.range = 510;
         self.offset = 0;
         self.byte_pos = 0;
@@ -224,7 +236,7 @@ impl CabacDecoder {
     }
 }
 
-impl CabacDecoder {
+impl<'a> CabacDecoder<'a> {
     /// Byte-align: discard buffered bits so the next read starts on a byte
     /// boundary (WPP). The raw bit-reader position (bits consumed from `data`)
     /// is `byte_pos*8 - bitcnt`; rounding that up to the next byte boundary

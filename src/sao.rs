@@ -173,6 +173,36 @@ pub(crate) fn apply_sao_band_offset_scalar(
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
+pub(crate) fn apply_sao_band_offset_inplace_scalar(
+    dst: &mut [u16],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    bd: u8,
+) {
+    let max_val = ((1u32 << bd) - 1) as i32;
+    let shift = bd - 5;
+
+    for y in y0..y_end {
+        let row = y * w;
+        for x in x0..x_end {
+            let dst = &mut dst[row + x];
+            let s = *dst as i32;
+            let band = (s >> shift) as u8;
+            let rel = band.wrapping_sub(band_pos);
+            if rel < 4 {
+                *dst = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
 fn apply_sao_edge_offset_scalar(
     dst: &mut [u16],
     src: &[u16],
@@ -266,24 +296,20 @@ pub(crate) struct SaoPlanesCtx<'a> {
     pub sao_chroma: bool,
 }
 
-/// Apply SAO to one CTB-row's worth of output. `luma_dst`/`cb_dst`/`cr_dst` are
-/// the *band* slices (rows `[ry*ctb .. ry*ctb+ctb)` of each plane, clipped to
-/// the picture); `luma_src`/`cb_src`/`cr_src` are the full, untouched source
-/// planes (EO neighbor reads may cross the band's top/bottom edge, so the source
-/// must be the whole plane, never the band). `band_y0`/`band_cy0` are the global
-/// row of each band's local row 0, so we can translate a CTB's global rectangle
-/// into band-local destination coordinates.
+/// Apply SAO to one CTB-row's worth of output. `*_dst` are band slices.
+/// Edge-offset SAO reads from optional full-plane snapshots; band-offset SAO is
+/// pointwise and runs in-place, so BO-only pictures avoid full-plane clones.
 #[allow(clippy::too_many_arguments)]
 fn apply_sao_ctb_row(
     ctx: &SaoPlanesCtx<'_>,
     ry: usize,
     luma_dst: &mut [u16],
-    luma_src: &[u16],
+    luma_src: Option<&[u16]>,
     band_y0: usize,
     cb_dst: &mut [u16],
     cr_dst: &mut [u16],
-    cb_src: &[u16],
-    cr_src: &[u16],
+    cb_src: Option<&[u16]>,
+    cr_src: Option<&[u16]>,
     band_cy0: usize,
 ) {
     let ctb = 1usize << ctx.log2_ctb;
@@ -295,23 +321,37 @@ fn apply_sao_ctb_row(
         if ctx.sao_luma && p.type_idx[0] != 0 {
             let x_end = (x0 + ctb).min(ctx.w);
             let y_end = (y0 + ctb).min(ctx.h);
-            // Destination is a band whose local row 0 == global row `band_y0`.
-            apply_sao_plane_banded(
-                luma_dst,
-                luma_src,
-                ctx.w,
-                ctx.h,
-                band_y0,
-                x0,
-                y0,
-                x_end,
-                y_end,
-                p.type_idx[0],
-                &p.offsets[0],
-                p.band_pos[0],
-                p.eo_class[0],
-                ctx.bd,
-            );
+            match p.type_idx[0] {
+                1 => apply_sao_band_offset_banded_inplace(
+                    luma_dst,
+                    ctx.w,
+                    band_y0,
+                    x0,
+                    y0,
+                    x_end,
+                    y_end,
+                    &p.offsets[0],
+                    p.band_pos[0],
+                    ctx.bd,
+                ),
+                2 => apply_sao_plane_banded(
+                    luma_dst,
+                    luma_src.expect("SAO EO requires luma snapshot"),
+                    ctx.w,
+                    ctx.h,
+                    band_y0,
+                    x0,
+                    y0,
+                    x_end,
+                    y_end,
+                    2,
+                    &p.offsets[0],
+                    p.band_pos[0],
+                    p.eo_class[0],
+                    ctx.bd,
+                ),
+                _ => {}
+            }
         }
 
         if ctx.sao_chroma {
@@ -319,10 +359,22 @@ fn apply_sao_ctb_row(
             let cy0 = y0 / ctx.sub_h;
             let cx_end = ((x0 + ctb) / ctx.sub_w).min(ctx.cw);
             let cy_end = ((y0 + ctb) / ctx.sub_h).min(ctx.ch);
-            if p.type_idx[1] != 0 {
-                apply_sao_plane_banded(
+            match p.type_idx[1] {
+                1 => apply_sao_band_offset_banded_inplace(
                     cb_dst,
-                    cb_src,
+                    ctx.cw,
+                    band_cy0,
+                    cx0,
+                    cy0,
+                    cx_end,
+                    cy_end,
+                    &p.offsets[1],
+                    p.band_pos[1],
+                    ctx.bd_c,
+                ),
+                2 => apply_sao_plane_banded(
+                    cb_dst,
+                    cb_src.expect("SAO EO requires Cb snapshot"),
                     ctx.cw,
                     ctx.ch,
                     band_cy0,
@@ -330,17 +382,30 @@ fn apply_sao_ctb_row(
                     cy0,
                     cx_end,
                     cy_end,
-                    p.type_idx[1],
+                    2,
                     &p.offsets[1],
                     p.band_pos[1],
                     p.eo_class[1],
                     ctx.bd_c,
-                );
+                ),
+                _ => {}
             }
-            if p.type_idx[2] != 0 {
-                apply_sao_plane_banded(
+            match p.type_idx[2] {
+                1 => apply_sao_band_offset_banded_inplace(
                     cr_dst,
-                    cr_src,
+                    ctx.cw,
+                    band_cy0,
+                    cx0,
+                    cy0,
+                    cx_end,
+                    cy_end,
+                    &p.offsets[2],
+                    p.band_pos[2],
+                    ctx.bd_c,
+                ),
+                2 => apply_sao_plane_banded(
+                    cr_dst,
+                    cr_src.expect("SAO EO requires Cr snapshot"),
                     ctx.cw,
                     ctx.ch,
                     band_cy0,
@@ -348,12 +413,13 @@ fn apply_sao_ctb_row(
                     cy0,
                     cx_end,
                     cy_end,
-                    p.type_idx[2],
+                    2,
                     &p.offsets[2],
                     p.band_pos[2],
                     p.eo_class[2],
                     ctx.bd_c,
-                );
+                ),
+                _ => {}
             }
         }
     }
@@ -388,6 +454,42 @@ fn apply_sao_plane_banded(
         dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, type_idx, offsets, band_pos,
         eo_class, bd,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_sao_band_offset_banded_inplace(
+    dst_band: &mut [u16],
+    w: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    bd: u8,
+) {
+    let max_val = ((1u32 << bd) - 1) as i32;
+    let shift = bd - 5;
+
+    for y in y0..y_end {
+        if y < band_y0 {
+            continue;
+        }
+        let dst_row = (y - band_y0) * w;
+        let Some(dst_row) = dst_band.get_mut(dst_row + x0..dst_row + x_end) else {
+            continue;
+        };
+        for dst in dst_row.iter_mut() {
+            let s = *dst as i32;
+            let band = (s >> shift) as u8;
+            let rel = band.wrapping_sub(band_pos);
+            if rel < 4 {
+                *dst = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -500,10 +602,34 @@ pub(crate) fn apply_sao_plane_banded_scalar(
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct SaoUsage {
+    active: [bool; 3],
+    needs_src: [bool; 3],
+}
+
+fn sao_usage(ctx: &SaoPlanesCtx<'_>) -> SaoUsage {
+    let mut usage = SaoUsage::default();
+    for p in ctx.params.iter() {
+        if ctx.sao_luma {
+            usage.active[0] |= p.type_idx[0] != 0;
+            usage.needs_src[0] |= p.type_idx[0] == 2;
+        }
+        if ctx.sao_chroma && ctx.cw != 0 && ctx.ch != 0 {
+            usage.active[1] |= p.type_idx[1] != 0;
+            usage.active[2] |= p.type_idx[2] != 0;
+            usage.needs_src[1] |= p.type_idx[1] == 2;
+            usage.needs_src[2] |= p.type_idx[2] == 2;
+        }
+    }
+    usage
+}
+
 /// Parallel SAO over the whole picture. Splits each plane into CTB-row bands
 /// (`ctb` output rows each, clipped at the picture edge), hands every band an
 /// exclusive `&mut` region via [`DisjointMut`], and applies that CTB-row's SAO
-/// on a pool worker. Reads come from full-plane clones, so bands never race.
+/// on a pool worker. BO-only planes run in-place; only EO planes allocate an
+/// untouched source snapshot for neighbor reads.
 ///
 /// `dst_*` are consumed and the filtered planes returned (matching the serial
 /// path's in-place semantics from the caller's view). When the pool is
@@ -517,11 +643,15 @@ pub(crate) fn apply_sao_parallel(
 ) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
     let ctb = 1usize << ctx.log2_ctb;
     let rows = ctx.ctb_rows;
+    let usage = sao_usage(ctx);
 
-    // Untouched sources for neighbor/pointwise reads.
-    let src_y = y.clone();
-    let src_cb = cb.clone();
-    let src_cr = cr.clone();
+    if !usage.active.iter().any(|&x| x) {
+        return (y, cb, cr);
+    }
+
+    let src_y = usage.needs_src[0].then(|| y.clone());
+    let src_cb = usage.needs_src[1].then(|| cb.clone());
+    let src_cr = usage.needs_src[2].then(|| cr.clone());
 
     // Serial fallback: no benefit from dispatch.
     if pool.threads() <= 1 || rows <= 1 {
@@ -533,12 +663,12 @@ pub(crate) fn apply_sao_parallel(
                 ctx,
                 ry,
                 &mut y[y_lo..],
-                &src_y,
+                src_y.as_deref(),
                 ry * ctb,
                 &mut cb[c_lo..],
                 &mut cr[c_lo..],
-                &src_cb,
-                &src_cr,
+                src_cb.as_deref(),
+                src_cr.as_deref(),
                 cy0,
             );
         }
@@ -572,12 +702,12 @@ pub(crate) fn apply_sao_parallel(
                 ctx,
                 ry,
                 &mut y_band,
-                &src_y,
+                src_y.as_deref(),
                 ly0,
                 &mut cb_band,
                 &mut cr_band,
-                &src_cb,
-                &src_cr,
+                src_cb.as_deref(),
+                src_cr.as_deref(),
                 cy0,
             );
         } else {
@@ -585,12 +715,12 @@ pub(crate) fn apply_sao_parallel(
                 ctx,
                 ry,
                 &mut y_band,
-                &src_y,
+                src_y.as_deref(),
                 ly0,
                 &mut [],
                 &mut [],
-                &src_cb,
-                &src_cr,
+                src_cb.as_deref(),
+                src_cr.as_deref(),
                 cy0,
             );
         }
