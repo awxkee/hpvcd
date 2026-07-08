@@ -38,34 +38,9 @@ pub(super) fn load_s32x4(src: &[i32]) -> int32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-pub(super) fn load_rows4_s32x4(src: &[i32], stride: usize, x: usize) -> int32x4_t {
-    debug_assert!(src.len() > 3 * stride + x);
-    let lanes = [
-        src[x],
-        src[stride + x],
-        src[2 * stride + x],
-        src[3 * stride + x],
-    ];
-    unsafe { vld1q_s32(lanes.as_ptr()) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 pub(super) fn store_s32x4(dst: &mut [i32], v: int32x4_t) {
     debug_assert!(dst.len() >= 4);
     unsafe { vst1q_s32(dst.as_mut_ptr(), v) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-pub(super) fn store_rows4_s32x4(dst: &mut [i32], stride: usize, x: usize, v: int32x4_t) {
-    debug_assert!(dst.len() > 3 * stride + x);
-    let mut lanes = [0i32; 4];
-    unsafe { vst1q_s32(lanes.as_mut_ptr(), v) };
-    dst[x] = lanes[0];
-    dst[stride + x] = lanes[1];
-    dst[2 * stride + x] = lanes[2];
-    dst[3 * stride + x] = lanes[3];
 }
 
 #[inline]

@@ -183,9 +183,67 @@ fn store_planar_row_neon(
         return;
     }
 
-    let mut x = 0usize;
-    while x + 8 <= n {
-        let a = load_u16x8(&above[1 + x..]);
+    let above_row = &above[1..1 + n];
+    let (above16, above_rem) = above_row.as_chunks::<16>();
+    let (out16, out_rem) = out[..n].as_chunks_mut::<16>();
+    for (block, (a, dst)) in above16.iter().zip(out16.iter_mut()).enumerate() {
+        let x = block * 16;
+        let a0 = load_u16x8(&a[..]);
+        let a1 = load_u16x8(&a[8..]);
+        let lo0 = planar4_neon(
+            widen_lo_u16x4(a0),
+            x,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        let hi0 = planar4_neon(
+            widen_hi_u16x4(a0),
+            x + 4,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        let lo1 = planar4_neon(
+            widen_lo_u16x4(a1),
+            x + 8,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        let hi1 = planar4_neon(
+            widen_hi_u16x4(a1),
+            x + 12,
+            n,
+            left_y,
+            tr,
+            bl_part,
+            ny,
+            add,
+            shift,
+        );
+        store_u16x8(&mut dst[..], pack_u16x8(lo0, hi0));
+        store_u16x8(&mut dst[8..], pack_u16x8(lo1, hi1));
+    }
+
+    let x8_base = above16.len() * 16;
+    let (above8, above_tail) = above_rem.as_chunks::<8>();
+    let (out8, out_tail) = out_rem.as_chunks_mut::<8>();
+    for (block, (a, dst)) in above8.iter().zip(out8.iter_mut()).enumerate() {
+        let x = x8_base + block * 8;
+        let a = load_u16x8(&a[..]);
         let lo = planar4_neon(widen_lo_u16x4(a), x, n, left_y, tr, bl_part, ny, add, shift);
         let hi = planar4_neon(
             widen_hi_u16x4(a),
@@ -198,13 +256,14 @@ fn store_planar_row_neon(
             add,
             shift,
         );
-        store_u16x8(&mut out[x..], pack_u16x8(lo, hi));
-        x += 8;
+        store_u16x8(&mut dst[..], pack_u16x8(lo, hi));
     }
-    if x < n {
+
+    if !above_tail.is_empty() {
+        let x = x8_base + above8.len() * 8;
         let a = load_u16x8(&above[1 + x..]);
         let lo = planar4_neon(widen_lo_u16x4(a), x, n, left_y, tr, bl_part, ny, add, shift);
-        store_u16x4(&mut out[x..], pack_u16x8(lo, vdupq_n_s32(0)));
+        store_u16x4(out_tail, pack_u16x8(lo, vdupq_n_s32(0)));
     }
 }
 
@@ -217,10 +276,14 @@ fn fill_row_neon(dst: &mut [u16], n: usize, v: u16) {
     } else if n == 4 {
         store_u16x4(dst, v);
     } else {
-        let mut x = 0usize;
-        while x < n {
-            store_u16x8(&mut dst[x..], v);
-            x += 8;
+        let (dst16, dst_rem) = dst[..n].as_chunks_mut::<16>();
+        for block in dst16 {
+            store_u16x8(&mut block[..], v);
+            store_u16x8(&mut block[8..], v);
+        }
+        let (dst8, _) = dst_rem.as_chunks_mut::<8>();
+        for block in dst8 {
+            store_u16x8(&mut block[..], v);
         }
     }
 }
@@ -235,11 +298,19 @@ fn copy_row_neon(dst: &mut [u16], src: &[u16], n: usize) {
         let v = load_u16x8(src);
         store_u16x4(dst, v);
     } else {
-        let mut x = 0usize;
-        while x < n {
-            let v = load_u16x8(&src[x..]);
-            store_u16x8(&mut dst[x..], v);
-            x += 8;
+        let (src16, src_rem) = src[..n].as_chunks::<16>();
+        let (dst16, dst_rem) = dst[..n].as_chunks_mut::<16>();
+        for (src, dst) in src16.iter().zip(dst16.iter_mut()) {
+            let v0 = load_u16x8(&src[..]);
+            let v1 = load_u16x8(&src[8..]);
+            store_u16x8(&mut dst[..], v0);
+            store_u16x8(&mut dst[8..], v1);
+        }
+        let (src8, _) = src_rem.as_chunks::<8>();
+        let (dst8, _) = dst_rem.as_chunks_mut::<8>();
+        for (src, dst) in src8.iter().zip(dst8.iter_mut()) {
+            let v = load_u16x8(&src[..]);
+            store_u16x8(&mut dst[..], v);
         }
     }
 }
@@ -249,6 +320,19 @@ fn copy_row_neon(dst: &mut [u16], src: &[u16], n: usize) {
 fn load_i32x4(src: &[i32]) -> int32x4_t {
     debug_assert!(src.len() >= 4);
     unsafe { vld1q_s32(src.as_ptr()) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn transpose_4x4_s32(v: [int32x4_t; 4]) -> [int32x4_t; 4] {
+    let ab = vtrnq_s32(v[0], v[1]);
+    let cd = vtrnq_s32(v[2], v[3]);
+    [
+        vcombine_s32(vget_low_s32(ab.0), vget_low_s32(cd.0)),
+        vcombine_s32(vget_low_s32(ab.1), vget_low_s32(cd.1)),
+        vcombine_s32(vget_high_s32(ab.0), vget_high_s32(cd.0)),
+        vcombine_s32(vget_high_s32(ab.1), vget_high_s32(cd.1)),
+    ]
 }
 
 #[inline]
@@ -374,9 +458,36 @@ fn predict_angular_vertical_row_neon(
     let pos = (row as i32 + 1) * angle;
     let i_idx = pos >> 5;
     let frac = pos & 31;
-    let mut x = 0usize;
+    let (dst16, dst_rem) = dst[..n].as_chunks_mut::<16>();
+    for (block, dst) in dst16.iter_mut().enumerate() {
+        let x = block * 16;
+        let idx = (x as i32 + i_idx + 1 + base) as usize;
+        let r0_0 = load_i32x4(&refs[idx..]);
+        let r0_1 = load_i32x4(&refs[idx + 4..]);
+        let r0_2 = load_i32x4(&refs[idx + 8..]);
+        let r0_3 = load_i32x4(&refs[idx + 12..]);
+        let (v0, v1, v2, v3) = if frac == 0 {
+            (r0_0, r0_1, r0_2, r0_3)
+        } else {
+            let r1_0 = load_i32x4(&refs[idx + 1..]);
+            let r1_1 = load_i32x4(&refs[idx + 5..]);
+            let r1_2 = load_i32x4(&refs[idx + 9..]);
+            let r1_3 = load_i32x4(&refs[idx + 13..]);
+            (
+                round_weighted_s32x4(r0_0, r1_0, frac),
+                round_weighted_s32x4(r0_1, r1_1, frac),
+                round_weighted_s32x4(r0_2, r1_2, frac),
+                round_weighted_s32x4(r0_3, r1_3, frac),
+            )
+        };
+        store_i32x8_as_u16(&mut dst[..], v0, v1, max_v);
+        store_i32x8_as_u16(&mut dst[8..], v2, v3, max_v);
+    }
 
-    while x + 8 <= n {
+    let x8_base = dst16.len() * 16;
+    let (dst8, dst_tail) = dst_rem.as_chunks_mut::<8>();
+    for (block, dst) in dst8.iter_mut().enumerate() {
+        let x = x8_base + block * 8;
         let idx = (x as i32 + i_idx + 1 + base) as usize;
         let r0_lo = load_i32x4(&refs[idx..]);
         let r0_hi = load_i32x4(&refs[idx + 4..]);
@@ -390,11 +501,11 @@ fn predict_angular_vertical_row_neon(
                 round_weighted_s32x4(r0_hi, r1_hi, frac),
             )
         };
-        store_i32x8_as_u16(&mut dst[x..], lo, hi, max_v);
-        x += 8;
+        store_i32x8_as_u16(&mut dst[..], lo, hi, max_v);
     }
 
-    if x < n {
+    if !dst_tail.is_empty() {
+        let x = x8_base + dst8.len() * 8;
         let idx = (x as i32 + i_idx + 1 + base) as usize;
         let r0 = load_i32x4(&refs[idx..]);
         let v = if frac == 0 {
@@ -403,32 +514,55 @@ fn predict_angular_vertical_row_neon(
             let r1 = load_i32x4(&refs[idx + 1..]);
             round_weighted_s32x4(r0, r1, frac)
         };
-        store_i32x4_as_u16(&mut dst[x..], v, max_v);
+        store_i32x4_as_u16(dst_tail, v, max_v);
     }
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn angular_horizontal4_neon(refs: &[i32], n: usize, y: usize, x: usize, angle: i32) -> int32x4_t {
+fn angular_horizontal_col4_neon(
+    refs: &[i32],
+    n: usize,
+    y: usize,
+    x: usize,
+    angle: i32,
+) -> int32x4_t {
     let base = n as i32;
-    let mut r0 = [0i32; 4];
-    let mut r1 = [0i32; 4];
-    let mut frac = [0i32; 4];
-
-    for lane in 0..4 {
-        let pos = (x as i32 + lane as i32 + 1) * angle;
-        let i_idx = pos >> 5;
-        let f = pos & 31;
-        let idx = (y as i32 + i_idx + 1 + base) as usize;
-        r0[lane] = refs[idx];
-        r1[lane] = if f == 0 { 0 } else { refs[idx + 1] };
-        frac[lane] = f;
+    let pos = (x as i32 + 1) * angle;
+    let i_idx = pos >> 5;
+    let frac = pos & 31;
+    let idx = (y as i32 + i_idx + 1 + base) as usize;
+    let r0 = load_i32x4(&refs[idx..]);
+    if frac == 0 {
+        r0
+    } else {
+        let r1 = load_i32x4(&refs[idx + 1..]);
+        round_weighted_s32x4(r0, r1, frac)
     }
+}
 
-    let r0 = unsafe { vld1q_s32(r0.as_ptr()) };
-    let r1 = unsafe { vld1q_s32(r1.as_ptr()) };
-    let frac = unsafe { vld1q_s32(frac.as_ptr()) };
-    round_weighted_var_s32x4(r0, r1, frac)
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_angular_horizontal4x4_neon(
+    rows: &mut [u16],
+    refs: &[i32],
+    n: usize,
+    y: usize,
+    x: usize,
+    angle: i32,
+    max_v: int32x4_t,
+) {
+    debug_assert!(rows.len() >= 4 * n);
+    debug_assert!(x + 4 <= n);
+    let c0 = angular_horizontal_col4_neon(refs, n, y, x, angle);
+    let c1 = angular_horizontal_col4_neon(refs, n, y, x + 1, angle);
+    let c2 = angular_horizontal_col4_neon(refs, n, y, x + 2, angle);
+    let c3 = angular_horizontal_col4_neon(refs, n, y, x + 3, angle);
+    let r = transpose_4x4_s32([c0, c1, c2, c3]);
+    store_i32x4_as_u16(&mut rows[x..], r[0], max_v);
+    store_i32x4_as_u16(&mut rows[n + x..], r[1], max_v);
+    store_i32x4_as_u16(&mut rows[2 * n + x..], r[2], max_v);
+    store_i32x4_as_u16(&mut rows[3 * n + x..], r[3], max_v);
 }
 
 #[inline]
@@ -494,17 +628,20 @@ fn predict_angular_neon(
             }
             return;
         }
-        for (y, row) in out.chunks_exact_mut(n).enumerate() {
-            let mut x = 0usize;
-            while x + 8 <= n {
-                let lo = angular_horizontal4_neon(refs, n, y, x, angle);
-                let hi = angular_horizontal4_neon(refs, n, y, x + 4, angle);
-                store_i32x8_as_u16(&mut row[x..], lo, hi, max_v);
-                x += 8;
+        for (y_block, rows) in out.chunks_exact_mut(4 * n).enumerate() {
+            let y = y_block * 4;
+            let (tiles8, has_tail) = {
+                let (first_row, _) = rows.split_at(n);
+                let (tiles8, tail) = first_row.as_chunks::<8>();
+                (tiles8.len(), !tail.is_empty())
+            };
+            for tile in 0..tiles8 {
+                let x = tile * 8;
+                store_angular_horizontal4x4_neon(rows, refs, n, y, x, angle, max_v);
+                store_angular_horizontal4x4_neon(rows, refs, n, y, x + 4, angle, max_v);
             }
-            if x < n {
-                let v = angular_horizontal4_neon(refs, n, y, x, angle);
-                store_i32x4_as_u16(&mut row[x..], v, max_v);
+            if has_tail {
+                store_angular_horizontal4x4_neon(rows, refs, n, y, tiles8 * 8, angle, max_v);
             }
         }
     }
@@ -519,8 +656,7 @@ fn predict_planar_neon(above: &[u16], left: &[u16], n: usize, out: &mut [u16]) {
 
     let tr = above[n + 1] as i32;
     let bl = left[n + 1] as i32;
-    for y in 0..n {
-        let row = &mut out[y * n..y * n + n];
+    for (y, row) in out[..n * n].chunks_exact_mut(n).enumerate() {
         store_planar_row_neon(row, above, left[y + 1] as i32, tr, bl, y, n);
     }
 }

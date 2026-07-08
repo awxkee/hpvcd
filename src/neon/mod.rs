@@ -28,6 +28,7 @@
  */
 
 mod common;
+mod deblock;
 mod dequant;
 mod i16;
 mod i32;
@@ -35,9 +36,15 @@ mod intra;
 mod reconstruct;
 mod sao;
 
+pub(crate) use deblock::{
+    chroma_horizontal_plane_neon, chroma_vertical_plane_neon, luma_horizontal_plane_neon,
+    luma_vertical_plane_neon,
+};
 pub(crate) use dequant::{
-    dequantize_into_neon, dequantize_into_neon16, dequantize_transform_skip_into_neon,
-    dequantize_transform_skip_into_neon16,
+    dequantize_into_neon, dequantize_into_neon16, dequantize_scaled_into_neon,
+    dequantize_scaled_into_neon16, dequantize_transform_skip_into_neon,
+    dequantize_transform_skip_into_neon16, dequantize_transform_skip_scaled_into_neon,
+    dequantize_transform_skip_scaled_into_neon16,
 };
 pub(crate) use i16::{inv_transform_dst_into_neon16, inv_transform_into_neon16};
 pub(crate) use i32::{inv_transform_dst_into_neon, inv_transform_into_neon};

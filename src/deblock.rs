@@ -150,56 +150,8 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
                 s += 4;
                 continue;
             }
-            for r in s..seg_end {
-                let lr = r - row0;
-                let base_p = lr * w + edge - 1;
-                let base_q = lr * w + edge;
-                let (p0, p1, p2, p3) = (
-                    y[base_p] as i32,
-                    y[base_p - 1] as i32,
-                    y[base_p - 2] as i32,
-                    y[base_p - 3] as i32,
-                );
-                let (q0, q1, q2, q3) = (
-                    y[base_q] as i32,
-                    y[base_q + 1] as i32,
-                    y[base_q + 2] as i32,
-                    y[base_q + 3] as i32,
-                );
-                let dp = (p2 - 2 * p1 + p0).abs();
-                let dq = (q2 - 2 * q1 + q0).abs();
-                let d = dp + dq;
-                let strong = d < (beta >> 2)
-                    && (p0 - q0).abs() < (5 * tc + 1) >> 1
-                    && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
-                if strong {
-                    y[base_p] =
-                        ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(0, maxv) as u16;
-                    y[base_p - 1] = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(0, maxv) as u16;
-                    y[base_p - 2] =
-                        ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(0, maxv) as u16;
-                    y[base_q] =
-                        ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(0, maxv) as u16;
-                    y[base_q + 1] = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, maxv) as u16;
-                    y[base_q + 2] =
-                        ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(0, maxv) as u16;
-                } else {
-                    let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-                    y[base_p] = (p0 + delta).clamp(0, maxv) as u16;
-                    y[base_q] = (q0 - delta).clamp(0, maxv) as u16;
-                    let thres = (tc * 10 + 1) >> 1;
-                    if (2 * (p0 - p1) - delta).abs() < thres {
-                        let dp1 =
-                            (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-                        y[base_p - 1] = (p1 + dp1).clamp(0, maxv) as u16;
-                    }
-                    if (2 * (q0 - q1) + delta).abs() < thres {
-                        let dq1 =
-                            (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-                        y[base_q + 1] = (q1 + dq1).clamp(0, maxv) as u16;
-                    }
-                }
-            }
+            let filter = resolve_luma_vertical_plane();
+            filter(y, w, edge, s, row0, beta, tc, maxv);
             s += 4;
         }
         edge += 8;
@@ -253,58 +205,326 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
                 scan += 4;
                 continue;
             }
-            for c in scan..scan + 4 {
-                if c >= w {
-                    continue;
-                }
-                let (p0, p1, p2, p3) = (
-                    at(y, edge - 1, c),
-                    at(y, edge - 2, c),
-                    at(y, edge - 3, c),
-                    if edge >= 4 { at(y, edge - 4, c) } else { 0 },
-                );
-                let (q0, q1, q2, q3) = (
-                    at(y, edge, c),
-                    at(y, edge + 1, c),
-                    at(y, edge + 2, c),
-                    if edge + 3 < h { at(y, edge + 3, c) } else { 0 },
-                );
-                let dp = (p2 - 2 * p1 + p0).abs();
-                let dq = (q2 - 2 * q1 + q0).abs();
-                let d = dp + dq;
-                let strong = d < (beta >> 2)
-                    && (p0 - q0).abs() < (5 * tc + 1) >> 1
-                    && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
-                let put = |dst: &mut [u16], gy: usize, val: i32| {
-                    dst[(gy - row0) * w + c] = val.clamp(0, maxv) as u16;
-                };
-                if strong {
-                    put(y, edge - 1, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-                    put(y, edge - 2, (p2 + p1 + p0 + q0 + 2) >> 2);
-                    put(y, edge - 3, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-                    put(y, edge, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-                    put(y, edge + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
-                    put(y, edge + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
-                } else {
-                    let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-                    put(y, edge - 1, p0 + delta);
-                    put(y, edge, q0 - delta);
-                    let thres = (tc * 10 + 1) >> 1;
-                    if (2 * (p0 - p1) - delta).abs() < thres {
-                        let dp1 =
-                            (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-                        put(y, edge - 2, p1 + dp1);
-                    }
-                    if (2 * (q0 - q1) + delta).abs() < thres {
-                        let dq1 =
-                            (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-                        put(y, edge + 1, q1 + dq1);
-                    }
-                }
-            }
+            let filter = resolve_luma_horizontal_plane();
+            filter(y, w, edge, scan, row0, beta, tc, maxv);
             scan += 4;
         }
         edge += 8;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+type LumaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
+
+static LUMA_VERTICAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
+static LUMA_HORIZONTAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
+
+#[inline]
+fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
+    *LUMA_VERTICAL_PLANE.get_or_init(|| {
+        let mut _f: LumaDeblockPlaneFn = luma_vertical_plane_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::luma_vertical_plane_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::luma_vertical_plane_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_luma_horizontal_plane() -> LumaDeblockPlaneFn {
+    *LUMA_HORIZONTAL_PLANE.get_or_init(|| {
+        let mut _f: LumaDeblockPlaneFn = luma_horizontal_plane_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::luma_horizontal_plane_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::luma_horizontal_plane_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn luma_vertical_plane_scalar(
+    pix: &mut [u16],
+    w: usize,
+    edge: usize,
+    s: usize,
+    row0: usize,
+    beta: i32,
+    tc: i32,
+    maxv: i32,
+) {
+    for r in s..s + 4 {
+        let lr = r - row0;
+        let base_p = lr * w + edge - 1;
+        let base_q = lr * w + edge;
+        let (p0, p1, p2, p3) = (
+            pix[base_p] as i32,
+            pix[base_p - 1] as i32,
+            pix[base_p - 2] as i32,
+            pix[base_p - 3] as i32,
+        );
+        let (q0, q1, q2, q3) = (
+            pix[base_q] as i32,
+            pix[base_q + 1] as i32,
+            pix[base_q + 2] as i32,
+            pix[base_q + 3] as i32,
+        );
+        luma_filter_lane_vertical(
+            pix, w, lr, edge, p0, p1, p2, p3, q0, q1, q2, q3, beta, tc, maxv,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn luma_horizontal_plane_scalar(
+    pix: &mut [u16],
+    w: usize,
+    edge: usize,
+    scan: usize,
+    row0: usize,
+    beta: i32,
+    tc: i32,
+    maxv: i32,
+) {
+    for c in scan..scan + 4 {
+        let at = |buf: &[u16], gy: usize, x: usize| -> i32 { buf[(gy - row0) * w + x] as i32 };
+        let (p0, p1, p2, p3) = (
+            at(pix, edge - 1, c),
+            at(pix, edge - 2, c),
+            at(pix, edge - 3, c),
+            at(pix, edge - 4, c),
+        );
+        let (q0, q1, q2, q3) = (
+            at(pix, edge, c),
+            at(pix, edge + 1, c),
+            at(pix, edge + 2, c),
+            at(pix, edge + 3, c),
+        );
+        luma_filter_lane_horizontal(
+            pix, w, edge, c, row0, p0, p1, p2, p3, q0, q1, q2, q3, beta, tc, maxv,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn luma_filter_lane_vertical(
+    pix: &mut [u16],
+    w: usize,
+    lr: usize,
+    edge: usize,
+    p0: i32,
+    p1: i32,
+    p2: i32,
+    p3: i32,
+    q0: i32,
+    q1: i32,
+    q2: i32,
+    q3: i32,
+    beta: i32,
+    tc: i32,
+    maxv: i32,
+) {
+    let base_p = lr * w + edge - 1;
+    let base_q = lr * w + edge;
+    let put = |dst: &mut [u16], idx: usize, val: i32| {
+        dst[idx] = val.clamp(0, maxv) as u16;
+    };
+    let dp = (p2 - 2 * p1 + p0).abs();
+    let dq = (q2 - 2 * q1 + q0).abs();
+    let d = dp + dq;
+    let strong = d < (beta >> 2)
+        && (p0 - q0).abs() < (5 * tc + 1) >> 1
+        && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
+    if strong {
+        put(pix, base_p, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+        put(pix, base_p - 1, (p2 + p1 + p0 + q0 + 2) >> 2);
+        put(pix, base_p - 2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+        put(pix, base_q, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+        put(pix, base_q + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
+        put(pix, base_q + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+    } else {
+        let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
+        put(pix, base_p, p0 + delta);
+        put(pix, base_q, q0 - delta);
+        let thres = (tc * 10 + 1) >> 1;
+        if (2 * (p0 - p1) - delta).abs() < thres {
+            let dp1 = (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
+            put(pix, base_p - 1, p1 + dp1);
+        }
+        if (2 * (q0 - q1) + delta).abs() < thres {
+            let dq1 = (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
+            put(pix, base_q + 1, q1 + dq1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn luma_filter_lane_horizontal(
+    pix: &mut [u16],
+    w: usize,
+    edge: usize,
+    c: usize,
+    row0: usize,
+    p0: i32,
+    p1: i32,
+    p2: i32,
+    p3: i32,
+    q0: i32,
+    q1: i32,
+    q2: i32,
+    q3: i32,
+    beta: i32,
+    tc: i32,
+    maxv: i32,
+) {
+    let put = |dst: &mut [u16], gy: usize, val: i32| {
+        dst[(gy - row0) * w + c] = val.clamp(0, maxv) as u16;
+    };
+    let dp = (p2 - 2 * p1 + p0).abs();
+    let dq = (q2 - 2 * q1 + q0).abs();
+    let d = dp + dq;
+    let strong = d < (beta >> 2)
+        && (p0 - q0).abs() < (5 * tc + 1) >> 1
+        && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
+    if strong {
+        put(pix, edge - 1, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+        put(pix, edge - 2, (p2 + p1 + p0 + q0 + 2) >> 2);
+        put(pix, edge - 3, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+        put(pix, edge, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+        put(pix, edge + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
+        put(pix, edge + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+    } else {
+        let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
+        put(pix, edge - 1, p0 + delta);
+        put(pix, edge, q0 - delta);
+        let thres = (tc * 10 + 1) >> 1;
+        if (2 * (p0 - p1) - delta).abs() < thres {
+            let dp1 = (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
+            put(pix, edge - 2, p1 + dp1);
+        }
+        if (2 * (q0 - q1) + delta).abs() < thres {
+            let dq1 = (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
+            put(pix, edge + 1, q1 + dq1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+type ChromaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32);
+
+static CHROMA_VERTICAL_PLANE: std::sync::OnceLock<ChromaDeblockPlaneFn> =
+    std::sync::OnceLock::new();
+static CHROMA_HORIZONTAL_PLANE: std::sync::OnceLock<ChromaDeblockPlaneFn> =
+    std::sync::OnceLock::new();
+
+#[inline]
+fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
+    *CHROMA_VERTICAL_PLANE.get_or_init(|| {
+        let mut _f: ChromaDeblockPlaneFn = chroma_vertical_plane_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::chroma_vertical_plane_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::chroma_vertical_plane_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_chroma_horizontal_plane() -> ChromaDeblockPlaneFn {
+    *CHROMA_HORIZONTAL_PLANE.get_or_init(|| {
+        let mut _f: ChromaDeblockPlaneFn = chroma_horizontal_plane_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::chroma_horizontal_plane_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::chroma_horizontal_plane_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_vertical_plane_scalar(
+    pix: &mut [u16],
+    cw: usize,
+    edge: usize,
+    s: usize,
+    crow0: usize,
+    tc_c: i32,
+    maxv_c: i32,
+) {
+    for r in s..s + 4 {
+        let lr = r - crow0;
+        let p0 = pix[lr * cw + edge - 1] as i32;
+        let p1 = pix[lr * cw + edge - 2] as i32;
+        let q0 = pix[lr * cw + edge] as i32;
+        let q1 = pix[lr * cw + edge + 1] as i32;
+        let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc_c, tc_c);
+        if delta != 0 {
+            pix[lr * cw + edge - 1] = (p0 + delta).clamp(0, maxv_c) as u16;
+            pix[lr * cw + edge] = (q0 - delta).clamp(0, maxv_c) as u16;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_horizontal_plane_scalar(
+    pix: &mut [u16],
+    cw: usize,
+    edge: usize,
+    scan: usize,
+    crow0: usize,
+    tc_c: i32,
+    maxv_c: i32,
+) {
+    for c in scan..scan + 4 {
+        let base = |gy: usize| (gy - crow0) * cw + c;
+        let p0 = pix[base(edge - 1)] as i32;
+        let p1 = pix[base(edge - 2)] as i32;
+        let q0 = pix[base(edge)] as i32;
+        let q1 = pix[base(edge + 1)] as i32;
+        let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc_c, tc_c);
+        if delta != 0 {
+            pix[base(edge - 1)] = (p0 + delta).clamp(0, maxv_c) as u16;
+            pix[base(edge)] = (q0 - delta).clamp(0, maxv_c) as u16;
+        }
     }
 }
 
@@ -319,7 +539,6 @@ fn chroma_vertical(
     crow1: usize,
 ) {
     let cw = ctx.cw;
-    let ch = ctx.ch;
     let w = ctx.w;
     let h = ctx.h;
     let maxv_c = (1i32 << ctx.bd_c) - 1;
@@ -346,25 +565,9 @@ fn chroma_vertical(
                 s += 4;
                 continue;
             }
-            let seg_end = (s + 4).min(crow1);
-            for plane in 0..2 {
-                let pix: &mut [u16] = if plane == 0 { &mut *cb } else { &mut *cr };
-                for r in s..seg_end {
-                    if r >= ch {
-                        continue;
-                    }
-                    let lr = r - crow0;
-                    let p0 = pix[lr * cw + edge - 1] as i32;
-                    let p1 = pix[lr * cw + edge - 2] as i32;
-                    let q0 = pix[lr * cw + edge] as i32;
-                    let q1 = pix[lr * cw + edge + 1] as i32;
-                    let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc_c, tc_c);
-                    if delta != 0 {
-                        pix[lr * cw + edge - 1] = (p0 + delta).clamp(0, maxv_c) as u16;
-                        pix[lr * cw + edge] = (q0 - delta).clamp(0, maxv_c) as u16;
-                    }
-                }
-            }
+            let filter = resolve_chroma_vertical_plane();
+            filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
+            filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
             s += 4;
         }
         edge += 8;
@@ -412,24 +615,9 @@ fn chroma_horizontal(
                 scan += 4;
                 continue;
             }
-            for plane in 0..2 {
-                let pix: &mut [u16] = if plane == 0 { &mut *cb } else { &mut *cr };
-                for c in scan..scan + 4 {
-                    if c >= cw {
-                        continue;
-                    }
-                    let base = |gy: usize| (gy - crow0) * cw + c;
-                    let p0 = pix[base(edge - 1)] as i32;
-                    let p1 = pix[base(edge - 2)] as i32;
-                    let q0 = pix[base(edge)] as i32;
-                    let q1 = pix[base(edge + 1)] as i32;
-                    let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc_c, tc_c);
-                    if delta != 0 {
-                        pix[base(edge - 1)] = (p0 + delta).clamp(0, maxv_c) as u16;
-                        pix[base(edge)] = (q0 - delta).clamp(0, maxv_c) as u16;
-                    }
-                }
-            }
+            let filter = resolve_chroma_horizontal_plane();
+            filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
+            filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
             scan += 4;
         }
         edge += 8;

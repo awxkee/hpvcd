@@ -31,6 +31,37 @@ use core::arch::aarch64::*;
 use super::common::*;
 use crate::transform::{DST4, inv_transform_into_scalar};
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn transpose_4x4_s32(v: [int32x4_t; 4]) -> [int32x4_t; 4] {
+    let ab = vtrnq_s32(v[0], v[1]);
+    let cd = vtrnq_s32(v[2], v[3]);
+    [
+        vcombine_s32(vget_low_s32(ab.0), vget_low_s32(cd.0)),
+        vcombine_s32(vget_low_s32(ab.1), vget_low_s32(cd.1)),
+        vcombine_s32(vget_high_s32(ab.0), vget_high_s32(cd.0)),
+        vcombine_s32(vget_high_s32(ab.1), vget_high_s32(cd.1)),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn tr_store_4x4_s32(
+    dst: &mut [i32],
+    stride: usize,
+    lane_base: usize,
+    elem_base: usize,
+    v: [int32x4_t; 4],
+) {
+    debug_assert!(dst.len() >= (lane_base + 4) * stride);
+    debug_assert!(elem_base + 4 <= stride);
+    let t = transpose_4x4_s32(v);
+    store_s32x4(&mut dst[(lane_base + 0) * stride + elem_base..], t[0]);
+    store_s32x4(&mut dst[(lane_base + 1) * stride + elem_base..], t[1]);
+    store_s32x4(&mut dst[(lane_base + 2) * stride + elem_base..], t[2]);
+    store_s32x4(&mut dst[(lane_base + 3) * stride + elem_base..], t[3]);
+}
+
 macro_rules! lin_s32x4 {
     ($v0:expr, $k0:expr $(, $v:expr, $k:expr)+ $(,)?) => {{
         let mut acc = mul_const($v0, $k0);
@@ -288,23 +319,26 @@ fn inv_dct_n_into_neon<const N: usize>(coeff: &[i32], bit_depth: u8, nx: usize, 
     let add2 = 1i32 << (shift2 - 1);
     let mut tmp = [0i32; 32 * 32];
 
-    // Columns >= nx are zero on input; skip them (tmp stays zero there).
+    // Columns >= nx are zero on input; skip them. Stage 1 writes a
+    // transposed scratch: tmp[input_column][stage1_row]. That lets stage 2
+    // use contiguous loads and normal 4x4 transpose stores instead of scalar
+    // row gather/scatter.
     let ncol = ((nx.min(N) + 3) & !3).max(4);
     for c in (0..ncol).step_by(4) {
-        let src = std::array::from_fn(|k| load_s32x4(&coeff[k * N + c..]));
+        let src: [int32x4_t; N] = std::array::from_fn(|k| load_s32x4(&coeff[k * N + c..]));
         let raw = idct_raw_s32x4::<N>(src);
-        for (m, raw) in raw.iter().copied().enumerate() {
-            let v = round_shift_clip_i16_s32x4(raw, add1, shift1);
-            store_s32x4(&mut tmp[m * N + c..], v);
+        for m in (0..N).step_by(4) {
+            let v = std::array::from_fn(|j| round_shift_clip_i16_s32x4(raw[m + j], add1, shift1));
+            tr_store_4x4_s32(&mut tmp, N, c, m, v);
         }
     }
 
     for r in (0..N).step_by(4) {
-        let src = std::array::from_fn(|k| load_rows4_s32x4(&tmp[r * N..], N, k));
+        let src: [int32x4_t; N] = std::array::from_fn(|k| load_s32x4(&tmp[k * N + r..]));
         let raw = idct_raw_s32x4::<N>(src);
-        for (x, raw) in raw.iter().copied().enumerate() {
-            let v = round_shift_s32x4(raw, add2, shift2);
-            store_rows4_s32x4(&mut out[r * N..], N, x, v);
+        for x in (0..N).step_by(4) {
+            let v = std::array::from_fn(|j| round_shift_s32x4(raw[x + j], add2, shift2));
+            tr_store_4x4_s32(out, N, r, x, v);
         }
     }
 }
@@ -327,20 +361,19 @@ fn inv_transform_dst4_into_neon(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
             *acc = madd_const(*acc, ck, tm);
         }
     }
-    for (m, acc) in acc.iter().copied().enumerate() {
-        let v = round_shift_clip_i16_s32x4(acc, add1, shift1);
-        store_s32x4(&mut tmp[m * 4..], v);
-    }
+    let v = std::array::from_fn(|m| round_shift_clip_i16_s32x4(acc[m], add1, shift1));
+    tr_store_4x4_s32(&mut tmp, 4, 0, 0, v);
 
-    let src: [int32x4_t; 4] = std::array::from_fn(|k| load_rows4_s32x4(&tmp, 4, k));
+    let src: [int32x4_t; 4] = std::array::from_fn(|k| load_s32x4(&tmp[k * 4..]));
+    let mut v = [zero(); 4];
     for x in 0..4 {
         let mut acc = zero();
         for (rk, trow) in src.iter().copied().zip(DST4.iter()) {
             acc = madd_const(acc, rk, trow[x]);
         }
-        let v = round_shift_s32x4(acc, add2, shift2);
-        store_rows4_s32x4(out, 4, x, v);
+        v[x] = round_shift_s32x4(acc, add2, shift2);
     }
+    tr_store_4x4_s32(out, 4, 0, 0, v);
 }
 
 pub(crate) fn inv_transform_into_neon(

@@ -167,19 +167,11 @@ fn add_residual_into_sse41_impl(
     };
     let max = _mm_set1_epi32(sample_max(bit_depth));
 
-    for y in 0..n {
-        let row_off = y * n;
-        let dst_off = y * stride;
-        let Some(dst_row) = dst.get_mut(dst_off..dst_off.saturating_add(n)) else {
-            break;
-        };
-        let Some(pred_row) = pred.get(row_off..row_off + n) else {
-            break;
-        };
-        let Some(res_row) = res.get(row_off..row_off + n) else {
-            break;
-        };
-        add_clip_row_sse41(dst_row, pred_row, res_row, n, max);
+    let dst_rows = dst.chunks_mut(stride).take(n);
+    let pred_rows = pred.chunks_exact(n);
+    let res_rows = res.chunks_exact(n);
+    for ((dst_row, pred_row), res_row) in dst_rows.zip(pred_rows).zip(res_rows) {
+        add_clip_row_sse41(&mut dst_row[..n], pred_row, res_row, n, max);
     }
 }
 
@@ -281,19 +273,11 @@ fn add_residual_into_sse41_impl_16(
         return;
     };
     let max = _mm_set1_epi16(sample_max(bit_depth) as i16);
-    for y in 0..n {
-        let row_off = y * n;
-        let dst_off = y * stride;
-        let Some(dst_row) = dst.get_mut(dst_off..dst_off.saturating_add(n)) else {
-            break;
-        };
-        let (Some(pred_row), Some(res_row)) = (
-            pred.get(row_off..row_off + n),
-            res.get(row_off..row_off + n),
-        ) else {
-            break;
-        };
-        add_clip_row_sse41_16(dst_row, pred_row, res_row, n, max);
+    let dst_rows = dst.chunks_mut(stride).take(n);
+    let pred_rows = pred.chunks_exact(n);
+    let res_rows = res.chunks_exact(n);
+    for ((dst_row, pred_row), res_row) in dst_rows.zip(pred_rows).zip(res_rows) {
+        add_clip_row_sse41_16(&mut dst_row[..n], pred_row, res_row, n, max);
     }
 }
 

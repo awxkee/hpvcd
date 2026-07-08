@@ -97,6 +97,268 @@ fn store_u16x8(dst: &mut [u16; 8], v: uint16x8_t) {
     unsafe { vst1q_u16(dst.as_mut_ptr(), v) };
 }
 
+#[inline]
+fn apply_eo_sample_inbounds_neon(
+    dst: &mut u16,
+    s: u16,
+    n1: u16,
+    n2: u16,
+    offsets: &[i32; 4],
+    max_val: i32,
+) {
+    let s = s as i32;
+    let n1 = n1 as i32;
+    let n2 = n2 as i32;
+    let sign1 = (s > n1) as i32 - (s < n1) as i32;
+    let sign2 = (s > n2) as i32 - (s < n2) as i32;
+    let offset = match sign1 + sign2 + 2 {
+        0 => offsets[0],
+        1 => offsets[1],
+        3 => offsets[2],
+        4 => offsets[3],
+        _ => 0,
+    };
+    if offset != 0 {
+        *dst = (s + offset).clamp(0, max_val) as u16;
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn edge_offset4_neon(
+    samples: int32x4_t,
+    n1: int32x4_t,
+    n2: int32x4_t,
+    offsets: &[i32; 4],
+    zero: int32x4_t,
+    max: int32x4_t,
+) -> (int32x4_t, uint32x4_t) {
+    let gt1 = vcgtq_s32(samples, n1);
+    let lt1 = vcgtq_s32(n1, samples);
+    let eq1 = vceqq_s32(samples, n1);
+    let gt2 = vcgtq_s32(samples, n2);
+    let lt2 = vcgtq_s32(n2, samples);
+    let eq2 = vceqq_s32(samples, n2);
+
+    let m0 = vandq_u32(lt1, lt2);
+    let m1 = vorrq_u32(vandq_u32(lt1, eq2), vandq_u32(lt2, eq1));
+    let m3 = vorrq_u32(vandq_u32(gt1, eq2), vandq_u32(gt2, eq1));
+    let m4 = vandq_u32(gt1, gt2);
+
+    let mut off = zero;
+    off = vbslq_s32(m0, vdupq_n_s32(offsets[0]), off);
+    off = vbslq_s32(m1, vdupq_n_s32(offsets[1]), off);
+    off = vbslq_s32(m3, vdupq_n_s32(offsets[2]), off);
+    off = vbslq_s32(m4, vdupq_n_s32(offsets[3]), off);
+
+    let mut active = vdupq_n_u32(0);
+    if offsets[0] != 0 {
+        active = vorrq_u32(active, m0);
+    }
+    if offsets[1] != 0 {
+        active = vorrq_u32(active, m1);
+    }
+    if offsets[2] != 0 {
+        active = vorrq_u32(active, m3);
+    }
+    if offsets[3] != 0 {
+        active = vorrq_u32(active, m4);
+    }
+    let v = vaddq_s32(samples, off);
+    (vminq_s32(vmaxq_s32(v, zero), max), active)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn edge_offset8_neon(
+    dst: &[u16; 8],
+    samples: &[u16; 8],
+    n1: &[u16; 8],
+    n2: &[u16; 8],
+    offsets: &[i32; 4],
+    zero: int32x4_t,
+    max: int32x4_t,
+) -> uint16x8_t {
+    let old = unsafe { vld1q_u16(dst.as_ptr()) };
+    let s = unsafe { vld1q_u16(samples.as_ptr()) };
+    let a = unsafe { vld1q_u16(n1.as_ptr()) };
+    let b = unsafe { vld1q_u16(n2.as_ptr()) };
+
+    let s_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(s)));
+    let s_hi = vreinterpretq_s32_u32(vmovl_high_u16(s));
+    let a_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(a)));
+    let a_hi = vreinterpretq_s32_u32(vmovl_high_u16(a));
+    let b_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(b)));
+    let b_hi = vreinterpretq_s32_u32(vmovl_high_u16(b));
+
+    let (lo, mlo) = edge_offset4_neon(s_lo, a_lo, b_lo, offsets, zero, max);
+    let (hi, mhi) = edge_offset4_neon(s_hi, a_hi, b_hi, offsets, zero, max);
+    let out = vcombine_u16(
+        vqmovn_u32(vreinterpretq_u32_s32(lo)),
+        vqmovn_u32(vreinterpretq_u32_s32(hi)),
+    );
+    let mask = vcombine_u16(vmovn_u32(mlo), vmovn_u32(mhi));
+    vbslq_u16(mask, out, old)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_sao_edge_offset_horizontal_neon_impl(
+    dst: &mut [u16],
+    src: &[u16],
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 {
+        return;
+    }
+    let vec_x0 = x0.max(1);
+    let vec_x1 = x_end.min(w.saturating_sub(1));
+    if vec_x0 >= vec_x1 {
+        apply_sao_plane_scalar(dst, src, w, h, x0, y0, x_end, y_end, 2, offsets, 0, 0, bd);
+        return;
+    }
+
+    if x0 < vec_x0 {
+        apply_sao_plane_scalar(dst, src, w, h, x0, y0, vec_x0, y_end, 2, offsets, 0, 0, bd);
+    }
+    if vec_x1 < x_end {
+        apply_sao_plane_scalar(
+            dst, src, w, h, vec_x1, y0, x_end, y_end, 2, offsets, 0, 0, bd,
+        );
+    }
+
+    let max_val = ((1u32 << bd) - 1) as i32;
+    let max = vdupq_n_s32(max_val);
+    let zero = vdupq_n_s32(0);
+
+    for y in y0..y_end {
+        let row = y * w;
+        let mid_range = row + vec_x0..row + vec_x1;
+        let left_range = row + vec_x0 - 1..row + vec_x1 - 1;
+        let right_range = row + vec_x0 + 1..row + vec_x1 + 1;
+        let (Some(src_mid), Some(src_left), Some(src_right), Some(dst_mid)) = (
+            src.get(mid_range.clone()),
+            src.get(left_range),
+            src.get(right_range),
+            dst.get_mut(mid_range),
+        ) else {
+            continue;
+        };
+
+        let (mid8, mid_tail) = src_mid.as_chunks::<8>();
+        let (left8, left_tail) = src_left.as_chunks::<8>();
+        let (right8, right_tail) = src_right.as_chunks::<8>();
+        let (dst8, dst_tail) = dst_mid.as_chunks_mut::<8>();
+
+        for (((s, l), r), d) in mid8
+            .iter()
+            .zip(left8.iter())
+            .zip(right8.iter())
+            .zip(dst8.iter_mut())
+        {
+            let out = edge_offset8_neon(d, s, r, l, offsets, zero, max);
+            store_u16x8(d, out);
+        }
+
+        for (((&s, &l), &r), d) in mid_tail
+            .iter()
+            .zip(left_tail.iter())
+            .zip(right_tail.iter())
+            .zip(dst_tail.iter_mut())
+        {
+            apply_eo_sample_inbounds_neon(d, s, r, l, offsets, max_val);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_sao_edge_offset_vertical_neon_impl(
+    dst: &mut [u16],
+    src: &[u16],
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 {
+        return;
+    }
+    let vec_y0 = y0.max(1);
+    let vec_y1 = y_end.min(h.saturating_sub(1));
+    if vec_y0 >= vec_y1 {
+        apply_sao_plane_scalar(dst, src, w, h, x0, y0, x_end, y_end, 2, offsets, 0, 1, bd);
+        return;
+    }
+
+    if y0 < vec_y0 {
+        apply_sao_plane_scalar(dst, src, w, h, x0, y0, x_end, vec_y0, 2, offsets, 0, 1, bd);
+    }
+    if vec_y1 < y_end {
+        apply_sao_plane_scalar(
+            dst, src, w, h, x0, vec_y1, x_end, y_end, 2, offsets, 0, 1, bd,
+        );
+    }
+
+    let max_val = ((1u32 << bd) - 1) as i32;
+    let max = vdupq_n_s32(max_val);
+    let zero = vdupq_n_s32(0);
+
+    for y in vec_y0..vec_y1 {
+        let above = (y - 1) * w;
+        let row = y * w;
+        let below = (y + 1) * w;
+        let row_range = row + x0..row + x_end;
+        let above_range = above + x0..above + x_end;
+        let below_range = below + x0..below + x_end;
+        let (Some(src_row), Some(src_above), Some(src_below), Some(dst_row)) = (
+            src.get(row_range.clone()),
+            src.get(above_range),
+            src.get(below_range),
+            dst.get_mut(row_range),
+        ) else {
+            continue;
+        };
+
+        let (src8, src_tail) = src_row.as_chunks::<8>();
+        let (above8, above_tail) = src_above.as_chunks::<8>();
+        let (below8, below_tail) = src_below.as_chunks::<8>();
+        let (dst8, dst_tail) = dst_row.as_chunks_mut::<8>();
+
+        for (((s, a), b), d) in src8
+            .iter()
+            .zip(above8.iter())
+            .zip(below8.iter())
+            .zip(dst8.iter_mut())
+        {
+            let out = edge_offset8_neon(d, s, b, a, offsets, zero, max);
+            store_u16x8(d, out);
+        }
+
+        for (((&s, &a), &b), d) in src_tail
+            .iter()
+            .zip(above_tail.iter())
+            .zip(below_tail.iter())
+            .zip(dst_tail.iter_mut())
+        {
+            apply_eo_sample_inbounds_neon(d, s, b, a, offsets, max_val);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "neon")]
@@ -160,15 +422,213 @@ pub(crate) fn apply_sao_plane_neon(
     eo_class: u8,
     bd: u8,
 ) {
-    if type_idx != 1 || x_end <= x0 || y_end <= y0 {
-        apply_sao_plane_scalar(
-            dst, src, w, h, x0, y0, x_end, y_end, type_idx, offsets, band_pos, eo_class, bd,
-        );
+    if x_end <= x0 || y_end <= y0 {
         return;
     }
 
     unsafe {
-        apply_sao_band_offset_neon_impl(dst, src, w, x0, y0, x_end, y_end, offsets, band_pos, bd)
+        match (type_idx, eo_class) {
+            (1, _) => apply_sao_band_offset_neon_impl(
+                dst, src, w, x0, y0, x_end, y_end, offsets, band_pos, bd,
+            ),
+            (2, 0) => apply_sao_edge_offset_horizontal_neon_impl(
+                dst, src, w, h, x0, y0, x_end, y_end, offsets, bd,
+            ),
+            (2, 1) => apply_sao_edge_offset_vertical_neon_impl(
+                dst, src, w, h, x0, y0, x_end, y_end, offsets, bd,
+            ),
+            _ => apply_sao_plane_scalar(
+                dst, src, w, h, x0, y0, x_end, y_end, type_idx, offsets, band_pos, eo_class, bd,
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_sao_edge_offset_horizontal_banded_neon_impl(
+    dst_band: &mut [u16],
+    src_full: &[u16],
+    w: usize,
+    h: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 || y_end <= band_y0 {
+        return;
+    }
+    let vec_x0 = x0.max(1);
+    let vec_x1 = x_end.min(w.saturating_sub(1));
+    if vec_x0 >= vec_x1 {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, 2, offsets, 0, 0, bd,
+        );
+        return;
+    }
+
+    if x0 < vec_x0 {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, x0, y0, vec_x0, y_end, 2, offsets, 0, 0, bd,
+        );
+    }
+    if vec_x1 < x_end {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, vec_x1, y0, x_end, y_end, 2, offsets, 0, 0, bd,
+        );
+    }
+
+    let Some(max_val) = 1u32
+        .checked_shl(bd as u32)
+        .map(|v| v.saturating_sub(1) as i32)
+    else {
+        return;
+    };
+    let max = vdupq_n_s32(max_val);
+    let zero = vdupq_n_s32(0);
+
+    for y in y0..y_end {
+        let Some(dst_base) = y.checked_sub(band_y0).and_then(|v| v.checked_mul(w)) else {
+            continue;
+        };
+        let Some(src_base) = y.checked_mul(w) else {
+            continue;
+        };
+        let mid_range = src_base + vec_x0..src_base + vec_x1;
+        let left_range = src_base + vec_x0 - 1..src_base + vec_x1 - 1;
+        let right_range = src_base + vec_x0 + 1..src_base + vec_x1 + 1;
+        let dst_range = dst_base + vec_x0..dst_base + vec_x1;
+        let (Some(src_mid), Some(src_left), Some(src_right), Some(dst_mid)) = (
+            src_full.get(mid_range),
+            src_full.get(left_range),
+            src_full.get(right_range),
+            dst_band.get_mut(dst_range),
+        ) else {
+            continue;
+        };
+
+        let (mid8, mid_tail) = src_mid.as_chunks::<8>();
+        let (left8, left_tail) = src_left.as_chunks::<8>();
+        let (right8, right_tail) = src_right.as_chunks::<8>();
+        let (dst8, dst_tail) = dst_mid.as_chunks_mut::<8>();
+
+        for (((s, l), r), d) in mid8
+            .iter()
+            .zip(left8.iter())
+            .zip(right8.iter())
+            .zip(dst8.iter_mut())
+        {
+            let out = edge_offset8_neon(d, s, r, l, offsets, zero, max);
+            store_u16x8(d, out);
+        }
+
+        for (((&s, &l), &r), d) in mid_tail
+            .iter()
+            .zip(left_tail.iter())
+            .zip(right_tail.iter())
+            .zip(dst_tail.iter_mut())
+        {
+            apply_eo_sample_inbounds_neon(d, s, r, l, offsets, max_val);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_sao_edge_offset_vertical_banded_neon_impl(
+    dst_band: &mut [u16],
+    src_full: &[u16],
+    w: usize,
+    h: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 || y_end <= band_y0 {
+        return;
+    }
+    let vec_y0 = y0.max(1);
+    let vec_y1 = y_end.min(h.saturating_sub(1));
+    if vec_y0 >= vec_y1 {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, 2, offsets, 0, 1, bd,
+        );
+        return;
+    }
+
+    if y0 < vec_y0 {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, x0, y0, x_end, vec_y0, 2, offsets, 0, 1, bd,
+        );
+    }
+    if vec_y1 < y_end {
+        apply_sao_plane_banded_scalar(
+            dst_band, src_full, w, h, band_y0, x0, vec_y1, x_end, y_end, 2, offsets, 0, 1, bd,
+        );
+    }
+
+    let Some(max_val) = (1u32)
+        .checked_shl(bd as u32)
+        .map(|v| v.saturating_sub(1) as i32)
+    else {
+        return;
+    };
+    let max = vdupq_n_s32(max_val);
+    let zero = vdupq_n_s32(0);
+
+    for y in vec_y0..vec_y1 {
+        let Some(dst_base) = y.checked_sub(band_y0).and_then(|v| v.checked_mul(w)) else {
+            continue;
+        };
+        let above = (y - 1) * w;
+        let row = y * w;
+        let below = (y + 1) * w;
+        let row_range = row + x0..row + x_end;
+        let above_range = above + x0..above + x_end;
+        let below_range = below + x0..below + x_end;
+        let dst_range = dst_base + x0..dst_base + x_end;
+        let (Some(src_row), Some(src_above), Some(src_below), Some(dst_row)) = (
+            src_full.get(row_range),
+            src_full.get(above_range),
+            src_full.get(below_range),
+            dst_band.get_mut(dst_range),
+        ) else {
+            continue;
+        };
+
+        let (src8, src_tail) = src_row.as_chunks::<8>();
+        let (above8, above_tail) = src_above.as_chunks::<8>();
+        let (below8, below_tail) = src_below.as_chunks::<8>();
+        let (dst8, dst_tail) = dst_row.as_chunks_mut::<8>();
+
+        for (((s, a), b), d) in src8
+            .iter()
+            .zip(above8.iter())
+            .zip(below8.iter())
+            .zip(dst8.iter_mut())
+        {
+            let out = edge_offset8_neon(d, s, b, a, offsets, zero, max);
+            store_u16x8(d, out);
+        }
+
+        for (((&s, &a), &b), d) in src_tail
+            .iter()
+            .zip(above_tail.iter())
+            .zip(below_tail.iter())
+            .zip(dst_tail.iter_mut())
+        {
+            apply_eo_sample_inbounds_neon(d, s, b, a, offsets, max_val);
+        }
     }
 }
 
@@ -252,17 +712,25 @@ pub(crate) fn apply_sao_plane_banded_neon(
     eo_class: u8,
     bd: u8,
 ) {
-    if type_idx != 1 || x_end <= x0 || y_end <= y0 {
-        apply_sao_plane_banded_scalar(
-            dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, type_idx, offsets, band_pos,
-            eo_class, bd,
-        );
+    if x_end <= x0 || y_end <= y0 {
         return;
     }
 
     unsafe {
-        apply_sao_band_offset_banded_neon_impl(
-            dst_band, src_full, w, band_y0, x0, y0, x_end, y_end, offsets, band_pos, bd,
-        )
+        match (type_idx, eo_class) {
+            (1, _) => apply_sao_band_offset_banded_neon_impl(
+                dst_band, src_full, w, band_y0, x0, y0, x_end, y_end, offsets, band_pos, bd,
+            ),
+            (2, 0) => apply_sao_edge_offset_horizontal_banded_neon_impl(
+                dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, bd,
+            ),
+            (2, 1) => apply_sao_edge_offset_vertical_banded_neon_impl(
+                dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, bd,
+            ),
+            _ => apply_sao_plane_banded_scalar(
+                dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, type_idx, offsets,
+                band_pos, eo_class, bd,
+            ),
+        }
     }
 }

@@ -618,7 +618,7 @@ impl<'a> ScalingMatrix<'a> {
     }
 
     #[inline]
-    fn coeff(self, idx: usize) -> i64 {
+    pub(crate) fn coeff(self, idx: usize) -> i64 {
         if self.log2_size == 2 {
             return self.coeffs[idx] as i64;
         }
@@ -785,17 +785,68 @@ pub(crate) fn dequantize_transform_skip_into_scalar_i16(
     dequantize_transform_skip_into_scalar(levels, n, params, out);
 }
 
+pub(crate) fn dequantize_scaled_into_scalar_i32(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    dequantize_scaled_into_scalar(levels, n, params, scaling, out);
+}
+
+pub(crate) fn dequantize_scaled_into_scalar_i16(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    dequantize_scaled_into_scalar(levels, n, params, scaling, out);
+}
+
+pub(crate) fn dequantize_transform_skip_scaled_into_scalar_i32(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    dequantize_transform_skip_scaled_into_scalar(levels, n, params, scaling, out);
+}
+
+pub(crate) fn dequantize_transform_skip_scaled_into_scalar_i16(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    dequantize_transform_skip_scaled_into_scalar(levels, n, params, scaling, out);
+}
+
 // `n` = transform width/height. Output is clipped to the HEVC residual dynamic
 // range used by the rest of this decoder.
 type DequantFn = fn(&[i32], usize, DequantParams, &mut [i32]);
 type DequantFn16 = fn(&[i32], usize, DequantParams, &mut [i16]);
 type DequantSkipFn = fn(&[i32], usize, TransformSkipParams, &mut [i32]);
 type DequantSkipFn16 = fn(&[i32], usize, TransformSkipParams, &mut [i16]);
+type DequantScaledFn = for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i32]);
+type DequantScaledFn16 = for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i16]);
+type DequantSkipScaledFn =
+    for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, &mut [i32]);
+type DequantSkipScaledFn16 =
+    for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, &mut [i16]);
 
 static DEQUANT: std::sync::OnceLock<DequantFn> = std::sync::OnceLock::new();
 static DEQUANT16: std::sync::OnceLock<DequantFn16> = std::sync::OnceLock::new();
 static DEQUANT_SKIP: std::sync::OnceLock<DequantSkipFn> = std::sync::OnceLock::new();
 static DEQUANT_SKIP16: std::sync::OnceLock<DequantSkipFn16> = std::sync::OnceLock::new();
+static DEQUANT_SCALED: std::sync::OnceLock<DequantScaledFn> = std::sync::OnceLock::new();
+static DEQUANT_SCALED16: std::sync::OnceLock<DequantScaledFn16> = std::sync::OnceLock::new();
+static DEQUANT_SKIP_SCALED: std::sync::OnceLock<DequantSkipScaledFn> = std::sync::OnceLock::new();
+static DEQUANT_SKIP_SCALED16: std::sync::OnceLock<DequantSkipScaledFn16> =
+    std::sync::OnceLock::new();
 
 #[inline]
 fn resolve_dequant() -> DequantFn {
@@ -881,12 +932,110 @@ fn resolve_dequant_skip16() -> DequantSkipFn16 {
     })
 }
 
+#[inline]
+fn resolve_dequant_scaled() -> DequantScaledFn {
+    *DEQUANT_SCALED.get_or_init(|| {
+        let mut _f: DequantScaledFn = dequantize_scaled_into_scalar_i32;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_scaled_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_scaled_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dequant_scaled16() -> DequantScaledFn16 {
+    *DEQUANT_SCALED16.get_or_init(|| {
+        let mut _f: DequantScaledFn16 = dequantize_scaled_into_scalar_i16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_scaled_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_scaled_into_sse41_16;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
+    *DEQUANT_SKIP_SCALED.get_or_init(|| {
+        let mut _f: DequantSkipScaledFn = dequantize_transform_skip_scaled_into_scalar_i32;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_transform_skip_scaled_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_transform_skip_scaled_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
+    *DEQUANT_SKIP_SCALED16.get_or_init(|| {
+        let mut _f: DequantSkipScaledFn16 = dequantize_transform_skip_scaled_into_scalar_i16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_transform_skip_scaled_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_transform_skip_scaled_into_sse41_16;
+            }
+        }
+
+        _f
+    })
+}
+
 pub(crate) trait DequantTarget: Coeff {
     fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]);
     fn dequantize_transform_skip(
         levels: &[i32],
         n: usize,
         params: TransformSkipParams,
+        out: &mut [Self],
+    );
+    fn dequantize_scaled(
+        levels: &[i32],
+        n: usize,
+        params: DequantParams,
+        scaling: ScalingMatrix<'_>,
+        out: &mut [Self],
+    );
+    fn dequantize_transform_skip_scaled(
+        levels: &[i32],
+        n: usize,
+        params: TransformSkipParams,
+        scaling: ScalingMatrix<'_>,
         out: &mut [Self],
     );
 }
@@ -906,6 +1055,28 @@ impl DequantTarget for i32 {
     ) {
         resolve_dequant_skip()(levels, n, params, out);
     }
+
+    #[inline]
+    fn dequantize_scaled(
+        levels: &[i32],
+        n: usize,
+        params: DequantParams,
+        scaling: ScalingMatrix<'_>,
+        out: &mut [Self],
+    ) {
+        resolve_dequant_scaled()(levels, n, params, scaling, out);
+    }
+
+    #[inline]
+    fn dequantize_transform_skip_scaled(
+        levels: &[i32],
+        n: usize,
+        params: TransformSkipParams,
+        scaling: ScalingMatrix<'_>,
+        out: &mut [Self],
+    ) {
+        resolve_dequant_skip_scaled()(levels, n, params, scaling, out);
+    }
 }
 
 impl DequantTarget for i16 {
@@ -922,6 +1093,28 @@ impl DequantTarget for i16 {
         out: &mut [Self],
     ) {
         resolve_dequant_skip16()(levels, n, params, out);
+    }
+
+    #[inline]
+    fn dequantize_scaled(
+        levels: &[i32],
+        n: usize,
+        params: DequantParams,
+        scaling: ScalingMatrix<'_>,
+        out: &mut [Self],
+    ) {
+        resolve_dequant_scaled16()(levels, n, params, scaling, out);
+    }
+
+    #[inline]
+    fn dequantize_transform_skip_scaled(
+        levels: &[i32],
+        n: usize,
+        params: TransformSkipParams,
+        scaling: ScalingMatrix<'_>,
+        out: &mut [Self],
+    ) {
+        resolve_dequant_skip_scaled16()(levels, n, params, scaling, out);
     }
 }
 
@@ -968,7 +1161,7 @@ pub(crate) fn dequantize_scaled_into<S: DequantTarget>(
         return;
     }
     let params = dequant_params(n, qp_prime, bit_depth);
-    dequantize_scaled_into_scalar(levels, n, params, scaling, out);
+    S::dequantize_scaled(levels, n, params, scaling, out);
 }
 
 pub(crate) fn dequantize_transform_skip_scaled_into<S: DequantTarget>(
@@ -992,7 +1185,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into<S: DequantTarget>(
         return;
     }
     let params = transform_skip_params(n, qp_prime, bit_depth);
-    dequantize_transform_skip_scaled_into_scalar(levels, n, params, scaling, out);
+    S::dequantize_transform_skip_scaled(levels, n, params, scaling, out);
 }
 
 // `nx` = number of nonzero input columns (last_x + 1); stage 1 skips the rest.

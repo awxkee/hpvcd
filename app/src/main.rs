@@ -14,7 +14,7 @@ fn main() {
         durations.push(elapsed);
     }
 
-    /*let total: std::time::Duration = durations.iter().sum();
+    let total: std::time::Duration = durations.iter().sum();
     let avg = total / durations.len() as u32;
     println!("Average: {:?}", avg);
     let instant = Instant::now();
@@ -50,5 +50,5 @@ fn main() {
         )
         .unwrap(),
     );
-    img.save("./out.jpg").unwrap();*/
+    img.save("./out.png").unwrap();
 }

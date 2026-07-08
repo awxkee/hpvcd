@@ -26,15 +26,22 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod deblock;
 mod dequant;
 mod intra;
 mod reconstruct;
 mod sao;
 mod transform;
 
+pub(crate) use deblock::{
+    chroma_horizontal_plane_sse41, chroma_vertical_plane_sse41, luma_horizontal_plane_sse41,
+    luma_vertical_plane_sse41,
+};
 pub(crate) use dequant::{
-    dequantize_into_sse41, dequantize_into_sse41_16, dequantize_transform_skip_into_sse41,
-    dequantize_transform_skip_into_sse41_16,
+    dequantize_into_sse41, dequantize_into_sse41_16, dequantize_scaled_into_sse41,
+    dequantize_scaled_into_sse41_16, dequantize_transform_skip_into_sse41,
+    dequantize_transform_skip_into_sse41_16, dequantize_transform_skip_scaled_into_sse41,
+    dequantize_transform_skip_scaled_into_sse41_16,
 };
 pub(crate) use intra::predict_into_sse41;
 pub(crate) use reconstruct::{add_residual_into_sse41, add_residual_into_sse41_16};

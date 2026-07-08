@@ -33,8 +33,11 @@ use core::arch::x86::*;
 use core::arch::x86_64::*;
 
 use crate::transform::{
-    DequantParams, TransformSkipParams, dequantize_into_scalar_i16, dequantize_into_scalar_i32,
-    dequantize_transform_skip_into_scalar_i16, dequantize_transform_skip_into_scalar_i32,
+    DequantParams, ScalingMatrix, TransformSkipParams, dequantize_into_scalar_i16,
+    dequantize_into_scalar_i32, dequantize_scaled_into_scalar_i16,
+    dequantize_scaled_into_scalar_i32, dequantize_transform_skip_into_scalar_i16,
+    dequantize_transform_skip_into_scalar_i32, dequantize_transform_skip_scaled_into_scalar_i16,
+    dequantize_transform_skip_scaled_into_scalar_i32,
 };
 
 #[inline]
@@ -58,6 +61,39 @@ fn mullo_safe(levels: &[i32], n: usize, params: DequantParams) -> bool {
 }
 
 #[inline]
+fn scaling_factors4(base_factor: i64, scaling: ScalingMatrix<'_>, idx: usize) -> [i32; 4] {
+    std::array::from_fn(|lane| (base_factor * scaling.coeff(idx + lane)) as i32)
+}
+
+#[inline]
+fn scaled_mullo_safe(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+) -> bool {
+    let Some(count) = n.checked_mul(n) else {
+        return false;
+    };
+    let Some(levels) = levels.get(..count) else {
+        return false;
+    };
+    let base_factor = params.factor / 16;
+    if base_factor <= 0 || params.add > i32::MAX as i64 {
+        return false;
+    }
+
+    levels.iter().enumerate().all(|(idx, &level)| {
+        let factor = base_factor * scaling.coeff(idx);
+        if factor <= 0 || factor > i32::MAX as i64 {
+            return false;
+        }
+        let limit = ((i32::MAX as i64 - params.add) / factor).max(0);
+        (level as i64).abs() <= limit
+    })
+}
+
+#[inline]
 #[target_feature(enable = "sse4.1")]
 fn load_i32x4(src: &[i32; 4]) -> __m128i {
     unsafe { _mm_loadu_si128(src.as_ptr().cast::<__m128i>()) }
@@ -78,43 +114,13 @@ fn store_i16x8(dst: &mut [i16; 8], v: __m128i) {
 #[inline]
 #[target_feature(enable = "sse4.1")]
 fn sra_epi32(v: __m128i, shift: i32) -> __m128i {
-    match shift {
-        0 => v,
-        1 => _mm_srai_epi32::<1>(v),
-        2 => _mm_srai_epi32::<2>(v),
-        3 => _mm_srai_epi32::<3>(v),
-        4 => _mm_srai_epi32::<4>(v),
-        5 => _mm_srai_epi32::<5>(v),
-        6 => _mm_srai_epi32::<6>(v),
-        7 => _mm_srai_epi32::<7>(v),
-        8 => _mm_srai_epi32::<8>(v),
-        9 => _mm_srai_epi32::<9>(v),
-        10 => _mm_srai_epi32::<10>(v),
-        11 => _mm_srai_epi32::<11>(v),
-        12 => _mm_srai_epi32::<12>(v),
-        13 => _mm_srai_epi32::<13>(v),
-        14 => _mm_srai_epi32::<14>(v),
-        15 => _mm_srai_epi32::<15>(v),
-        16 => _mm_srai_epi32::<16>(v),
-        _ => _mm_sra_epi32(v, _mm_cvtsi32_si128(shift)),
-    }
+    _mm_sra_epi32(v, _mm_cvtsi32_si128(shift))
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
 fn shl_epi32(v: __m128i, shift: i32) -> __m128i {
-    match shift {
-        0 => v,
-        1 => _mm_slli_epi32::<1>(v),
-        2 => _mm_slli_epi32::<2>(v),
-        3 => _mm_slli_epi32::<3>(v),
-        4 => _mm_slli_epi32::<4>(v),
-        5 => _mm_slli_epi32::<5>(v),
-        6 => _mm_slli_epi32::<6>(v),
-        7 => _mm_slli_epi32::<7>(v),
-        8 => _mm_slli_epi32::<8>(v),
-        _ => _mm_sll_epi32(v, _mm_cvtsi32_si128(shift)),
-    }
+    _mm_sll_epi32(v, _mm_cvtsi32_si128(shift))
 }
 
 #[inline]
@@ -137,8 +143,35 @@ fn dequant4_sse41(levels: &[i32; 4], params: DequantParams) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn dequant4_scaled_sse41(levels: &[i32; 4], factors: &[i32; 4], params: DequantParams) -> __m128i {
+    let v = load_i32x4(levels);
+    let f = load_i32x4(factors);
+    let v = _mm_mullo_epi32(v, f);
+    let v = _mm_add_epi32(v, _mm_set1_epi32(params.add as i32));
+    clip_i16_s32x4(sra_epi32(v, params.shift))
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 fn transform_skip4_sse41(levels: &[i32; 4], params: TransformSkipParams) -> __m128i {
     let deq = dequant4_sse41(levels, params.dequant);
+    let shifted = if params.tr_shift >= 0 {
+        let v = _mm_add_epi32(deq, _mm_set1_epi32(params.tr_add));
+        sra_epi32(v, params.tr_shift)
+    } else {
+        shl_epi32(deq, -params.tr_shift)
+    };
+    clip_i16_s32x4(shifted)
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn transform_skip4_scaled_sse41(
+    levels: &[i32; 4],
+    factors: &[i32; 4],
+    params: TransformSkipParams,
+) -> __m128i {
+    let deq = dequant4_scaled_sse41(levels, factors, params.dequant);
     let shifted = if params.tr_shift >= 0 {
         let v = _mm_add_epi32(deq, _mm_set1_epi32(params.tr_add));
         sra_epi32(v, params.tr_shift)
@@ -208,6 +241,92 @@ fn dequantize_transform_skip_into_sse41_16_impl(
     }
 }
 
+#[target_feature(enable = "sse4.1")]
+fn dequantize_scaled_into_sse41_impl(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    let count = n * n;
+    let base_factor = params.factor / 16;
+    let (levels, _) = levels[..count].as_chunks::<4>();
+    let (out, _) = out[..count].as_chunks_mut::<4>();
+
+    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
+        let factors = scaling_factors4(base_factor, scaling, block_idx * 4);
+        store_i32x4(dst, dequant4_scaled_sse41(src, &factors, params));
+    }
+}
+
+#[target_feature(enable = "sse4.1")]
+fn dequantize_scaled_into_sse41_16_impl(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    let count = n * n;
+    let base_factor = params.factor / 16;
+    let (levels, _) = levels[..count].as_chunks::<8>();
+    let (out, _) = out[..count].as_chunks_mut::<8>();
+
+    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
+        let (src4, _) = src.as_chunks::<4>();
+        let idx = block_idx * 8;
+        let factors_lo = scaling_factors4(base_factor, scaling, idx);
+        let factors_hi = scaling_factors4(base_factor, scaling, idx + 4);
+        let lo = dequant4_scaled_sse41(&src4[0], &factors_lo, params);
+        let hi = dequant4_scaled_sse41(&src4[1], &factors_hi, params);
+        store_i16x8(dst, _mm_packs_epi32(lo, hi));
+    }
+}
+
+#[target_feature(enable = "sse4.1")]
+fn dequantize_transform_skip_scaled_into_sse41_impl(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    debug_assert_eq!(n, 4);
+    let base_factor = params.dequant.factor / 16;
+    let (levels, _) = levels[..16].as_chunks::<4>();
+    let (out, _) = out[..16].as_chunks_mut::<4>();
+
+    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
+        let factors = scaling_factors4(base_factor, scaling, block_idx * 4);
+        store_i32x4(dst, transform_skip4_scaled_sse41(src, &factors, params));
+    }
+}
+
+#[target_feature(enable = "sse4.1")]
+fn dequantize_transform_skip_scaled_into_sse41_16_impl(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    debug_assert_eq!(n, 4);
+    let base_factor = params.dequant.factor / 16;
+    let (levels, _) = levels[..16].as_chunks::<8>();
+    let (out, _) = out[..16].as_chunks_mut::<8>();
+
+    for (block_idx, (src, dst)) in levels.iter().zip(out.iter_mut()).enumerate() {
+        let (src4, _) = src.as_chunks::<4>();
+        let idx = block_idx * 8;
+        let factors_lo = scaling_factors4(base_factor, scaling, idx);
+        let factors_hi = scaling_factors4(base_factor, scaling, idx + 4);
+        let lo = transform_skip4_scaled_sse41(&src4[0], &factors_lo, params);
+        let hi = transform_skip4_scaled_sse41(&src4[1], &factors_hi, params);
+        store_i16x8(dst, _mm_packs_epi32(lo, hi));
+    }
+}
+
 pub(crate) fn dequantize_into_sse41(
     levels: &[i32],
     n: usize,
@@ -258,4 +377,60 @@ pub(crate) fn dequantize_transform_skip_into_sse41_16(
         return;
     }
     unsafe { dequantize_transform_skip_into_sse41_16_impl(levels, n, params, out) }
+}
+
+pub(crate) fn dequantize_scaled_into_sse41(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    if !supported_n(n) || !scaled_mullo_safe(levels, n, params, scaling) {
+        dequantize_scaled_into_scalar_i32(levels, n, params, scaling, out);
+        return;
+    }
+    unsafe { dequantize_scaled_into_sse41_impl(levels, n, params, scaling, out) }
+}
+
+pub(crate) fn dequantize_scaled_into_sse41_16(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    if !supported_n(n) || !scaled_mullo_safe(levels, n, params, scaling) {
+        dequantize_scaled_into_scalar_i16(levels, n, params, scaling, out);
+        return;
+    }
+    unsafe { dequantize_scaled_into_sse41_16_impl(levels, n, params, scaling, out) }
+}
+
+pub(crate) fn dequantize_transform_skip_scaled_into_sse41(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    if n != 4 || !scaled_mullo_safe(levels, n, params.dequant, scaling) {
+        dequantize_transform_skip_scaled_into_scalar_i32(levels, n, params, scaling, out);
+        return;
+    }
+    unsafe { dequantize_transform_skip_scaled_into_sse41_impl(levels, n, params, scaling, out) }
+}
+
+pub(crate) fn dequantize_transform_skip_scaled_into_sse41_16(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    if n != 4 || !scaled_mullo_safe(levels, n, params.dequant, scaling) {
+        dequantize_transform_skip_scaled_into_scalar_i16(levels, n, params, scaling, out);
+        return;
+    }
+    unsafe { dequantize_transform_skip_scaled_into_sse41_16_impl(levels, n, params, scaling, out) }
 }
