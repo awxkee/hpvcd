@@ -111,7 +111,7 @@ pub(crate) struct FullDecoder<'cab> {
     // QP tracking
     slice_qp: i32,
     qp_y_prev: i32,
-    qp_y_map: crate::plane::Plane<i16>, // per 4×4 luma (QpY ∈ −24..51, fits i16; halves a multi-MB buffer)
+    qp_y_map: crate::plane::Plane<i16>, // per 4×4 luma (QpY ∈ -QpBdOffsetY..=51, fits i16)
     cu_qp_delta_val: i32,
     is_cu_qp_delta_coded: bool,
     log2_qg: u32,
@@ -167,7 +167,7 @@ impl FullDecoder<'static> {
         pps: Pps,
         hdr: &SliceHeader,
     ) -> Result<Self, DecodeError> {
-        let slice_qp = hdr.slice_qp;
+        let hdr_slice_qp = hdr.slice_qp;
         let sao_luma = hdr.sao_luma;
         let sao_chroma = hdr.sao_chroma;
         // Reject dimensions that would cause enormous allocations.
@@ -191,6 +191,8 @@ impl FullDecoder<'static> {
             8 | 10 | 12 => {}
             n => return Err(DecodeError::UnsupportedBitDepth(n)),
         }
+
+        let slice_qp = clamp_qpy(hdr_slice_qp, sps.bit_depth_luma);
 
         let cab =
             CabacDecoder::new(cabac).map_err(|_| DecodeError::Bitstream("cabac init".into()))?;
@@ -287,9 +289,10 @@ impl<'cab> FullDecoder<'cab> {
         self.cab.reset_with(cabac)?;
         if !hdr.dependent_slice_segment {
             // Independent segment: reset entropy contexts and slice-level state.
-            self.slice_qp = hdr.slice_qp;
-            self.qp_y_prev = hdr.slice_qp;
-            self.cur_qp = hdr.slice_qp;
+            let slice_qp = clamp_qpy(hdr.slice_qp, self.bd);
+            self.slice_qp = slice_qp;
+            self.qp_y_prev = slice_qp;
+            self.cur_qp = slice_qp;
             self.cu_qp_delta_val = 0;
             self.is_cu_qp_delta_coded = false;
             self.sao_luma = hdr.sao_luma;
@@ -299,7 +302,7 @@ impl<'cab> FullDecoder<'cab> {
             self.deblocking_disabled = hdr.deblocking_disabled;
             self.beta_offset_div2 = hdr.beta_offset_div2;
             self.tc_offset_div2 = hdr.tc_offset_div2;
-            let qp = hdr.slice_qp.clamp(0, 51) as u8;
+            let qp = slice_qp.clamp(0, 51) as u8;
             self.ctx = ContextSet::init_islice(qp);
             self.ictx = IntraModeContexts::init_islice(qp);
         } else {
@@ -1382,7 +1385,7 @@ impl<'cab> FullDecoder<'cab> {
         if x0 == xqg && y0 == yqg {
             self.is_cu_qp_delta_coded = false;
             self.cu_qp_delta_val = 0;
-            self.cur_qp = self.predict_qp(xqg, yqg);
+            self.cur_qp = clamp_qpy(self.predict_qp(xqg, yqg), self.bd);
         }
 
         // cu_transquant_bypass_flag (HEVC §7.3.8.5): first CU element, present only
@@ -1478,8 +1481,10 @@ impl<'cab> FullDecoder<'cab> {
 
         // mark decoded
         self.mark_decoded(x0, y0, cb_size);
-        self.qp_y_prev = self.cur_qp;
-        self.set_qp(x0, y0, cb_size, self.cur_qp);
+        let cur_qp = clamp_qpy(self.cur_qp, self.bd);
+        self.qp_y_prev = cur_qp;
+        self.cur_qp = cur_qp;
+        self.set_qp(x0, y0, cb_size, cur_qp);
     }
 
     #[inline]
@@ -1522,17 +1527,20 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             self.qp_y_prev
         };
+        debug_assert!((qpy_min(self.bd)..=51).contains(&qp_a));
+        debug_assert!((qpy_min(self.bd)..=51).contains(&qp_b));
         (qp_a + qp_b + 1) >> 1
     }
 
     fn set_qp(&mut self, x0: usize, y0: usize, size: usize, qp: i32) {
+        let qp = clamp_qpy(qp, self.bd) as i16;
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
                 if xx < self.w
                     && yy < self.h
                     && let Some(g) = self.grid_idx(xx, yy)
                 {
-                    self.qp_y_map[g] = qp as i16;
+                    self.qp_y_map[g] = qp;
                 }
             }
         }
@@ -1846,12 +1854,10 @@ impl<'cab> FullDecoder<'cab> {
         if self.pps.cu_qp_delta_enabled && need_qp && !self.is_cu_qp_delta_coded {
             self.cu_qp_delta_val = self.decode_cu_qp_delta();
             self.is_cu_qp_delta_coded = true;
-            // recompute QpY for the QG
-            let qp_bd = 0; // 8/10/12-bit luma offset is 0 here (QpBdOffsetY=6*(bd-8) but applied symmetrically)
-            let off = 6 * (self.bd as i32 - 8);
+            // Recompute QpY for the QG. Keep the arithmetic in i64 so a
+            // malformed/fuzzer delta cannot overflow before the final QpY clamp.
             self.cur_qp =
-                ((self.predict_qp_cur() + self.cu_qp_delta_val + 52 + 2 * off) % (52 + off)) - off
-                    + qp_bd;
+                derive_qpy_from_delta(self.predict_qp_cur(), self.cu_qp_delta_val, self.bd);
         }
 
         // luma residual + reconstruction
@@ -1908,8 +1914,9 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     fn decode_cu_qp_delta(&mut self) -> i32 {
-        // cu_qp_delta_abs: prefix TU (cMax=5) ctx[0] then ctx[1], then bypass EG0
-        let mut abs_val;
+        // cu_qp_delta_abs: prefix TU (cMax=5) ctx[0] then ctx[1], then bypass EG0.
+        // Use wide/saturating arithmetic so malformed EG0 suffixes cannot poison
+        // QpY state through debug-overflow panics before derive_qpy_from_delta().
         let mut prefix = 0;
         while prefix < 5 {
             let ci = if prefix == 0 { 0 } else { 1 };
@@ -1918,22 +1925,26 @@ impl<'cab> FullDecoder<'cab> {
             }
             prefix += 1;
         }
-        abs_val = prefix;
+        let mut abs_val = i64::from(prefix);
         if prefix >= 5 {
-            // EG0 suffix (bypass)
-            let mut k = 0;
+            // EG0 suffix (bypass). A valid stream should stay tiny here; cap the
+            // fuzz-only runaway case at an i32-representable delta.
+            let mut k = 0u32;
             while self.cab.decode_bypass() != 0 {
-                k += 1;
-                if k > 30 {
+                if k >= 30 {
                     break;
                 }
+                k += 1;
             }
-            let mut suffix = 0i32;
+            let mut suffix = 0i64;
             for _ in 0..k {
-                suffix = (suffix << 1) | self.cab.decode_bypass() as i32;
+                suffix = (suffix << 1) | i64::from(self.cab.decode_bypass());
             }
-            abs_val += suffix + (1 << k) - 1;
+            abs_val = abs_val
+                .saturating_add(suffix)
+                .saturating_add((1i64 << k).saturating_sub(1));
         }
+        let abs_val = abs_val.min(i64::from(i32::MAX)) as i32;
         if abs_val > 0 {
             let sign = self.cab.decode_bypass();
             if sign != 0 { -abs_val } else { abs_val }
@@ -2789,6 +2800,24 @@ fn qp_bd_offset(bit_depth: u8) -> i32 {
 }
 
 #[inline]
+fn qpy_min(bit_depth: u8) -> i32 {
+    -qp_bd_offset(bit_depth)
+}
+
+#[inline]
+fn clamp_qpy(qp: i32, bit_depth: u8) -> i32 {
+    qp.clamp(qpy_min(bit_depth), 51)
+}
+
+#[inline]
+fn derive_qpy_from_delta(prev: i32, delta: i32, bit_depth: u8) -> i32 {
+    let off = i64::from(qp_bd_offset(bit_depth));
+    let modulus = 52 + off;
+    let qp = (i64::from(prev) + i64::from(delta) + 52 + 2 * off).rem_euclid(modulus) - off;
+    clamp_qpy(qp as i32, bit_depth)
+}
+
+#[inline]
 fn qp_prime(qp: i32, bit_depth: u8) -> i32 {
     let off = qp_bd_offset(bit_depth);
     (qp + off).clamp(0, 51 + off)
@@ -3045,7 +3074,7 @@ pub(crate) fn parse_slice_header_full(
             r.read_bit().map_err(|_| e("alignment_pad"))?;
         }
         return Ok(SliceHeader {
-            slice_qp: pps.init_qp,
+            slice_qp: clamp_qpy(pps.init_qp, sps.bit_depth_luma),
             sao_luma: false,
             sao_chroma: false,
             cabac_offset: r.bit_pos() / 8,
@@ -3082,7 +3111,10 @@ pub(crate) fn parse_slice_header_full(
         }
     }
     let slice_qp_delta = r.read_se().map_err(|_| e("qp_delta"))?;
-    let slice_qp = pps.init_qp + slice_qp_delta;
+    let slice_qp = clamp_qpy(
+        pps.init_qp.saturating_add(slice_qp_delta),
+        sps.bit_depth_luma,
+    );
     // slice_cb_qp_offset / slice_cr_qp_offset (§7.3.6.1): added to the PPS-level
     // offsets when deriving chroma QP. Previously parsed and dropped.
     let mut cb_qp_offset = 0;
@@ -3162,7 +3194,7 @@ fn ceil_log2(n: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ceil_log2, qp_prime, qpc};
+    use super::{ceil_log2, clamp_qpy, derive_qpy_from_delta, qp_prime, qpc, qpy_min};
 
     #[test]
     fn ceil_log2_matches_slice_address_widths() {
@@ -3194,5 +3226,21 @@ mod tests {
         assert_eq!(qpc(-24, 1, 12), -24);
         assert_eq!(qp_prime(qpc(-12, 1, 10), 10), 0);
         assert_eq!(qp_prime(qpc(-24, 3, 12), 12), 0);
+    }
+
+    #[test]
+    fn luma_qpy_clamp_uses_bit_depth_offset() {
+        assert_eq!(clamp_qpy(-1, 8), 0);
+        assert_eq!(clamp_qpy(-12, 10), -12);
+        assert_eq!(clamp_qpy(-13, 10), -12);
+        assert_eq!(clamp_qpy(-24, 12), -24);
+        assert_eq!(clamp_qpy(90, 12), 51);
+    }
+
+    #[test]
+    fn luma_qpy_delta_derivation_is_overflow_hardened() {
+        assert_eq!(derive_qpy_from_delta(51, 0, 8), 51);
+        assert!((qpy_min(12)..=51).contains(&derive_qpy_from_delta(i32::MAX, i32::MAX, 12)));
+        assert!((qpy_min(12)..=51).contains(&derive_qpy_from_delta(i32::MIN, i32::MIN, 12)));
     }
 }

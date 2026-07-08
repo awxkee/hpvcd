@@ -608,7 +608,9 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
     let cabac_init_present = r.read_flag().map_err(|_| e("cabac_init"))?;
     let _nref0 = r.read_ue().map_err(|_| e("nref0"))?;
     let _nref1 = r.read_ue().map_err(|_| e("nref1"))?;
-    let init_qp = 26 + r.read_se().map_err(|_| e("init_qp"))?;
+    let init_qp = 26i32
+        .saturating_add(r.read_se().map_err(|_| e("init_qp"))?)
+        .clamp(0, 51);
     let constrained_intra_pred = r.read_flag().map_err(|_| e("constrained_intra"))?;
     let transform_skip_enabled = r.read_flag().map_err(|_| e("transform_skip"))?;
     let cu_qp_delta_enabled = r.read_flag().map_err(|_| e("cu_qp_delta"))?;

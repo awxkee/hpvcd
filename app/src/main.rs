@@ -4,7 +4,7 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let bytes = fs::read("./assets/IMG_5556.HEIC").unwrap();
+    let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
@@ -50,5 +50,5 @@ fn main() {
         )
         .unwrap(),
     );
-    img.save("./out.png").unwrap();
+    img.save("./out1.jpg").unwrap();
 }

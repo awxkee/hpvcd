@@ -190,24 +190,23 @@ impl<'a> CabacDecoder<'a> {
     /// Decode one context-coded bin (HEVC Table 9-15 DecodeDecision).
     #[inline]
     pub(crate) fn decode_bin(&mut self, ctx: &mut CtxModel) -> u8 {
-        let state = ctx.p_state_idx as usize;
+        let ctx_state = ctx.state;
+        let state = (ctx_state & 63) as usize;
+        let mps = ctx_state >> 6;
         let lps = RANGE_TAB_LPS[state][(self.range >> 6) as usize & 3] as u32;
         self.range -= lps;
         if self.offset >= self.range {
-            let bin_val = 1 - ctx.val_mps;
+            let bin_val = mps ^ 1;
             self.offset -= self.range;
             self.range = lps;
-            if ctx.p_state_idx == 0 {
-                ctx.val_mps ^= 1;
-            }
-            ctx.p_state_idx = TRANS_IDX_LPS[state];
+            let next_mps = if state == 0 { mps ^ 1 } else { mps };
+            ctx.state = TRANS_IDX_LPS[state] | (next_mps << 6);
             self.renorm();
             bin_val
         } else {
-            let bin_val = ctx.val_mps;
-            ctx.p_state_idx = TRANS_IDX_MPS[state];
+            ctx.state = TRANS_IDX_MPS[state] | (mps << 6);
             self.renorm();
-            bin_val
+            mps
         }
     }
 

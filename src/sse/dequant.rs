@@ -254,21 +254,21 @@ fn dequantize_transform_skip_into_sse41_impl(
     let d2 = dequant4_sse41_const(&levels[2], factor, add, shift, clip_lo, clip_hi);
     let d3 = dequant4_sse41_const(&levels[3], factor, add, shift, clip_lo, clip_hi);
 
-    let v0;
-    let v1;
-    let v2;
-    let v3;
-    if params.tr_shift >= 0 {
-        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
-        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
-        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
-        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift),
+        )
     } else {
-        v0 = shl_epi32_count(d0, tr_shift);
-        v1 = shl_epi32_count(d1, tr_shift);
-        v2 = shl_epi32_count(d2, tr_shift);
-        v3 = shl_epi32_count(d3, tr_shift);
-    }
+        (
+            shl_epi32_count(d0, tr_shift),
+            shl_epi32_count(d1, tr_shift),
+            shl_epi32_count(d2, tr_shift),
+            shl_epi32_count(d3, tr_shift),
+        )
+    };
 
     store_i32x4(&mut out[0], clip_i16_s32x4_with(v0, clip_lo, clip_hi));
     store_i32x4(&mut out[1], clip_i16_s32x4_with(v1, clip_lo, clip_hi));
@@ -302,21 +302,21 @@ fn dequantize_transform_skip_into_sse41_16_impl(
     let d2 = dequant4_sse41_const(&src1[0], factor, add, shift, clip_lo, clip_hi);
     let d3 = dequant4_sse41_const(&src1[1], factor, add, shift, clip_lo, clip_hi);
 
-    let v0;
-    let v1;
-    let v2;
-    let v3;
-    if params.tr_shift >= 0 {
-        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
-        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
-        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
-        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift),
+        )
     } else {
-        v0 = shl_epi32_count(d0, tr_shift);
-        v1 = shl_epi32_count(d1, tr_shift);
-        v2 = shl_epi32_count(d2, tr_shift);
-        v3 = shl_epi32_count(d3, tr_shift);
-    }
+        (
+            shl_epi32_count(d0, tr_shift),
+            shl_epi32_count(d1, tr_shift),
+            shl_epi32_count(d2, tr_shift),
+            shl_epi32_count(d3, tr_shift),
+        )
+    };
 
     let lo = clip_i16_s32x4_with(v0, clip_lo, clip_hi);
     let hi = clip_i16_s32x4_with(v1, clip_lo, clip_hi);
@@ -451,21 +451,21 @@ fn dequantize_transform_skip_scaled_into_sse41_impl(
     let d2 = dequant4_scaled_sse41_const(&levels[2], &f2, add, shift, clip_lo, clip_hi);
     let d3 = dequant4_scaled_sse41_const(&levels[3], &f3, add, shift, clip_lo, clip_hi);
 
-    let v0;
-    let v1;
-    let v2;
-    let v3;
-    if params.tr_shift >= 0 {
-        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
-        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
-        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
-        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift),
+        )
     } else {
-        v0 = shl_epi32_count(d0, tr_shift);
-        v1 = shl_epi32_count(d1, tr_shift);
-        v2 = shl_epi32_count(d2, tr_shift);
-        v3 = shl_epi32_count(d3, tr_shift);
-    }
+        (
+            shl_epi32_count(d0, tr_shift),
+            shl_epi32_count(d1, tr_shift),
+            shl_epi32_count(d2, tr_shift),
+            shl_epi32_count(d3, tr_shift),
+        )
+    };
 
     store_i32x4(&mut out[0], clip_i16_s32x4_with(v0, clip_lo, clip_hi));
     store_i32x4(&mut out[1], clip_i16_s32x4_with(v1, clip_lo, clip_hi));
@@ -504,21 +504,21 @@ fn dequantize_transform_skip_scaled_into_sse41_16_impl(
     let d2 = dequant4_scaled_sse41_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
     let d3 = dequant4_scaled_sse41_const(&src1[1], &f3, add, shift, clip_lo, clip_hi);
 
-    let v0;
-    let v1;
-    let v2;
-    let v3;
-    if params.tr_shift >= 0 {
-        v0 = sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift);
-        v1 = sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift);
-        v2 = sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift);
-        v3 = sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift);
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            sra_epi32_count(_mm_add_epi32(d0, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d1, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d2, tr_add), tr_shift),
+            sra_epi32_count(_mm_add_epi32(d3, tr_add), tr_shift),
+        )
     } else {
-        v0 = shl_epi32_count(d0, tr_shift);
-        v1 = shl_epi32_count(d1, tr_shift);
-        v2 = shl_epi32_count(d2, tr_shift);
-        v3 = shl_epi32_count(d3, tr_shift);
-    }
+        (
+            shl_epi32_count(d0, tr_shift),
+            shl_epi32_count(d1, tr_shift),
+            shl_epi32_count(d2, tr_shift),
+            shl_epi32_count(d3, tr_shift),
+        )
+    };
 
     let lo = clip_i16_s32x4_with(v0, clip_lo, clip_hi);
     let hi = clip_i16_s32x4_with(v1, clip_lo, clip_hi);
