@@ -34,7 +34,7 @@ pub(crate) static DST4: [[i32; 4]; 4] = [
     [55, -84, 74, -29],
 ];
 
-static DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
+const DEQUANT_SCALE: [i64; 6] = [40, 45, 51, 57, 64, 72];
 
 /// Coefficient/residual storage element: `i16` for 8-bit depth, `i32` for 10/12-bit.
 /// Butterfly accumulators are always i32; this only picks the in/out storage width.
@@ -579,28 +579,296 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
     }
 }
 
-/// Dequantize into `out[..n*n]`. Output is always within i16 range (spec clamp),
-/// so it stores exactly whether `S` is `i16` or `i32`.
-pub(crate) fn dequantize_into<S: Coeff>(
-    levels: &[i32],
-    n: usize,
-    qp: u8,
-    bit_depth: u8,
-    out: &mut [S],
-) {
+#[derive(Clone, Copy)]
+pub(crate) struct DequantParams {
+    pub factor: i64,
+    pub add: i64,
+    pub shift: i32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TransformSkipParams {
+    pub dequant: DequantParams,
+    pub tr_add: i32,
+    pub tr_shift: i32,
+}
+
+#[inline]
+fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantParams {
     let log2n = (n as u32).trailing_zeros() as i64;
     let bd = bit_depth as i64;
     let bd_shift = (bd + log2n - 5).max(1);
-    let add = 1i64 << (bd_shift - 1);
-    let qp_bd_offset = 6 * (bd - 8);
-    let qp_scaled = (qp as i64) + qp_bd_offset;
+    let max_qp_prime = 51 + 6 * (bit_depth as i32 - 8);
+    let qp_scaled = qp_prime.clamp(0, max_qp_prime) as i64;
     let scale = DEQUANT_SCALE[(qp_scaled % 6) as usize];
     let per = 1i64 << (qp_scaled / 6);
-    let factor = scale * per * 16;
+    DequantParams {
+        factor: scale * per * 16,
+        add: 1i64 << (bd_shift - 1),
+        shift: bd_shift as i32,
+    }
+}
+
+#[inline]
+fn transform_skip_params(n: usize, qp_prime: i32, bit_depth: u8) -> TransformSkipParams {
+    let dequant = dequant_params(n, qp_prime, bit_depth);
+    let log2n = (n as u32).trailing_zeros() as i32;
+    // getTransformShift(bitDepth, log2TrSize, maxLog2TrDynamicRange), with
+    // maxLog2TrDynamicRange fixed to 15 for the supported HEVC profiles.
+    let tr_shift = 15i32 - bit_depth as i32 - log2n;
+    let tr_add = if tr_shift > 0 {
+        1i32 << (tr_shift - 1)
+    } else {
+        0
+    };
+    TransformSkipParams {
+        dequant,
+        tr_add,
+        tr_shift,
+    }
+}
+
+#[inline]
+fn apply_transform_skip_shift(deq: i32, params: TransformSkipParams) -> i32 {
+    if params.tr_shift >= 0 {
+        (deq + params.tr_add) >> params.tr_shift
+    } else {
+        deq << (-params.tr_shift)
+    }
+}
+
+pub(crate) fn dequantize_into_scalar<S: Coeff>(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    out: &mut [S],
+) {
     for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
         // l*factor can exceed i32 at high QP, so the intermediate stays i64.
-        *o = S::from_i32(((l as i64 * factor + add) >> bd_shift).clamp(-32768, 32767) as i32);
+        let v = ((l as i64 * params.factor + params.add) >> params.shift).clamp(-32768, 32767);
+        *o = S::from_i32(v as i32);
     }
+}
+
+pub(crate) fn dequantize_transform_skip_into_scalar<S: Coeff>(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    out: &mut [S],
+) {
+    debug_assert!(
+        n == 4,
+        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
+    );
+
+    for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
+        let deq = ((l as i64 * params.dequant.factor + params.dequant.add) >> params.dequant.shift)
+            .clamp(-32768, 32767) as i32;
+        let residual = apply_transform_skip_shift(deq, params).clamp(-32768, 32767);
+        *o = S::from_i32(residual);
+    }
+}
+
+pub(crate) fn dequantize_into_scalar_i32(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    out: &mut [i32],
+) {
+    dequantize_into_scalar(levels, n, params, out);
+}
+
+pub(crate) fn dequantize_into_scalar_i16(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    out: &mut [i16],
+) {
+    dequantize_into_scalar(levels, n, params, out);
+}
+
+pub(crate) fn dequantize_transform_skip_into_scalar_i32(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    out: &mut [i32],
+) {
+    dequantize_transform_skip_into_scalar(levels, n, params, out);
+}
+
+pub(crate) fn dequantize_transform_skip_into_scalar_i16(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    out: &mut [i16],
+) {
+    dequantize_transform_skip_into_scalar(levels, n, params, out);
+}
+
+// `n` = transform width/height. Output is clipped to the HEVC residual dynamic
+// range used by the rest of this decoder.
+type DequantFn = fn(&[i32], usize, DequantParams, &mut [i32]);
+type DequantFn16 = fn(&[i32], usize, DequantParams, &mut [i16]);
+type DequantSkipFn = fn(&[i32], usize, TransformSkipParams, &mut [i32]);
+type DequantSkipFn16 = fn(&[i32], usize, TransformSkipParams, &mut [i16]);
+
+static DEQUANT: std::sync::OnceLock<DequantFn> = std::sync::OnceLock::new();
+static DEQUANT16: std::sync::OnceLock<DequantFn16> = std::sync::OnceLock::new();
+static DEQUANT_SKIP: std::sync::OnceLock<DequantSkipFn> = std::sync::OnceLock::new();
+static DEQUANT_SKIP16: std::sync::OnceLock<DequantSkipFn16> = std::sync::OnceLock::new();
+
+#[inline]
+fn resolve_dequant() -> DequantFn {
+    *DEQUANT.get_or_init(|| {
+        let mut _f: DequantFn = dequantize_into_scalar_i32;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dequant16() -> DequantFn16 {
+    *DEQUANT16.get_or_init(|| {
+        let mut _f: DequantFn16 = dequantize_into_scalar_i16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_into_sse41_16;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dequant_skip() -> DequantSkipFn {
+    *DEQUANT_SKIP.get_or_init(|| {
+        let mut _f: DequantSkipFn = dequantize_transform_skip_into_scalar_i32;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_transform_skip_into_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_transform_skip_into_sse41;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dequant_skip16() -> DequantSkipFn16 {
+    *DEQUANT_SKIP16.get_or_init(|| {
+        let mut _f: DequantSkipFn16 = dequantize_transform_skip_into_scalar_i16;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::dequantize_transform_skip_into_neon16;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::dequantize_transform_skip_into_sse41_16;
+            }
+        }
+
+        _f
+    })
+}
+
+pub(crate) trait DequantTarget: Coeff {
+    fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]);
+    fn dequantize_transform_skip(
+        levels: &[i32],
+        n: usize,
+        params: TransformSkipParams,
+        out: &mut [Self],
+    );
+}
+
+impl DequantTarget for i32 {
+    #[inline]
+    fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]) {
+        resolve_dequant()(levels, n, params, out);
+    }
+
+    #[inline]
+    fn dequantize_transform_skip(
+        levels: &[i32],
+        n: usize,
+        params: TransformSkipParams,
+        out: &mut [Self],
+    ) {
+        resolve_dequant_skip()(levels, n, params, out);
+    }
+}
+
+impl DequantTarget for i16 {
+    #[inline]
+    fn dequantize(levels: &[i32], n: usize, params: DequantParams, out: &mut [Self]) {
+        resolve_dequant16()(levels, n, params, out);
+    }
+
+    #[inline]
+    fn dequantize_transform_skip(
+        levels: &[i32],
+        n: usize,
+        params: TransformSkipParams,
+        out: &mut [Self],
+    ) {
+        resolve_dequant_skip16()(levels, n, params, out);
+    }
+}
+
+pub(crate) fn dequantize_into<S: DequantTarget>(
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    out: &mut [S],
+) {
+    let params = dequant_params(n, qp_prime, bit_depth);
+    S::dequantize(levels, n, params, out);
+}
+
+pub(crate) fn dequantize_transform_skip_into<S: DequantTarget>(
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    out: &mut [S],
+) {
+    debug_assert!(
+        n == 4,
+        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
+    );
+    let params = transform_skip_params(n, qp_prime, bit_depth);
+    S::dequantize_transform_skip(levels, n, params, out);
 }
 
 // `nx` = number of nonzero input columns (last_x + 1); stage 1 skips the rest.
@@ -772,4 +1040,96 @@ pub(crate) fn inv_transform_into16(
 /// i16 inverse 4×4 DST (8-bit depth).
 pub(crate) fn inv_transform_dst_into16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
     resolve_inv_transform_dst4_16()(coeff, bit_depth, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_skip_4x4_8bit_qp22_known_values() {
+        let mut levels = [0i32; 16];
+        levels[0] = 1;
+        levels[1] = -1;
+        levels[2] = 2;
+        levels[3] = -2;
+
+        let mut out = [0i16; 16];
+        dequantize_transform_skip_into(&levels, 4, 22, 8, &mut out);
+
+        assert_eq!(out[0], 8);
+        assert_eq!(out[1], -8);
+        assert_eq!(out[2], 16);
+        assert_eq!(out[3], -16);
+        assert!(out[4..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn transform_skip_is_dequant_plus_logical_inverse_skip() {
+        let levels = [3, -2, 0, 1, -1, 0, 2, -3, 0, 4, -4, 0, 1, 0, -1, 2];
+        let mut deq = [0i32; 16];
+        let mut out = [0i32; 16];
+
+        dequantize_into(&levels, 4, 18, 8, &mut deq);
+        dequantize_transform_skip_into(&levels, 4, 18, 8, &mut out);
+
+        let shift = 15 - 8 - 2;
+        let add = 1 << (shift - 1);
+        for (actual, &d) in out.iter().zip(deq.iter()) {
+            assert_eq!(*actual, (d + add) >> shift);
+        }
+    }
+
+    #[test]
+    fn scalar_dequant_matches_public_dispatch_i16() {
+        let levels = [-12, 0, 7, 19, -31, 42, 3, -4, 5, -6, 100, -100, 1, 2, -3, 4];
+        let params = dequant_params(4, 34, 8);
+        let mut expected = [0i16; 16];
+        let mut actual = [0i16; 16];
+
+        dequantize_into_scalar(&levels, 4, params, &mut expected);
+        dequantize_into(&levels, 4, 34, 8, &mut actual);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn scalar_transform_skip_matches_public_dispatch_i32() {
+        let levels = [-12, 0, 7, 19, -31, 42, 3, -4, 5, -6, 100, -100, 1, 2, -3, 4];
+        let params = transform_skip_params(4, 34, 10);
+        let mut expected = [0i32; 16];
+        let mut actual = [0i32; 16];
+
+        dequantize_transform_skip_into_scalar(&levels, 4, params, &mut expected);
+        dequantize_transform_skip_into(&levels, 4, 34, 10, &mut actual);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dequant_10bit_accepts_qp_prime_zero() {
+        let mut levels = [0i32; 16];
+        levels[0] = 1;
+
+        let mut out = [0i32; 16];
+        dequantize_into(&levels, 4, 0, 10, &mut out);
+
+        // Nominal 10-bit QpY=-12 maps to qp_prime=0. The decoder must not add
+        // QpBdOffset again inside dequantization; doing so would produce 20 here.
+        assert_eq!(out[0], 5);
+        assert!(out[1..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn transform_skip_10bit_accepts_qp_prime_zero() {
+        let mut levels = [0i32; 16];
+        levels[0] = 1;
+
+        let mut out = [0i32; 16];
+        dequantize_transform_skip_into(&levels, 4, 0, 10, &mut out);
+
+        // dequant=5, transform-skip shift=15-10-log2(4)=3 => (5+4)>>3.
+        assert_eq!(out[0], 1);
+        assert!(out[1..].iter().all(|&v| v == 0));
+    }
 }

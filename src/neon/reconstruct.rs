@@ -129,9 +129,10 @@ fn add_clip4_neon(pred: int32x4_t, res: int32x4_t, zero: int32x4_t, max: int32x4
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn add_clip8_neon(pred: uint16x8_t, res: &[i32], zero: int32x4_t, max: int32x4_t) -> uint16x8_t {
-    let lo = add_clip4_neon(widen_lo_u16x4(pred), load_i32x4(res), zero, max);
-    let hi = add_clip4_neon(widen_hi_u16x4(pred), load_i32x4(&res[4..]), zero, max);
+fn add_clip8_neon(pred: uint16x8_t, res: &[i32; 8], zero: int32x4_t, max: int32x4_t) -> uint16x8_t {
+    let (res4, _) = res.as_chunks::<4>();
+    let lo = add_clip4_neon(widen_lo_u16x4(pred), load_i32x4(&res4[0]), zero, max);
+    let hi = add_clip4_neon(widen_hi_u16x4(pred), load_i32x4(&res4[1]), zero, max);
     pack_u16x8(lo, hi)
 }
 
@@ -154,12 +155,13 @@ fn add_clip_row_neon(dst: &mut [u16], pred: &[u16], res: &[i32], n: usize, max: 
         return;
     }
 
-    let mut x = 0usize;
-    while x < n {
-        let pred = load_u16x8(&pred[x..]);
-        let out = add_clip8_neon(pred, &res[x..], zero, max);
-        store_u16x8(&mut dst[x..], out);
-        x += 8;
+    let (pred8, _) = pred[..n].as_chunks::<8>();
+    let (res8, _) = res[..n].as_chunks::<8>();
+    let (dst8, _) = dst[..n].as_chunks_mut::<8>();
+
+    for ((pred, res), dst) in pred8.iter().zip(res8.iter()).zip(dst8.iter_mut()) {
+        let out = add_clip8_neon(load_u16x8(pred), res, zero, max);
+        store_u16x8(dst, out);
     }
 }
 
@@ -227,11 +229,11 @@ pub(crate) fn add_residual_into_neon(
 #[inline]
 #[target_feature(enable = "neon")]
 fn load_i16x2(src: &[i16]) -> int16x4_t {
-    debug_assert!(src.len() >= 2);
-    unsafe {
-        let v = vld1_lane_s16::<0>(src.as_ptr(), vdup_n_s16(0));
-        vld1_lane_s16::<1>(src.as_ptr().add(1), v)
-    }
+    let (src2, _) = src.as_chunks::<2>();
+    debug_assert!(!src2.is_empty());
+    let src = src2[0];
+    let v = vset_lane_s16::<0>(src[0], vdup_n_s16(0));
+    vset_lane_s16::<1>(src[1], v)
 }
 
 /// Saturating add equals widen+clamp because the result is clamped to max <= 32767.
@@ -265,13 +267,15 @@ fn add_clip_row_neon_16(dst: &mut [u16], pred: &[u16], res: &[i16], n: usize, ma
         return;
     }
 
-    let mut x = 0usize;
-    while x < n {
-        let p = vreinterpretq_s16_u16(load_u16x8(&pred[x..]));
-        let r = unsafe { vld1q_s16(res[x..].as_ptr()) };
+    let (pred8, _) = pred[..n].as_chunks::<8>();
+    let (res8, _) = res[..n].as_chunks::<8>();
+    let (dst8, _) = dst[..n].as_chunks_mut::<8>();
+
+    for ((pred, res), dst) in pred8.iter().zip(res8.iter()).zip(dst8.iter_mut()) {
+        let p = vreinterpretq_s16_u16(load_u16x8(pred));
+        let r = unsafe { vld1q_s16(res.as_ptr()) };
         let s = add_clip_i16q(p, r, zero, max);
-        store_u16x8(&mut dst[x..], vreinterpretq_u16_s16(s));
-        x += 8;
+        store_u16x8(dst, vreinterpretq_u16_s16(s));
     }
 }
 

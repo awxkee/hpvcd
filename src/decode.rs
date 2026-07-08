@@ -1874,13 +1874,13 @@ impl<'cab> FullDecoder<'cab> {
         let luma_mode = self.luma_mode_at(x0, y0, luma_modes, blk_idx);
         if cbf_luma {
             let scan = luma_scan(luma_mode, log2_ts);
-            let ts_ctx = if self.pps.transform_skip_enabled && log2_ts == 2 {
+            let ts_ctx = if self.pps.transform_skip_enabled && !self.cu_tqb && log2_ts == 2 {
                 Some(0)
             } else {
                 None
             };
             let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-            let (_tskip, max_x, _last_y) = residual_coding(
+            let (transform_skip, max_x, _last_y) = residual_coding(
                 &mut self.cab,
                 &mut self.ctx,
                 log2_ts,
@@ -1891,7 +1891,15 @@ impl<'cab> FullDecoder<'cab> {
                 self.cu_tqb,
                 &mut coeffs,
             );
-            self.reconstruct_luma(x0, y0, log2_ts, luma_mode, &coeffs, max_x + 1);
+            self.reconstruct_luma(
+                x0,
+                y0,
+                log2_ts,
+                luma_mode,
+                &coeffs,
+                max_x + 1,
+                transform_skip,
+            );
             self.coeff_scratch = coeffs;
         } else {
             // prediction only (no residual) still needs to fill rec for neighbors
@@ -2086,6 +2094,7 @@ impl<'cab> FullDecoder<'cab> {
         corner
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reconstruct_luma(
         &mut self,
         x0: usize,
@@ -2094,12 +2103,14 @@ impl<'cab> FullDecoder<'cab> {
         mode: u8,
         levels: &[i32],
         nx: usize,
+        transform_skip: bool,
     ) {
         let n = 1usize << log2_ts;
         self.predict_luma_block_into(x0, y0, n, mode);
         let stride = self.w;
         let valid_w = self.w.saturating_sub(x0).min(n);
         let valid_h = self.h.saturating_sub(y0).min(n);
+
         // 8-bit depth: residuals fit i16, halving memory traffic and widening SIMD.
         if self.bd <= 8 {
             if self.cu_tqb {
@@ -2107,28 +2118,38 @@ impl<'cab> FullDecoder<'cab> {
                     *o = l.clamp(-32768, 32767) as i16;
                 }
             } else {
-                let qp = self.cur_qp.clamp(0, 51) as u8;
-                transform::dequantize_into(
-                    levels,
-                    n,
-                    qp,
-                    self.bd,
-                    &mut self.deq_scratch16[..n * n],
-                );
-                if n == 4 {
-                    transform::inv_transform_dst_into16(
-                        &self.deq_scratch16[..n * n],
+                let qp_prime_y = qp_prime(self.cur_qp, self.bd);
+                if transform_skip {
+                    transform::dequantize_transform_skip_into(
+                        levels,
+                        n,
+                        qp_prime_y,
                         self.bd,
                         &mut self.res_scratch16[..n * n],
                     );
                 } else {
-                    transform::inv_transform_into16(
-                        &self.deq_scratch16[..n * n],
+                    transform::dequantize_into(
+                        levels,
                         n,
+                        qp_prime_y,
                         self.bd,
-                        nx,
-                        &mut self.res_scratch16[..n * n],
+                        &mut self.deq_scratch16[..n * n],
                     );
+                    if n == 4 {
+                        transform::inv_transform_dst_into16(
+                            &self.deq_scratch16[..n * n],
+                            self.bd,
+                            &mut self.res_scratch16[..n * n],
+                        );
+                    } else {
+                        transform::inv_transform_into16(
+                            &self.deq_scratch16[..n * n],
+                            n,
+                            self.bd,
+                            nx,
+                            &mut self.res_scratch16[..n * n],
+                        );
+                    }
                 }
             }
             let pred = &self.scratch.pred[..n * n];
@@ -2144,27 +2165,44 @@ impl<'cab> FullDecoder<'cab> {
             self.mark_decoded(x0, y0, n);
             return;
         }
+
         if self.cu_tqb {
             // Lossless: residual is the parsed level array verbatim (row-major),
             // no scaling or inverse transform (HEVC §8.6.5).
             self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
         } else {
-            let qp = self.cur_qp.clamp(0, 51) as u8;
-            transform::dequantize_into(levels, n, qp, self.bd, &mut self.deq_scratch[..n * n]);
-            if n == 4 {
-                transform::inv_transform_dst_into(
-                    &self.deq_scratch[..n * n],
+            let qp_prime_y = qp_prime(self.cur_qp, self.bd);
+            if transform_skip {
+                transform::dequantize_transform_skip_into(
+                    levels,
+                    n,
+                    qp_prime_y,
                     self.bd,
                     &mut self.res_scratch[..n * n],
                 );
             } else {
-                transform::inv_transform_into(
-                    &self.deq_scratch[..n * n],
+                transform::dequantize_into(
+                    levels,
                     n,
+                    qp_prime_y,
                     self.bd,
-                    nx,
-                    &mut self.res_scratch[..n * n],
+                    &mut self.deq_scratch[..n * n],
                 );
+                if n == 4 {
+                    transform::inv_transform_dst_into(
+                        &self.deq_scratch[..n * n],
+                        self.bd,
+                        &mut self.res_scratch[..n * n],
+                    );
+                } else {
+                    transform::inv_transform_into(
+                        &self.deq_scratch[..n * n],
+                        n,
+                        self.bd,
+                        nx,
+                        &mut self.res_scratch[..n * n],
+                    );
+                }
             }
         }
         let pred = &self.scratch.pred[..n * n];
@@ -2261,51 +2299,89 @@ impl<'cab> FullDecoder<'cab> {
         let n_tb = if idc == 2 { 2 } else { 1 };
         let scan = chroma_scan(mode, clog2, idc == 3);
 
-        let qp_cb = qpc(
-            self.cur_qp + self.pps.cb_qp_offset + self.slice_cb_qp_offset,
-            idc,
+        let qp_prime_cb = qp_prime(
+            qpc(
+                self.cur_qp + self.pps.cb_qp_offset + self.slice_cb_qp_offset,
+                idc,
+                self.bd_c,
+            ),
+            self.bd_c,
         );
         for (t, &cb) in cbf_cb[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cb {
                 let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-                let (_, max_x, _) = residual_coding(
+                let ts_ctx = if self.pps.transform_skip_enabled && !self.cu_tqb && clog2 == 2 {
+                    Some(1)
+                } else {
+                    None
+                };
+                let (transform_skip, max_x, _) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     clog2,
                     false,
                     scan,
                     self.sign_hiding,
-                    None,
+                    ts_ctx,
                     self.cu_tqb,
                     &mut coeffs,
                 );
-                self.reconstruct_chroma(true, cx0, ty, cn, mode, &coeffs, qp_cb, max_x + 1);
+                self.reconstruct_chroma(
+                    true,
+                    cx0,
+                    ty,
+                    cn,
+                    mode,
+                    &coeffs,
+                    qp_prime_cb,
+                    max_x + 1,
+                    transform_skip,
+                );
                 self.coeff_scratch = coeffs;
             } else {
                 self.predict_only_chroma(true, cx0, ty, cn, mode);
             }
         }
-        let qp_cr = qpc(
-            self.cur_qp + self.pps.cr_qp_offset + self.slice_cr_qp_offset,
-            idc,
+        let qp_prime_cr = qp_prime(
+            qpc(
+                self.cur_qp + self.pps.cr_qp_offset + self.slice_cr_qp_offset,
+                idc,
+                self.bd_c,
+            ),
+            self.bd_c,
         );
         for (t, &cr) in cbf_cr[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cr {
                 let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-                let (_, max_x, _) = residual_coding(
+                let ts_ctx = if self.pps.transform_skip_enabled && !self.cu_tqb && clog2 == 2 {
+                    Some(1)
+                } else {
+                    None
+                };
+                let (transform_skip, max_x, _) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     clog2,
                     false,
                     scan,
                     self.sign_hiding,
-                    None,
+                    ts_ctx,
                     self.cu_tqb,
                     &mut coeffs,
                 );
-                self.reconstruct_chroma(false, cx0, ty, cn, mode, &coeffs, qp_cr, max_x + 1);
+                self.reconstruct_chroma(
+                    false,
+                    cx0,
+                    ty,
+                    cn,
+                    mode,
+                    &coeffs,
+                    qp_prime_cr,
+                    max_x + 1,
+                    transform_skip,
+                );
                 self.coeff_scratch = coeffs;
             } else {
                 self.predict_only_chroma(false, cx0, ty, cn, mode);
@@ -2430,8 +2506,9 @@ impl<'cab> FullDecoder<'cab> {
         n: usize,
         mode: u8,
         levels: &[i32],
-        qp: i32,
+        qp_prime: i32,
         nx: usize,
+        transform_skip: bool,
     ) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
         let n2 = n * n;
@@ -2444,21 +2521,30 @@ impl<'cab> FullDecoder<'cab> {
                     *o = l.clamp(-32768, 32767) as i16;
                 }
             } else {
-                let qp_c = qp.clamp(0, 51) as u8;
-                transform::dequantize_into(
-                    levels,
-                    n,
-                    qp_c,
-                    self.bd_c,
-                    &mut self.deq_scratch16[..n2],
-                );
-                transform::inv_transform_into16(
-                    &self.deq_scratch16[..n2],
-                    n,
-                    self.bd_c,
-                    nx,
-                    &mut self.res_scratch16[..n2],
-                );
+                if transform_skip {
+                    transform::dequantize_transform_skip_into(
+                        levels,
+                        n,
+                        qp_prime,
+                        self.bd_c,
+                        &mut self.res_scratch16[..n2],
+                    );
+                } else {
+                    transform::dequantize_into(
+                        levels,
+                        n,
+                        qp_prime,
+                        self.bd_c,
+                        &mut self.deq_scratch16[..n2],
+                    );
+                    transform::inv_transform_into16(
+                        &self.deq_scratch16[..n2],
+                        n,
+                        self.bd_c,
+                        nx,
+                        &mut self.res_scratch16[..n2],
+                    );
+                }
             }
             let pred = &self.scratch.pred[..n2];
             let res = &self.res_scratch16[..n2];
@@ -2476,15 +2562,30 @@ impl<'cab> FullDecoder<'cab> {
             // Lossless: chroma residual is the parsed levels verbatim.
             self.res_scratch[..n2].copy_from_slice(&levels[..n2]);
         } else {
-            let qp_c = qp.clamp(0, 51) as u8;
-            transform::dequantize_into(levels, n, qp_c, self.bd_c, &mut self.deq_scratch[..n2]);
-            transform::inv_transform_into(
-                &self.deq_scratch[..n2],
-                n,
-                self.bd_c,
-                nx,
-                &mut self.res_scratch[..n2],
-            );
+            if transform_skip {
+                transform::dequantize_transform_skip_into(
+                    levels,
+                    n,
+                    qp_prime,
+                    self.bd_c,
+                    &mut self.res_scratch[..n2],
+                );
+            } else {
+                transform::dequantize_into(
+                    levels,
+                    n,
+                    qp_prime,
+                    self.bd_c,
+                    &mut self.deq_scratch[..n2],
+                );
+                transform::inv_transform_into(
+                    &self.deq_scratch[..n2],
+                    n,
+                    self.bd_c,
+                    nx,
+                    &mut self.res_scratch[..n2],
+                );
+            }
         }
         let pred = &self.scratch.pred[..n2];
         let res = &self.res_scratch[..n2];
@@ -2656,12 +2757,24 @@ impl RowFactory {
     }
 }
 
-/// Chroma QP mapping (Table 8-10). ChromaArrayType 1 (4:2:0) uses the table;
-/// 2/3 clamp differently but share the <30 / table / -6 structure.
-fn qpc(qpi: i32, chroma_idc: u8) -> i32 {
-    let qpi = qpi.clamp(0, 57);
+#[inline]
+fn qp_bd_offset(bit_depth: u8) -> i32 {
+    6 * (bit_depth as i32 - 8)
+}
+
+#[inline]
+fn qp_prime(qp: i32, bit_depth: u8) -> i32 {
+    let off = qp_bd_offset(bit_depth);
+    (qp + off).clamp(0, 51 + off)
+}
+
+/// Chroma QP mapping (Table 8-10). The input qPi is a nominal signed QP, so
+/// high-bit-depth streams may legitimately pass negative values. The returned
+/// QpC is still nominal/signed; callers add QpBdOffsetC with `qp_prime`.
+fn qpc(qpi: i32, chroma_idc: u8, bit_depth: u8) -> i32 {
+    let qpi = qpi.clamp(-qp_bd_offset(bit_depth), 57);
     if chroma_idc != 1 {
-        // 4:2:2 / 4:4:4: QpC = min(qpi, 51)
+        // 4:2:2 / 4:4:4: QpC = min(qPi, 51), preserving negative QP.
         return qpi.min(51);
     }
     if qpi < 30 {
@@ -2877,7 +2990,7 @@ fn ceil_log2(n: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::ceil_log2;
+    use super::{ceil_log2, qp_prime, qpc};
 
     #[test]
     fn ceil_log2_matches_slice_address_widths() {
@@ -2893,5 +3006,21 @@ mod tests {
         assert_eq!(ceil_log2(1023), 10);
         assert_eq!(ceil_log2(1024), 10);
         assert_eq!(ceil_log2(1025), 11);
+    }
+
+    #[test]
+    fn qp_prime_preserves_negative_high_bit_depth_qp() {
+        assert_eq!(qp_prime(-12, 10), 0);
+        assert_eq!(qp_prime(-24, 12), 0);
+        assert_eq!(qp_prime(0, 10), 12);
+        assert_eq!(qp_prime(51, 12), 75);
+    }
+
+    #[test]
+    fn chroma_qpc_preserves_negative_high_bit_depth_qp() {
+        assert_eq!(qpc(-12, 1, 10), -12);
+        assert_eq!(qpc(-24, 1, 12), -24);
+        assert_eq!(qp_prime(qpc(-12, 1, 10), 10), 0);
+        assert_eq!(qp_prime(qpc(-24, 3, 12), 12), 0);
     }
 }

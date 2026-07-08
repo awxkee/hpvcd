@@ -109,9 +109,10 @@ fn add_clip4_sse41(pred: __m128i, res: __m128i, zero: __m128i, max: __m128i) -> 
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn add_clip8_sse41(pred: __m128i, res: &[i32], zero: __m128i, max: __m128i) -> __m128i {
-    let lo = add_clip4_sse41(pred, load_i32x4(res), zero, max);
-    let hi = add_clip4_sse41(_mm_srli_si128::<8>(pred), load_i32x4(&res[4..]), zero, max);
+fn add_clip8_sse41(pred: __m128i, res: &[i32; 8], zero: __m128i, max: __m128i) -> __m128i {
+    let (res4, _) = res.as_chunks::<4>();
+    let lo = add_clip4_sse41(pred, load_i32x4(&res4[0]), zero, max);
+    let hi = add_clip4_sse41(_mm_srli_si128::<8>(pred), load_i32x4(&res4[1]), zero, max);
     _mm_packus_epi32(lo, hi)
 }
 
@@ -134,12 +135,13 @@ fn add_clip_row_sse41(dst: &mut [u16], pred: &[u16], res: &[i32], n: usize, max:
         return;
     }
 
-    let mut x = 0usize;
-    while x < n {
-        let pred = load_u16x8(&pred[x..]);
-        let out = add_clip8_sse41(pred, &res[x..], zero, max);
-        store_u16x8(&mut dst[x..], out);
-        x += 8;
+    let (pred8, _) = pred[..n].as_chunks::<8>();
+    let (res8, _) = res[..n].as_chunks::<8>();
+    let (dst8, _) = dst[..n].as_chunks_mut::<8>();
+
+    for ((pred, res), dst) in pred8.iter().zip(res8.iter()).zip(dst8.iter_mut()) {
+        let out = add_clip8_sse41(load_u16x8(pred), res, zero, max);
+        store_u16x8(dst, out);
     }
 }
 
@@ -248,11 +250,13 @@ fn add_clip_row_sse41_16(dst: &mut [u16], pred: &[u16], res: &[i16], n: usize, m
         return;
     }
 
-    let mut x = 0usize;
-    while x < n {
-        let s = add_clip_i16(load_u16x8(&pred[x..]), load_i16x8(&res[x..]), zero, max);
-        store_u16x8(&mut dst[x..], s);
-        x += 8;
+    let (pred8, _) = pred[..n].as_chunks::<8>();
+    let (res8, _) = res[..n].as_chunks::<8>();
+    let (dst8, _) = dst[..n].as_chunks_mut::<8>();
+
+    for ((pred, res), dst) in pred8.iter().zip(res8.iter()).zip(dst8.iter_mut()) {
+        let s = add_clip_i16(load_u16x8(pred), load_i16x8(res), zero, max);
+        store_u16x8(dst, s);
     }
 }
 

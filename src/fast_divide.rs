@@ -57,11 +57,10 @@ impl FastDivU32 {
         let rem = (numerator % divisor as u64) as u32;
 
         let e = divisor - rem;
-        let more: u8;
 
-        if e < (1u32 << floor_log_2_d) {
+        let more: u8 = if e < (1u32 << floor_log_2_d) {
             // Smaller magic, no correction add.
-            more = floor_log_2_d as u8;
+            floor_log_2_d as u8
         } else {
             // Larger magic, requires correction add during division.
             proposed_m += proposed_m;
@@ -71,8 +70,8 @@ impl FastDivU32 {
                 proposed_m += 1;
             }
 
-            more = floor_log_2_d as u8 | ADD_MARKER;
-        }
+            floor_log_2_d as u8 | ADD_MARKER
+        };
 
         Self {
             magic: proposed_m.wrapping_add(1) as u32,

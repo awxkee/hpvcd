@@ -69,16 +69,14 @@ fn band_offset4_neon(
 #[inline]
 #[target_feature(enable = "neon")]
 fn band_offset8_neon(
-    dst: &[u16],
-    src: &[u16],
+    dst: &[u16; 8],
+    src: &[u16; 8],
     offsets: &[i32; 4],
     band_pos: int32x4_t,
     shift: u8,
     zero: int32x4_t,
     max: int32x4_t,
 ) -> uint16x8_t {
-    debug_assert!(dst.len() >= 8);
-    debug_assert!(src.len() >= 8);
     let old = unsafe { vld1q_u16(dst.as_ptr()) };
     let s = unsafe { vld1q_u16(src.as_ptr()) };
     let lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(s)));
@@ -91,6 +89,12 @@ fn band_offset8_neon(
     );
     let mask = vcombine_u16(vmovn_u32(mlo), vmovn_u32(mhi));
     vbslq_u16(mask, out, old)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_u16x8(dst: &mut [u16; 8], v: uint16x8_t) {
+    unsafe { vst1q_u16(dst.as_mut_ptr(), v) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -116,28 +120,25 @@ fn apply_sao_band_offset_neon_impl(
 
     for y in y0..y_end {
         let row = y * w;
-        let mut x = x0;
+        let row_range = row + x0..row + x_end;
+        let (Some(src_row), Some(dst_row)) = (src.get(row_range.clone()), dst.get_mut(row_range))
+        else {
+            continue;
+        };
+        let (src8, src_tail) = src_row.as_chunks::<8>();
+        let (dst8, dst_tail) = dst_row.as_chunks_mut::<8>();
 
-        while x + 8 <= x_end {
-            let out = band_offset8_neon(
-                &dst[row + x..],
-                &src[row + x..],
-                offsets,
-                band_pos_v,
-                shift,
-                zero,
-                max,
-            );
-            unsafe { vst1q_u16(dst[row + x..].as_mut_ptr(), out) };
-            x += 8;
+        for (src, dst) in src8.iter().zip(dst8.iter_mut()) {
+            let out = band_offset8_neon(dst, src, offsets, band_pos_v, shift, zero, max);
+            store_u16x8(dst, out);
         }
 
-        for x in x..x_end {
-            let s = src[row + x] as i32;
+        for (s, dst) in src_tail.iter().copied().zip(dst_tail.iter_mut()) {
+            let s = s as i32;
             let band = (s >> shift) as u8;
             let rel = band.wrapping_sub(band_pos);
             if rel < 4 {
-                dst[row + x] = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
+                *dst = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
             }
         }
     }
@@ -215,22 +216,15 @@ fn apply_sao_band_offset_banded_neon_impl(
             continue;
         };
 
-        let mut x = 0usize;
-        while x + 8 <= src_row.len() {
-            let out = band_offset8_neon(
-                &dst_row[x..],
-                &src_row[x..],
-                offsets,
-                band_pos_v,
-                shift,
-                zero,
-                max,
-            );
-            unsafe { vst1q_u16(dst_row.as_mut_ptr().add(x), out) };
-            x += 8;
+        let (src8, src_tail) = src_row.as_chunks::<8>();
+        let (dst8, dst_tail) = dst_row.as_chunks_mut::<8>();
+
+        for (src, dst) in src8.iter().zip(dst8.iter_mut()) {
+            let out = band_offset8_neon(dst, src, offsets, band_pos_v, shift, zero, max);
+            store_u16x8(dst, out);
         }
 
-        for (s, dst) in src_row[x..].iter().copied().zip(dst_row[x..].iter_mut()) {
+        for (s, dst) in src_tail.iter().copied().zip(dst_tail.iter_mut()) {
             let s = s as i32;
             let band = (s >> shift) as u8;
             let rel = band.wrapping_sub(band_pos);
