@@ -51,7 +51,8 @@ pub(crate) struct Sps {
     pub(crate) log2_max_tb: u32,
     pub(crate) max_transform_hierarchy_intra: u32,
     pub(crate) _max_transform_hierarchy_inter: u32,
-    pub(crate) _scaling_list_enabled: bool,
+    pub(crate) scaling_list_enabled: bool,
+    pub(crate) scaling_list: Option<ScalingList>,
     pub(crate) _amp_enabled: bool,
     pub(crate) sao_enabled: bool,
     pub(crate) _pcm_enabled: bool,
@@ -93,7 +94,7 @@ pub(crate) struct Pps {
     pub(crate) deblocking_filter_disabled: bool,
     pub(crate) beta_offset_div2: i32,
     pub(crate) tc_offset_div2: i32,
-    pub(crate) _scaling_list_data_present: bool,
+    pub(crate) scaling_list: Option<ScalingList>,
     pub(crate) _lists_modification_present: bool,
     pub(crate) _log2_parallel_merge_level: u32,
     pub(crate) slice_segment_header_extension_present: bool,
@@ -148,30 +149,181 @@ fn parse_ptl(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<(), Decode
     Ok(())
 }
 
-/// Parse scaling_list_data (§7.3.4) — we only need to skip past it.
-fn skip_scaling_list_data(r: &mut BitReader) -> Result<(), DecodeError> {
-    for size_id in 0..4 {
-        let mut matrix_id = 0;
-        while matrix_id < 6 {
+const SCALING_LIST_NUM_SIZES: usize = 4;
+const SCALING_LIST_NUM_LISTS: usize = 6;
+const SCALING_LIST_DC: u8 = 16;
+
+static QUANT_TS_DEFAULT_4X4: [u8; 16] = [16; 16];
+
+static QUANT_INTRA_DEFAULT_8X8: [u8; 64] = [
+    16, 16, 16, 16, 17, 18, 21, 24, 16, 16, 16, 16, 17, 19, 22, 25, 16, 16, 17, 18, 20, 22, 25, 29,
+    16, 16, 18, 21, 24, 27, 31, 36, 17, 17, 20, 24, 30, 35, 41, 47, 18, 19, 22, 27, 35, 44, 54, 65,
+    21, 22, 25, 31, 41, 54, 70, 88, 24, 25, 29, 36, 47, 65, 88, 115,
+];
+
+static QUANT_INTER_DEFAULT_8X8: [u8; 64] = [
+    16, 16, 16, 16, 17, 18, 20, 24, 16, 16, 16, 17, 18, 20, 24, 25, 16, 16, 17, 18, 20, 24, 25, 28,
+    16, 17, 18, 20, 24, 25, 28, 33, 17, 18, 20, 24, 25, 28, 33, 41, 18, 20, 24, 25, 28, 33, 41, 54,
+    20, 24, 25, 28, 33, 41, 54, 71, 24, 25, 28, 33, 41, 54, 71, 91,
+];
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScalingList {
+    matrices: [[[u8; 64]; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+    dc: [[u8; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+    flat_16: [[bool; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+}
+
+impl Default for ScalingList {
+    fn default() -> Self {
+        let mut out = ScalingList {
+            matrices: [[[16; 64]; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+            dc: [[SCALING_LIST_DC; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+            flat_16: [[true; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+        };
+
+        for list_id in 0..SCALING_LIST_NUM_LISTS {
+            out.matrices[0][list_id][..16].copy_from_slice(&QUANT_TS_DEFAULT_4X4);
+            out.refresh_flat_16(0, list_id);
+            let default_8x8 = if list_id < 3 {
+                &QUANT_INTRA_DEFAULT_8X8
+            } else {
+                &QUANT_INTER_DEFAULT_8X8
+            };
+            for size_id in 1..SCALING_LIST_NUM_SIZES {
+                out.matrices[size_id][list_id].copy_from_slice(default_8x8);
+                out.refresh_flat_16(size_id, list_id);
+            }
+        }
+
+        out
+    }
+}
+
+impl ScalingList {
+    #[inline]
+    fn refresh_flat_16(&mut self, size_id: usize, matrix_id: usize) {
+        self.flat_16[size_id][matrix_id] = self.dc[size_id][matrix_id] == SCALING_LIST_DC
+            && self.matrices[size_id][matrix_id].iter().all(|&v| v == 16);
+    }
+
+    #[inline]
+    fn set_matrix(&mut self, size_id: usize, matrix_id: usize, matrix: [u8; 64], dc: u8) {
+        self.matrices[size_id][matrix_id] = matrix;
+        self.dc[size_id][matrix_id] = dc;
+        self.refresh_flat_16(size_id, matrix_id);
+    }
+
+    #[inline]
+    fn copy_matrix(&mut self, size_id: usize, matrix_id: usize, pred_id: usize) {
+        self.matrices[size_id][matrix_id] = self.matrices[size_id][pred_id];
+        self.dc[size_id][matrix_id] = self.dc[size_id][pred_id];
+        self.flat_16[size_id][matrix_id] = self.flat_16[size_id][pred_id];
+    }
+
+    #[inline]
+    pub(crate) fn matrix(&self, size_id: usize, matrix_id: usize) -> (&[u8; 64], u8, bool) {
+        let size_id = size_id.min(SCALING_LIST_NUM_SIZES - 1);
+        let matrix_id = matrix_id.min(SCALING_LIST_NUM_LISTS - 1);
+        (
+            &self.matrices[size_id][matrix_id],
+            self.dc[size_id][matrix_id],
+            self.flat_16[size_id][matrix_id],
+        )
+    }
+}
+
+fn scaling_list_scan_pos(size: usize, scan_idx: usize) -> usize {
+    let (mut x, mut y) = (0i32, 0i32);
+    let mut seen = 0usize;
+    loop {
+        while y >= 0 {
+            if (x as usize) < size && (y as usize) < size {
+                if seen == scan_idx {
+                    return y as usize * size + x as usize;
+                }
+                seen += 1;
+            }
+            y -= 1;
+            x += 1;
+        }
+        y = x;
+        x = 0;
+    }
+}
+
+fn default_scaling_list_matrix(size_id: usize, matrix_id: usize) -> ([u8; 64], u8) {
+    let mut matrix = [16u8; 64];
+    if size_id == 0 {
+        matrix[..16].copy_from_slice(&QUANT_TS_DEFAULT_4X4);
+    } else {
+        let default_8x8 = if matrix_id < 3 {
+            &QUANT_INTRA_DEFAULT_8X8
+        } else {
+            &QUANT_INTER_DEFAULT_8X8
+        };
+        matrix.copy_from_slice(default_8x8);
+    }
+    (matrix, SCALING_LIST_DC)
+}
+
+/// Parse scaling_list_data (§7.3.4) into raster-order matrices
+fn parse_scaling_list_data(r: &mut BitReader) -> Result<ScalingList, DecodeError> {
+    let mut out = ScalingList::default();
+
+    for size_id in 0..SCALING_LIST_NUM_SIZES {
+        let mut matrix_id = 0usize;
+        while matrix_id < SCALING_LIST_NUM_LISTS {
             let pred_mode_flag = r
                 .read_flag()
                 .map_err(|_| e("scaling_list_pred_mode_flag"))?;
             if !pred_mode_flag {
-                r.read_ue()
-                    .map_err(|_| e("scaling_list_pred_matrix_id_delta"))?;
+                let delta = r
+                    .read_ue()
+                    .map_err(|_| e("scaling_list_pred_matrix_id_delta"))?
+                    as usize;
+                if delta == 0 {
+                    let (matrix, dc) = default_scaling_list_matrix(size_id, matrix_id);
+                    out.set_matrix(size_id, matrix_id, matrix, dc);
+                } else {
+                    let pred_delta = if size_id == 3 { delta * 3 } else { delta };
+                    let pred_id = matrix_id
+                        .checked_sub(pred_delta)
+                        .ok_or_else(|| e("scaling_list_pred_matrix_id_delta"))?;
+                    out.copy_matrix(size_id, matrix_id, pred_id);
+                }
             } else {
-                let coef_num = std::cmp::min(64, 1 << (4 + (size_id << 1)));
+                let scan_size = if size_id == 0 { 4 } else { 8 };
+                let coef_num = scan_size * scan_size;
+                let mut next_coef = 8i32;
                 if size_id > 1 {
-                    r.read_se().map_err(|_| e("scaling_list_dc_coef"))?;
+                    next_coef = r.read_se().map_err(|_| e("scaling_list_dc_coef"))? + 8;
+                    out.dc[size_id][matrix_id] = next_coef.clamp(1, 255) as u8;
+                    out.refresh_flat_16(size_id, matrix_id);
+                } else {
+                    out.dc[size_id][matrix_id] = SCALING_LIST_DC;
+                    out.refresh_flat_16(size_id, matrix_id);
                 }
-                for _ in 0..coef_num {
-                    r.read_se().map_err(|_| e("scaling_list_delta_coef"))?;
+
+                for scan_idx in 0..coef_num {
+                    let delta_coef = r.read_se().map_err(|_| e("scaling_list_delta_coef"))?;
+                    next_coef = (next_coef + delta_coef + 256) & 255;
+                    let pos = scaling_list_scan_pos(scan_size, scan_idx);
+                    out.matrices[size_id][matrix_id][pos] = next_coef.clamp(1, 255) as u8;
                 }
+                out.refresh_flat_16(size_id, matrix_id);
             }
             matrix_id += if size_id == 3 { 3 } else { 1 };
         }
     }
-    Ok(())
+
+    for &matrix_id in &[1usize, 2, 4, 5] {
+        out.matrices[3][matrix_id] = out.matrices[2][matrix_id];
+        out.dc[3][matrix_id] = out.dc[2][matrix_id];
+        out.flat_16[3][matrix_id] = out.flat_16[2][matrix_id];
+    }
+
+    Ok(out)
 }
 
 /// Parse a short_term_ref_pic_set (§7.3.7). Returns NumDeltaPocs for this set.
@@ -308,11 +460,14 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let max_transform_hierarchy_intra = r.read_ue().map_err(|_| e("mth_intra"))?;
 
     let scaling_list_enabled = r.read_flag().map_err(|_| e("scaling_list_enabled"))?;
+    let mut scaling_list = None;
     if scaling_list_enabled {
         let present = r.read_flag().map_err(|_| e("sps_scaling_list_present"))?;
-        if present {
-            skip_scaling_list_data(&mut r)?;
-        }
+        scaling_list = Some(if present {
+            parse_scaling_list_data(&mut r)?
+        } else {
+            ScalingList::default()
+        });
     }
     let amp_enabled = r.read_flag().map_err(|_| e("amp"))?;
     let sao_enabled = r.read_flag().map_err(|_| e("sao"))?;
@@ -424,7 +579,8 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         log2_max_tb,
         max_transform_hierarchy_intra,
         _max_transform_hierarchy_inter: max_transform_hierarchy_inter,
-        _scaling_list_enabled: scaling_list_enabled,
+        scaling_list,
+        scaling_list_enabled,
         _amp_enabled: amp_enabled,
         sao_enabled,
         _pcm_enabled: pcm_enabled,
@@ -441,7 +597,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     })
 }
 
-pub(crate) fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
+pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, DecodeError> {
     let mut r = BitReader::new(rbsp);
     let _pps_id = r.read_ue().map_err(|_| e("pps_id"))?;
     let _sps_id = r.read_ue().map_err(|_| e("pps_sps_id"))?;
@@ -497,10 +653,12 @@ pub(crate) fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
             tc_offset_div2 = r.read_se().map_err(|_| e("tc_offset"))?;
         }
     }
-    let scaling_list_data_present = r.read_flag().map_err(|_| e("pps_scaling_list_present"))?;
-    if scaling_list_data_present {
-        skip_scaling_list_data(&mut r)?;
-    }
+    let scaling_list =
+        if scaling_list_enabled && r.read_flag().map_err(|_| e("pps_scaling_list_present"))? {
+            Some(parse_scaling_list_data(&mut r)?)
+        } else {
+            None
+        };
     let lists_modification_present = r.read_flag().map_err(|_| e("lists_modification"))?;
     let log2_parallel_merge_level = r.read_ue().map_err(|_| e("log2_parallel_merge"))? + 2;
     let slice_segment_header_extension_present = r.read_flag().map_err(|_| e("slice_hdr_ext"))?;
@@ -530,7 +688,7 @@ pub(crate) fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         deblocking_filter_disabled,
         beta_offset_div2,
         tc_offset_div2,
-        _scaling_list_data_present: scaling_list_data_present,
+        scaling_list,
         _lists_modification_present: lists_modification_present,
         _log2_parallel_merge_level: log2_parallel_merge_level,
         slice_segment_header_extension_present,
@@ -577,6 +735,9 @@ pub(crate) fn parse_hvcc_full(hvcc: &[u8]) -> Result<(Sps, Pps), DecodeError> {
         }
     }
     let sps = parse_sps(&sps_rbsp.ok_or_else(|| e("no SPS"))?)?;
-    let pps = parse_pps(&pps_rbsp.ok_or_else(|| e("no PPS"))?)?;
+    let pps = parse_pps(
+        &pps_rbsp.ok_or_else(|| e("no PPS"))?,
+        sps.scaling_list_enabled,
+    )?;
     Ok((sps, pps))
 }

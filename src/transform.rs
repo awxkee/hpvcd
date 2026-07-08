@@ -593,6 +593,49 @@ pub(crate) struct TransformSkipParams {
     pub tr_shift: i32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ScalingMatrix<'a> {
+    coeffs: &'a [u8; 64],
+    dc: u8,
+    log2_size: u32,
+    flat_16: bool,
+}
+
+impl<'a> ScalingMatrix<'a> {
+    #[inline]
+    pub(crate) fn new(coeffs: &'a [u8; 64], dc: u8, n: usize, flat_16: bool) -> Self {
+        ScalingMatrix {
+            coeffs,
+            dc,
+            log2_size: (n as u32).trailing_zeros(),
+            flat_16,
+        }
+    }
+
+    #[inline]
+    fn is_flat_16(self) -> bool {
+        self.flat_16
+    }
+
+    #[inline]
+    fn coeff(self, idx: usize) -> i64 {
+        if self.log2_size == 2 {
+            return self.coeffs[idx] as i64;
+        }
+        if idx == 0 && self.log2_size >= 4 {
+            return self.dc as i64;
+        }
+
+        let n = 1usize << self.log2_size;
+        let y = idx / n;
+        let x = idx - y * n;
+        let downshift = self.log2_size.saturating_sub(3) as usize;
+        let sx = x >> downshift;
+        let sy = y >> downshift;
+        self.coeffs[sy * 8 + sx] as i64
+    }
+}
+
 #[inline]
 fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantParams {
     let log2n = (n as u32).trailing_zeros() as i64;
@@ -663,6 +706,43 @@ pub(crate) fn dequantize_transform_skip_into_scalar<S: Coeff>(
 
     for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
         let deq = ((l as i64 * params.dequant.factor + params.dequant.add) >> params.dequant.shift)
+            .clamp(-32768, 32767) as i32;
+        let residual = apply_transform_skip_shift(deq, params).clamp(-32768, 32767);
+        *o = S::from_i32(residual);
+    }
+}
+
+pub(crate) fn dequantize_scaled_into_scalar<S: Coeff>(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [S],
+) {
+    let base_factor = params.factor / 16;
+    for (idx, (o, &l)) in out[..n * n].iter_mut().zip(levels.iter()).enumerate() {
+        let factor = base_factor * scaling.coeff(idx);
+        let v = ((l as i64 * factor + params.add) >> params.shift).clamp(-32768, 32767);
+        *o = S::from_i32(v as i32);
+    }
+}
+
+pub(crate) fn dequantize_transform_skip_scaled_into_scalar<S: Coeff>(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [S],
+) {
+    debug_assert!(
+        n == 4,
+        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
+    );
+
+    let base_factor = params.dequant.factor / 16;
+    for (idx, (o, &l)) in out[..n * n].iter_mut().zip(levels.iter()).enumerate() {
+        let factor = base_factor * scaling.coeff(idx);
+        let deq = ((l as i64 * factor + params.dequant.add) >> params.dequant.shift)
             .clamp(-32768, 32767) as i32;
         let residual = apply_transform_skip_shift(deq, params).clamp(-32768, 32767);
         *o = S::from_i32(residual);
@@ -869,6 +949,50 @@ pub(crate) fn dequantize_transform_skip_into<S: DequantTarget>(
     );
     let params = transform_skip_params(n, qp_prime, bit_depth);
     S::dequantize_transform_skip(levels, n, params, out);
+}
+
+pub(crate) fn dequantize_scaled_into<S: DequantTarget>(
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    scaling: Option<ScalingMatrix<'_>>,
+    out: &mut [S],
+) {
+    let Some(scaling) = scaling else {
+        dequantize_into(levels, n, qp_prime, bit_depth, out);
+        return;
+    };
+    if scaling.is_flat_16() {
+        dequantize_into(levels, n, qp_prime, bit_depth, out);
+        return;
+    }
+    let params = dequant_params(n, qp_prime, bit_depth);
+    dequantize_scaled_into_scalar(levels, n, params, scaling, out);
+}
+
+pub(crate) fn dequantize_transform_skip_scaled_into<S: DequantTarget>(
+    levels: &[i32],
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    scaling: Option<ScalingMatrix<'_>>,
+    out: &mut [S],
+) {
+    debug_assert!(
+        n == 4,
+        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
+    );
+    let Some(scaling) = scaling else {
+        dequantize_transform_skip_into(levels, n, qp_prime, bit_depth, out);
+        return;
+    };
+    if scaling.is_flat_16() {
+        dequantize_transform_skip_into(levels, n, qp_prime, bit_depth, out);
+        return;
+    }
+    let params = transform_skip_params(n, qp_prime, bit_depth);
+    dequantize_transform_skip_scaled_into_scalar(levels, n, params, scaling, out);
 }
 
 // `nx` = number of nonzero input columns (last_x + 1); stage 1 skips the rest.
@@ -1131,5 +1255,60 @@ mod tests {
         // dequant=5, transform-skip shift=15-10-log2(4)=3 => (5+4)>>3.
         assert_eq!(out[0], 1);
         assert!(out[1..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn scaled_dequant_flat_16_matches_default_dispatch() {
+        let levels = [-12, 0, 7, 19, -31, 42, 3, -4, 5, -6, 100, -100, 1, 2, -3, 4];
+        let coeffs = [16u8; 64];
+        let scaling = ScalingMatrix::new(&coeffs, 16, 4, false);
+        let mut expected = [0i16; 16];
+        let mut actual = [0i16; 16];
+
+        dequantize_into(&levels, 4, 34, 8, &mut expected);
+        dequantize_scaled_into(&levels, 4, 34, 8, Some(scaling), &mut actual);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn scaled_dequant_uses_per_coefficient_matrix() {
+        let mut levels = [0i32; 16];
+        levels[0] = 1;
+        levels[5] = 1;
+        let mut coeffs = [16u8; 64];
+        coeffs[0] = 32;
+        coeffs[5] = 8;
+        let scaling = ScalingMatrix::new(&coeffs, 16, 4, false);
+        let mut out = [0i32; 16];
+
+        dequantize_scaled_into(&levels, 4, 0, 8, Some(scaling), &mut out);
+
+        assert_eq!(out[0], 40);
+        assert_eq!(out[5], 10);
+        assert!(
+            out.iter()
+                .enumerate()
+                .all(|(i, &v)| i == 0 || i == 5 || v == 0)
+        );
+    }
+
+    #[test]
+    fn scaled_dequant_16x16_replicates_8x8_and_uses_dc() {
+        let mut levels = [0i32; 256];
+        levels[0] = 1;
+        levels[1] = 1;
+        levels[2] = 1;
+        let mut coeffs = [16u8; 64];
+        coeffs[0] = 8;
+        coeffs[1] = 32;
+        let scaling = ScalingMatrix::new(&coeffs, 24, 16, false);
+        let mut out = [0i32; 256];
+
+        dequantize_scaled_into(&levels, 16, 0, 8, Some(scaling), &mut out);
+
+        assert_eq!(out[0], 8);
+        assert_eq!(out[1], 3);
+        assert_eq!(out[2], 10);
     }
 }

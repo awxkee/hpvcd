@@ -30,7 +30,7 @@
 use crate::cabac::CabacDecoder;
 use crate::cabac::{ContextSet, IntraModeContexts};
 use crate::cabac::{SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding};
-use crate::config::{Pps, Sps};
+use crate::config::{Pps, ScalingList, Sps};
 use crate::error::DecodeError;
 use crate::fast_divide::FastDivU32;
 use crate::fmt::BitDepth;
@@ -2119,20 +2119,28 @@ impl<'cab> FullDecoder<'cab> {
                 }
             } else {
                 let qp_prime_y = qp_prime(self.cur_qp, self.bd);
+                let scaling = scaling_matrix_from_lists(
+                    self.pps.scaling_list.as_ref(),
+                    self.sps.scaling_list.as_ref(),
+                    0,
+                    n,
+                );
                 if transform_skip {
-                    transform::dequantize_transform_skip_into(
+                    transform::dequantize_transform_skip_scaled_into(
                         levels,
                         n,
                         qp_prime_y,
                         self.bd,
+                        scaling,
                         &mut self.res_scratch16[..n * n],
                     );
                 } else {
-                    transform::dequantize_into(
+                    transform::dequantize_scaled_into(
                         levels,
                         n,
                         qp_prime_y,
                         self.bd,
+                        scaling,
                         &mut self.deq_scratch16[..n * n],
                     );
                     if n == 4 {
@@ -2172,20 +2180,28 @@ impl<'cab> FullDecoder<'cab> {
             self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
         } else {
             let qp_prime_y = qp_prime(self.cur_qp, self.bd);
+            let scaling = scaling_matrix_from_lists(
+                self.pps.scaling_list.as_ref(),
+                self.sps.scaling_list.as_ref(),
+                0,
+                n,
+            );
             if transform_skip {
-                transform::dequantize_transform_skip_into(
+                transform::dequantize_transform_skip_scaled_into(
                     levels,
                     n,
                     qp_prime_y,
                     self.bd,
+                    scaling,
                     &mut self.res_scratch[..n * n],
                 );
             } else {
-                transform::dequantize_into(
+                transform::dequantize_scaled_into(
                     levels,
                     n,
                     qp_prime_y,
                     self.bd,
+                    scaling,
                     &mut self.deq_scratch[..n * n],
                 );
                 if n == 4 {
@@ -2512,6 +2528,13 @@ impl<'cab> FullDecoder<'cab> {
     ) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
         let n2 = n * n;
+        let component = if is_cb { 1 } else { 2 };
+        let scaling = scaling_matrix_from_lists(
+            self.pps.scaling_list.as_ref(),
+            self.sps.scaling_list.as_ref(),
+            component,
+            n,
+        );
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
@@ -2522,19 +2545,21 @@ impl<'cab> FullDecoder<'cab> {
                 }
             } else {
                 if transform_skip {
-                    transform::dequantize_transform_skip_into(
+                    transform::dequantize_transform_skip_scaled_into(
                         levels,
                         n,
                         qp_prime,
                         self.bd_c,
+                        scaling,
                         &mut self.res_scratch16[..n2],
                     );
                 } else {
-                    transform::dequantize_into(
+                    transform::dequantize_scaled_into(
                         levels,
                         n,
                         qp_prime,
                         self.bd_c,
+                        scaling,
                         &mut self.deq_scratch16[..n2],
                     );
                     transform::inv_transform_into16(
@@ -2563,19 +2588,21 @@ impl<'cab> FullDecoder<'cab> {
             self.res_scratch[..n2].copy_from_slice(&levels[..n2]);
         } else {
             if transform_skip {
-                transform::dequantize_transform_skip_into(
+                transform::dequantize_transform_skip_scaled_into(
                     levels,
                     n,
                     qp_prime,
                     self.bd_c,
+                    scaling,
                     &mut self.res_scratch[..n2],
                 );
             } else {
-                transform::dequantize_into(
+                transform::dequantize_scaled_into(
                     levels,
                     n,
                     qp_prime,
                     self.bd_c,
+                    scaling,
                     &mut self.deq_scratch[..n2],
                 );
                 transform::inv_transform_into(
@@ -2766,6 +2793,20 @@ fn qp_bd_offset(bit_depth: u8) -> i32 {
 fn qp_prime(qp: i32, bit_depth: u8) -> i32 {
     let off = qp_bd_offset(bit_depth);
     (qp + off).clamp(0, 51 + off)
+}
+
+#[inline]
+fn scaling_matrix_from_lists<'a>(
+    pps_scaling_list: Option<&'a ScalingList>,
+    sps_scaling_list: Option<&'a ScalingList>,
+    component: usize,
+    n: usize,
+) -> Option<transform::ScalingMatrix<'a>> {
+    let lists = pps_scaling_list.or(sps_scaling_list)?;
+    let size_id = (n as u32).trailing_zeros().saturating_sub(2) as usize;
+    let matrix_id = component.min(2);
+    let (coeffs, dc, flat_16) = lists.matrix(size_id, matrix_id);
+    Some(transform::ScalingMatrix::new(coeffs, dc, n, flat_16))
 }
 
 /// Chroma QP mapping (Table 8-10). The input qPi is a nominal signed QP, so
