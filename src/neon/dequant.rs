@@ -41,6 +41,44 @@ fn supported_n(n: usize) -> bool {
 }
 
 #[inline]
+fn mul_i32_safe_from_max(max_abs_level: i32, params: DequantParams) -> bool {
+    if params.factor <= 0 || params.factor > i32::MAX as i64 || params.add > i32::MAX as i64 {
+        return false;
+    }
+    let limit = ((i32::MAX as i64 - params.add) / params.factor).max(0);
+    i64::from(max_abs_level) <= limit
+}
+
+#[inline]
+fn scaled_mul_i32_safe_from_max(
+    max_abs_level: i32,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+) -> bool {
+    let base_factor = params.factor / 16;
+    if base_factor <= 0 || params.add > i32::MAX as i64 {
+        return false;
+    }
+    let max_factor = base_factor * scaling.max_coeff();
+    if max_factor <= 0 || max_factor > i32::MAX as i64 {
+        return false;
+    }
+    let limit = ((i32::MAX as i64 - params.add) / max_factor).max(0);
+    i64::from(max_abs_level) <= limit
+}
+
+#[inline]
+fn neon_i64_factor_ok(params: DequantParams) -> bool {
+    params.factor > 0 && params.factor <= i32::MAX as i64
+}
+
+#[inline]
+fn neon_scaled_i64_factor_ok(params: DequantParams, scaling: ScalingMatrix<'_>) -> bool {
+    let base_factor = params.factor / 16;
+    base_factor > 0 && base_factor * scaling.max_coeff() <= i32::MAX as i64
+}
+
+#[inline]
 fn scaling_factors4(base_factor: i64, scaling: ScalingMatrix<'_>, idx: usize) -> [i32; 4] {
     std::array::from_fn(|lane| (base_factor * scaling.coeff(idx + lane)) as i32)
 }
@@ -116,6 +154,39 @@ fn dequant4_scaled_neon_const(
         clip_lo,
         clip_hi,
     )
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dequant4_neon_i32_const(
+    levels: &[i32; 4],
+    factor: int32x4_t,
+    add: int32x4_t,
+    shift: int32x4_t,
+    clip_lo: int32x4_t,
+    clip_hi: int32x4_t,
+) -> int32x4_t {
+    let v = load_i32x4(levels);
+    let v = vmulq_s32(v, factor);
+    let v = vaddq_s32(v, add);
+    clip_i16_s32x4_with(vshlq_s32(v, shift), clip_lo, clip_hi)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dequant4_scaled_neon_i32_const(
+    levels: &[i32; 4],
+    factors: &[i32; 4],
+    add: int32x4_t,
+    shift: int32x4_t,
+    clip_lo: int32x4_t,
+    clip_hi: int32x4_t,
+) -> int32x4_t {
+    let v = load_i32x4(levels);
+    let f = load_i32x4(factors);
+    let v = vmulq_s32(v, f);
+    let v = vaddq_s32(v, add);
+    clip_i16_s32x4_with(vshlq_s32(v, shift), clip_lo, clip_hi)
 }
 
 #[target_feature(enable = "neon")]
@@ -518,56 +589,513 @@ fn dequantize_transform_skip_scaled_into_neon16_impl(
     store_i16x8(&mut out[1], vcombine_s16(lo1, hi1));
 }
 
+#[target_feature(enable = "neon")]
+fn dequantize_into_neon_i32_impl(levels: &[i32], n: usize, params: DequantParams, out: &mut [i32]) {
+    let count = n * n;
+    let (levels, _) = levels[..count].as_chunks::<4>();
+    let (out, _) = out[..count].as_chunks_mut::<4>();
+
+    let factor = vdupq_n_s32(params.factor as i32);
+    let add = vdupq_n_s32(params.add as i32);
+    let shift = vdupq_n_s32(-params.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<4>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<4>();
+
+    for (src, dst) in level_groups.iter().zip(out_groups.iter_mut()) {
+        let v0 = dequant4_neon_i32_const(&src[0], factor, add, shift, clip_lo, clip_hi);
+        let v1 = dequant4_neon_i32_const(&src[1], factor, add, shift, clip_lo, clip_hi);
+        let v2 = dequant4_neon_i32_const(&src[2], factor, add, shift, clip_lo, clip_hi);
+        let v3 = dequant4_neon_i32_const(&src[3], factor, add, shift, clip_lo, clip_hi);
+        store_i32x4(&mut dst[0], v0);
+        store_i32x4(&mut dst[1], v1);
+        store_i32x4(&mut dst[2], v2);
+        store_i32x4(&mut dst[3], v3);
+    }
+
+    for (src, dst) in level_tail.iter().zip(out_tail.iter_mut()) {
+        store_i32x4(
+            dst,
+            dequant4_neon_i32_const(src, factor, add, shift, clip_lo, clip_hi),
+        );
+    }
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_into_neon16_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    out: &mut [i16],
+) {
+    let count = n * n;
+    let (levels, _) = levels[..count].as_chunks::<8>();
+    let (out, _) = out[..count].as_chunks_mut::<8>();
+
+    let factor = vdupq_n_s32(params.factor as i32);
+    let add = vdupq_n_s32(params.add as i32);
+    let shift = vdupq_n_s32(-params.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<2>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<2>();
+
+    for (src, dst) in level_groups.iter().zip(out_groups.iter_mut()) {
+        let (src0, _) = src[0].as_chunks::<4>();
+        let (src1, _) = src[1].as_chunks::<4>();
+        let lo0 = vqmovn_s32(dequant4_neon_i32_const(
+            &src0[0], factor, add, shift, clip_lo, clip_hi,
+        ));
+        let hi0 = vqmovn_s32(dequant4_neon_i32_const(
+            &src0[1], factor, add, shift, clip_lo, clip_hi,
+        ));
+        let lo1 = vqmovn_s32(dequant4_neon_i32_const(
+            &src1[0], factor, add, shift, clip_lo, clip_hi,
+        ));
+        let hi1 = vqmovn_s32(dequant4_neon_i32_const(
+            &src1[1], factor, add, shift, clip_lo, clip_hi,
+        ));
+        store_i16x8(&mut dst[0], vcombine_s16(lo0, hi0));
+        store_i16x8(&mut dst[1], vcombine_s16(lo1, hi1));
+    }
+
+    for (src, dst) in level_tail.iter().zip(out_tail.iter_mut()) {
+        let (src4, _) = src.as_chunks::<4>();
+        let lo = vqmovn_s32(dequant4_neon_i32_const(
+            &src4[0], factor, add, shift, clip_lo, clip_hi,
+        ));
+        let hi = vqmovn_s32(dequant4_neon_i32_const(
+            &src4[1], factor, add, shift, clip_lo, clip_hi,
+        ));
+        store_i16x8(dst, vcombine_s16(lo, hi));
+    }
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_transform_skip_into_neon_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    out: &mut [i32],
+) {
+    debug_assert_eq!(n, 4);
+    let (levels, _) = levels[..16].as_chunks::<4>();
+    let (out, _) = out[..16].as_chunks_mut::<4>();
+
+    let factor = vdupq_n_s32(params.dequant.factor as i32);
+    let add = vdupq_n_s32(params.dequant.add as i32);
+    let shift = vdupq_n_s32(-params.dequant.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+    let tr_add = vdupq_n_s32(params.tr_add);
+    let tr_shift = vdupq_n_s32(-params.tr_shift);
+
+    let d0 = dequant4_neon_i32_const(&levels[0], factor, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_neon_i32_const(&levels[1], factor, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_neon_i32_const(&levels[2], factor, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_neon_i32_const(&levels[3], factor, add, shift, clip_lo, clip_hi);
+
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            vshlq_s32(vaddq_s32(d0, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d1, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d2, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d3, tr_add), tr_shift),
+        )
+    } else {
+        (
+            vshlq_s32(d0, tr_shift),
+            vshlq_s32(d1, tr_shift),
+            vshlq_s32(d2, tr_shift),
+            vshlq_s32(d3, tr_shift),
+        )
+    };
+
+    store_i32x4(&mut out[0], clip_i16_s32x4_with(v0, clip_lo, clip_hi));
+    store_i32x4(&mut out[1], clip_i16_s32x4_with(v1, clip_lo, clip_hi));
+    store_i32x4(&mut out[2], clip_i16_s32x4_with(v2, clip_lo, clip_hi));
+    store_i32x4(&mut out[3], clip_i16_s32x4_with(v3, clip_lo, clip_hi));
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_transform_skip_into_neon16_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    out: &mut [i16],
+) {
+    debug_assert_eq!(n, 4);
+    let (levels, _) = levels[..16].as_chunks::<8>();
+    let (out, _) = out[..16].as_chunks_mut::<8>();
+
+    let factor = vdupq_n_s32(params.dequant.factor as i32);
+    let add = vdupq_n_s32(params.dequant.add as i32);
+    let shift = vdupq_n_s32(-params.dequant.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+    let tr_add = vdupq_n_s32(params.tr_add);
+    let tr_shift = vdupq_n_s32(-params.tr_shift);
+
+    let (src0, _) = levels[0].as_chunks::<4>();
+    let (src1, _) = levels[1].as_chunks::<4>();
+    let d0 = dequant4_neon_i32_const(&src0[0], factor, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_neon_i32_const(&src0[1], factor, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_neon_i32_const(&src1[0], factor, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_neon_i32_const(&src1[1], factor, add, shift, clip_lo, clip_hi);
+
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            vshlq_s32(vaddq_s32(d0, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d1, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d2, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d3, tr_add), tr_shift),
+        )
+    } else {
+        (
+            vshlq_s32(d0, tr_shift),
+            vshlq_s32(d1, tr_shift),
+            vshlq_s32(d2, tr_shift),
+            vshlq_s32(d3, tr_shift),
+        )
+    };
+
+    let lo0 = vqmovn_s32(clip_i16_s32x4_with(v0, clip_lo, clip_hi));
+    let hi0 = vqmovn_s32(clip_i16_s32x4_with(v1, clip_lo, clip_hi));
+    let lo1 = vqmovn_s32(clip_i16_s32x4_with(v2, clip_lo, clip_hi));
+    let hi1 = vqmovn_s32(clip_i16_s32x4_with(v3, clip_lo, clip_hi));
+    store_i16x8(&mut out[0], vcombine_s16(lo0, hi0));
+    store_i16x8(&mut out[1], vcombine_s16(lo1, hi1));
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_scaled_into_neon_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    let count = n * n;
+    let base_factor = params.factor / 16;
+    let (levels, _) = levels[..count].as_chunks::<4>();
+    let (out, _) = out[..count].as_chunks_mut::<4>();
+
+    let add = vdupq_n_s32(params.add as i32);
+    let shift = vdupq_n_s32(-params.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<4>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<4>();
+
+    for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
+        let idx = group_idx * 16;
+        let f0 = scaling_factors4(base_factor, scaling, idx);
+        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
+        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
+        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let v0 = dequant4_scaled_neon_i32_const(&src[0], &f0, add, shift, clip_lo, clip_hi);
+        let v1 = dequant4_scaled_neon_i32_const(&src[1], &f1, add, shift, clip_lo, clip_hi);
+        let v2 = dequant4_scaled_neon_i32_const(&src[2], &f2, add, shift, clip_lo, clip_hi);
+        let v3 = dequant4_scaled_neon_i32_const(&src[3], &f3, add, shift, clip_lo, clip_hi);
+        store_i32x4(&mut dst[0], v0);
+        store_i32x4(&mut dst[1], v1);
+        store_i32x4(&mut dst[2], v2);
+        store_i32x4(&mut dst[3], v3);
+    }
+
+    let tail_base = level_groups.len() * 16;
+    for (block_idx, (src, dst)) in level_tail.iter().zip(out_tail.iter_mut()).enumerate() {
+        let factors = scaling_factors4(base_factor, scaling, tail_base + block_idx * 4);
+        store_i32x4(
+            dst,
+            dequant4_scaled_neon_i32_const(src, &factors, add, shift, clip_lo, clip_hi),
+        );
+    }
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_scaled_into_neon16_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: DequantParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    let count = n * n;
+    let base_factor = params.factor / 16;
+    let (levels, _) = levels[..count].as_chunks::<8>();
+    let (out, _) = out[..count].as_chunks_mut::<8>();
+
+    let add = vdupq_n_s32(params.add as i32);
+    let shift = vdupq_n_s32(-params.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+
+    let (level_groups, level_tail) = levels.as_chunks::<2>();
+    let (out_groups, out_tail) = out.as_chunks_mut::<2>();
+
+    for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
+        let idx = group_idx * 16;
+        let (src0, _) = src[0].as_chunks::<4>();
+        let (src1, _) = src[1].as_chunks::<4>();
+        let f0 = scaling_factors4(base_factor, scaling, idx);
+        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
+        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
+        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let lo0 = vqmovn_s32(dequant4_scaled_neon_i32_const(
+            &src0[0], &f0, add, shift, clip_lo, clip_hi,
+        ));
+        let hi0 = vqmovn_s32(dequant4_scaled_neon_i32_const(
+            &src0[1], &f1, add, shift, clip_lo, clip_hi,
+        ));
+        let lo1 = vqmovn_s32(dequant4_scaled_neon_i32_const(
+            &src1[0], &f2, add, shift, clip_lo, clip_hi,
+        ));
+        let hi1 = vqmovn_s32(dequant4_scaled_neon_i32_const(
+            &src1[1], &f3, add, shift, clip_lo, clip_hi,
+        ));
+        store_i16x8(&mut dst[0], vcombine_s16(lo0, hi0));
+        store_i16x8(&mut dst[1], vcombine_s16(lo1, hi1));
+    }
+
+    let tail_base = level_groups.len() * 16;
+    for (block_idx, (src, dst)) in level_tail.iter().zip(out_tail.iter_mut()).enumerate() {
+        let (src4, _) = src.as_chunks::<4>();
+        let idx = tail_base + block_idx * 8;
+        let factors_lo = scaling_factors4(base_factor, scaling, idx);
+        let factors_hi = scaling_factors4(base_factor, scaling, idx + 4);
+        let lo = vqmovn_s32(dequant4_scaled_neon_i32_const(
+            &src4[0],
+            &factors_lo,
+            add,
+            shift,
+            clip_lo,
+            clip_hi,
+        ));
+        let hi = vqmovn_s32(dequant4_scaled_neon_i32_const(
+            &src4[1],
+            &factors_hi,
+            add,
+            shift,
+            clip_lo,
+            clip_hi,
+        ));
+        store_i16x8(dst, vcombine_s16(lo, hi));
+    }
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_transform_skip_scaled_into_neon_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i32],
+) {
+    debug_assert_eq!(n, 4);
+    let base_factor = params.dequant.factor / 16;
+    let (levels, _) = levels[..16].as_chunks::<4>();
+    let (out, _) = out[..16].as_chunks_mut::<4>();
+
+    let add = vdupq_n_s32(params.dequant.add as i32);
+    let shift = vdupq_n_s32(-params.dequant.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+    let tr_add = vdupq_n_s32(params.tr_add);
+    let tr_shift = vdupq_n_s32(-params.tr_shift);
+
+    let f0 = scaling_factors4(base_factor, scaling, 0);
+    let f1 = scaling_factors4(base_factor, scaling, 4);
+    let f2 = scaling_factors4(base_factor, scaling, 8);
+    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let d0 = dequant4_scaled_neon_i32_const(&levels[0], &f0, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_scaled_neon_i32_const(&levels[1], &f1, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_scaled_neon_i32_const(&levels[2], &f2, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_scaled_neon_i32_const(&levels[3], &f3, add, shift, clip_lo, clip_hi);
+
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            vshlq_s32(vaddq_s32(d0, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d1, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d2, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d3, tr_add), tr_shift),
+        )
+    } else {
+        (
+            vshlq_s32(d0, tr_shift),
+            vshlq_s32(d1, tr_shift),
+            vshlq_s32(d2, tr_shift),
+            vshlq_s32(d3, tr_shift),
+        )
+    };
+
+    store_i32x4(&mut out[0], clip_i16_s32x4_with(v0, clip_lo, clip_hi));
+    store_i32x4(&mut out[1], clip_i16_s32x4_with(v1, clip_lo, clip_hi));
+    store_i32x4(&mut out[2], clip_i16_s32x4_with(v2, clip_lo, clip_hi));
+    store_i32x4(&mut out[3], clip_i16_s32x4_with(v3, clip_lo, clip_hi));
+}
+
+#[target_feature(enable = "neon")]
+fn dequantize_transform_skip_scaled_into_neon16_i32_impl(
+    levels: &[i32],
+    n: usize,
+    params: TransformSkipParams,
+    scaling: ScalingMatrix<'_>,
+    out: &mut [i16],
+) {
+    debug_assert_eq!(n, 4);
+    let base_factor = params.dequant.factor / 16;
+    let (levels, _) = levels[..16].as_chunks::<8>();
+    let (out, _) = out[..16].as_chunks_mut::<8>();
+
+    let add = vdupq_n_s32(params.dequant.add as i32);
+    let shift = vdupq_n_s32(-params.dequant.shift);
+    let clip_lo = vdupq_n_s32(-32768);
+    let clip_hi = vdupq_n_s32(32767);
+    let tr_add = vdupq_n_s32(params.tr_add);
+    let tr_shift = vdupq_n_s32(-params.tr_shift);
+
+    let (src0, _) = levels[0].as_chunks::<4>();
+    let (src1, _) = levels[1].as_chunks::<4>();
+    let f0 = scaling_factors4(base_factor, scaling, 0);
+    let f1 = scaling_factors4(base_factor, scaling, 4);
+    let f2 = scaling_factors4(base_factor, scaling, 8);
+    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let d0 = dequant4_scaled_neon_i32_const(&src0[0], &f0, add, shift, clip_lo, clip_hi);
+    let d1 = dequant4_scaled_neon_i32_const(&src0[1], &f1, add, shift, clip_lo, clip_hi);
+    let d2 = dequant4_scaled_neon_i32_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
+    let d3 = dequant4_scaled_neon_i32_const(&src1[1], &f3, add, shift, clip_lo, clip_hi);
+
+    let (v0, v1, v2, v3) = if params.tr_shift >= 0 {
+        (
+            vshlq_s32(vaddq_s32(d0, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d1, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d2, tr_add), tr_shift),
+            vshlq_s32(vaddq_s32(d3, tr_add), tr_shift),
+        )
+    } else {
+        (
+            vshlq_s32(d0, tr_shift),
+            vshlq_s32(d1, tr_shift),
+            vshlq_s32(d2, tr_shift),
+            vshlq_s32(d3, tr_shift),
+        )
+    };
+
+    let lo0 = vqmovn_s32(clip_i16_s32x4_with(v0, clip_lo, clip_hi));
+    let hi0 = vqmovn_s32(clip_i16_s32x4_with(v1, clip_lo, clip_hi));
+    let lo1 = vqmovn_s32(clip_i16_s32x4_with(v2, clip_lo, clip_hi));
+    let hi1 = vqmovn_s32(clip_i16_s32x4_with(v3, clip_lo, clip_hi));
+    store_i16x8(&mut out[0], vcombine_s16(lo0, hi0));
+    store_i16x8(&mut out[1], vcombine_s16(lo1, hi1));
+}
+
 pub(crate) fn dequantize_into_neon(
     levels: &[i32],
     n: usize,
     params: DequantParams,
+    max_abs_level: i32,
     out: &mut [i32],
 ) {
     if !supported_n(n) {
-        crate::transform::dequantize_into_scalar_i32(levels, n, params, out);
+        crate::transform::dequantize_into_scalar_i32(levels, n, params, max_abs_level, out);
         return;
     }
-    unsafe { dequantize_into_neon_impl(levels, n, params, out) }
+    if mul_i32_safe_from_max(max_abs_level, params) {
+        unsafe { dequantize_into_neon_i32_impl(levels, n, params, out) }
+    } else if neon_i64_factor_ok(params) {
+        unsafe { dequantize_into_neon_impl(levels, n, params, out) }
+    } else {
+        crate::transform::dequantize_into_scalar_i32(levels, n, params, max_abs_level, out);
+    }
 }
 
 pub(crate) fn dequantize_into_neon16(
     levels: &[i32],
     n: usize,
     params: DequantParams,
+    max_abs_level: i32,
     out: &mut [i16],
 ) {
     if !supported_n(n) {
-        crate::transform::dequantize_into_scalar_i16(levels, n, params, out);
+        crate::transform::dequantize_into_scalar_i16(levels, n, params, max_abs_level, out);
         return;
     }
-    unsafe { dequantize_into_neon16_impl(levels, n, params, out) }
+    if mul_i32_safe_from_max(max_abs_level, params) {
+        unsafe { dequantize_into_neon16_i32_impl(levels, n, params, out) }
+    } else if neon_i64_factor_ok(params) {
+        unsafe { dequantize_into_neon16_impl(levels, n, params, out) }
+    } else {
+        crate::transform::dequantize_into_scalar_i16(levels, n, params, max_abs_level, out);
+    }
 }
 
 pub(crate) fn dequantize_transform_skip_into_neon(
     levels: &[i32],
     n: usize,
     params: TransformSkipParams,
+    max_abs_level: i32,
     out: &mut [i32],
 ) {
     if n != 4 {
-        crate::transform::dequantize_transform_skip_into_scalar_i32(levels, n, params, out);
+        crate::transform::dequantize_transform_skip_into_scalar_i32(
+            levels,
+            n,
+            params,
+            max_abs_level,
+            out,
+        );
         return;
     }
-    unsafe { dequantize_transform_skip_into_neon_impl(levels, n, params, out) }
+    if mul_i32_safe_from_max(max_abs_level, params.dequant) {
+        unsafe { dequantize_transform_skip_into_neon_i32_impl(levels, n, params, out) }
+    } else if neon_i64_factor_ok(params.dequant) {
+        unsafe { dequantize_transform_skip_into_neon_impl(levels, n, params, out) }
+    } else {
+        crate::transform::dequantize_transform_skip_into_scalar_i32(
+            levels,
+            n,
+            params,
+            max_abs_level,
+            out,
+        );
+    }
 }
 
 pub(crate) fn dequantize_transform_skip_into_neon16(
     levels: &[i32],
     n: usize,
     params: TransformSkipParams,
+    max_abs_level: i32,
     out: &mut [i16],
 ) {
     if n != 4 {
-        crate::transform::dequantize_transform_skip_into_scalar_i16(levels, n, params, out);
+        crate::transform::dequantize_transform_skip_into_scalar_i16(
+            levels,
+            n,
+            params,
+            max_abs_level,
+            out,
+        );
         return;
     }
-    unsafe { dequantize_transform_skip_into_neon16_impl(levels, n, params, out) }
+    if mul_i32_safe_from_max(max_abs_level, params.dequant) {
+        unsafe { dequantize_transform_skip_into_neon16_i32_impl(levels, n, params, out) }
+    } else if neon_i64_factor_ok(params.dequant) {
+        unsafe { dequantize_transform_skip_into_neon16_impl(levels, n, params, out) }
+    } else {
+        crate::transform::dequantize_transform_skip_into_scalar_i16(
+            levels,
+            n,
+            params,
+            max_abs_level,
+            out,
+        );
+    }
 }
 
 pub(crate) fn dequantize_scaled_into_neon(
@@ -575,13 +1103,20 @@ pub(crate) fn dequantize_scaled_into_neon(
     n: usize,
     params: DequantParams,
     scaling: ScalingMatrix<'_>,
+    max_abs_level: i32,
     out: &mut [i32],
 ) {
     if !supported_n(n) {
-        dequantize_scaled_into_scalar_i32(levels, n, params, scaling, out);
+        dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
         return;
     }
-    unsafe { dequantize_scaled_into_neon_impl(levels, n, params, scaling, out) }
+    if scaled_mul_i32_safe_from_max(max_abs_level, params, scaling) {
+        unsafe { dequantize_scaled_into_neon_i32_impl(levels, n, params, scaling, out) }
+    } else if neon_scaled_i64_factor_ok(params, scaling) {
+        unsafe { dequantize_scaled_into_neon_impl(levels, n, params, scaling, out) }
+    } else {
+        dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
+    }
 }
 
 pub(crate) fn dequantize_scaled_into_neon16(
@@ -589,13 +1124,20 @@ pub(crate) fn dequantize_scaled_into_neon16(
     n: usize,
     params: DequantParams,
     scaling: ScalingMatrix<'_>,
+    max_abs_level: i32,
     out: &mut [i16],
 ) {
     if !supported_n(n) {
-        dequantize_scaled_into_scalar_i16(levels, n, params, scaling, out);
+        dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
         return;
     }
-    unsafe { dequantize_scaled_into_neon16_impl(levels, n, params, scaling, out) }
+    if scaled_mul_i32_safe_from_max(max_abs_level, params, scaling) {
+        unsafe { dequantize_scaled_into_neon16_i32_impl(levels, n, params, scaling, out) }
+    } else if neon_scaled_i64_factor_ok(params, scaling) {
+        unsafe { dequantize_scaled_into_neon16_impl(levels, n, params, scaling, out) }
+    } else {
+        dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
+    }
 }
 
 pub(crate) fn dequantize_transform_skip_scaled_into_neon(
@@ -603,13 +1145,36 @@ pub(crate) fn dequantize_transform_skip_scaled_into_neon(
     n: usize,
     params: TransformSkipParams,
     scaling: ScalingMatrix<'_>,
+    max_abs_level: i32,
     out: &mut [i32],
 ) {
     if n != 4 {
-        dequantize_transform_skip_scaled_into_scalar_i32(levels, n, params, scaling, out);
+        dequantize_transform_skip_scaled_into_scalar_i32(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
         return;
     }
-    unsafe { dequantize_transform_skip_scaled_into_neon_impl(levels, n, params, scaling, out) }
+    if scaled_mul_i32_safe_from_max(max_abs_level, params.dequant, scaling) {
+        unsafe {
+            dequantize_transform_skip_scaled_into_neon_i32_impl(levels, n, params, scaling, out)
+        }
+    } else if neon_scaled_i64_factor_ok(params.dequant, scaling) {
+        unsafe { dequantize_transform_skip_scaled_into_neon_impl(levels, n, params, scaling, out) }
+    } else {
+        dequantize_transform_skip_scaled_into_scalar_i32(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
+    }
 }
 
 pub(crate) fn dequantize_transform_skip_scaled_into_neon16(
@@ -617,11 +1182,36 @@ pub(crate) fn dequantize_transform_skip_scaled_into_neon16(
     n: usize,
     params: TransformSkipParams,
     scaling: ScalingMatrix<'_>,
+    max_abs_level: i32,
     out: &mut [i16],
 ) {
     if n != 4 {
-        dequantize_transform_skip_scaled_into_scalar_i16(levels, n, params, scaling, out);
+        dequantize_transform_skip_scaled_into_scalar_i16(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
         return;
     }
-    unsafe { dequantize_transform_skip_scaled_into_neon16_impl(levels, n, params, scaling, out) }
+    if scaled_mul_i32_safe_from_max(max_abs_level, params.dequant, scaling) {
+        unsafe {
+            dequantize_transform_skip_scaled_into_neon16_i32_impl(levels, n, params, scaling, out)
+        }
+    } else if neon_scaled_i64_factor_ok(params.dequant, scaling) {
+        unsafe {
+            dequantize_transform_skip_scaled_into_neon16_impl(levels, n, params, scaling, out)
+        }
+    } else {
+        dequantize_transform_skip_scaled_into_scalar_i16(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
+    }
 }

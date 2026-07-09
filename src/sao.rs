@@ -49,8 +49,18 @@ pub(crate) type SaoPlaneBandedFn = fn(
     u8,
 );
 
+pub(crate) type SaoBandOffsetInplaceFn =
+    fn(&mut [u16], usize, usize, usize, usize, usize, &[i32; 4], u8, u8);
+
+pub(crate) type SaoBandOffsetBandedInplaceFn =
+    fn(&mut [u16], usize, usize, usize, usize, usize, usize, &[i32; 4], u8, u8);
+
 static APPLY_SAO_PLANE: std::sync::OnceLock<SaoPlaneFn> = std::sync::OnceLock::new();
 static APPLY_SAO_PLANE_BANDED: std::sync::OnceLock<SaoPlaneBandedFn> = std::sync::OnceLock::new();
+static APPLY_SAO_BAND_OFFSET_INPLACE: std::sync::OnceLock<SaoBandOffsetInplaceFn> =
+    std::sync::OnceLock::new();
+static APPLY_SAO_BAND_OFFSET_BANDED_INPLACE: std::sync::OnceLock<SaoBandOffsetBandedInplaceFn> =
+    std::sync::OnceLock::new();
 
 #[inline]
 pub(crate) fn resolve_apply_sao_plane() -> SaoPlaneFn {
@@ -66,6 +76,13 @@ pub(crate) fn resolve_apply_sao_plane() -> SaoPlaneFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::apply_sao_plane_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::apply_sao_plane_avx2;
             }
         }
 
@@ -87,6 +104,69 @@ pub(crate) fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::apply_sao_plane_banded_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::apply_sao_plane_banded_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_apply_sao_band_offset_inplace() -> SaoBandOffsetInplaceFn {
+    *APPLY_SAO_BAND_OFFSET_INPLACE.get_or_init(|| {
+        let mut _f: SaoBandOffsetInplaceFn = apply_sao_band_offset_inplace_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::apply_sao_band_offset_inplace_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::apply_sao_band_offset_inplace_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::apply_sao_band_offset_inplace_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_apply_sao_band_offset_banded_inplace() -> SaoBandOffsetBandedInplaceFn {
+    *APPLY_SAO_BAND_OFFSET_BANDED_INPLACE.get_or_init(|| {
+        let mut _f: SaoBandOffsetBandedInplaceFn = apply_sao_band_offset_banded_inplace_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::apply_sao_band_offset_banded_inplace_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::apply_sao_band_offset_banded_inplace_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::apply_sao_band_offset_banded_inplace_avx2;
             }
         }
 
@@ -303,7 +383,7 @@ fn apply_sao_ctb_row(
             let x_end = (x0 + ctb).min(ctx.w);
             let y_end = (y0 + ctb).min(ctx.h);
             match p.type_idx[0] {
-                1 => apply_sao_band_offset_banded_inplace(
+                1 => (ctx.exec.sao_band_offset_banded_inplace)(
                     luma_dst,
                     ctx.w,
                     band_y0,
@@ -341,7 +421,7 @@ fn apply_sao_ctb_row(
             let cx_end = ((x0 + ctb) / ctx.sub_w).min(ctx.cw);
             let cy_end = ((y0 + ctb) / ctx.sub_h).min(ctx.ch);
             match p.type_idx[1] {
-                1 => apply_sao_band_offset_banded_inplace(
+                1 => (ctx.exec.sao_band_offset_banded_inplace)(
                     cb_dst,
                     ctx.cw,
                     band_cy0,
@@ -372,7 +452,7 @@ fn apply_sao_ctb_row(
                 _ => {}
             }
             match p.type_idx[2] {
-                1 => apply_sao_band_offset_banded_inplace(
+                1 => (ctx.exec.sao_band_offset_banded_inplace)(
                     cr_dst,
                     ctx.cw,
                     band_cy0,
@@ -415,7 +495,7 @@ fn apply_sao_ctb_row(
 /// the untouched clone and write each output pixel exactly once.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn apply_sao_band_offset_banded_inplace(
+fn apply_sao_band_offset_banded_inplace_scalar(
     dst_band: &mut [u16],
     w: usize,
     band_y0: usize,

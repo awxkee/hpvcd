@@ -113,47 +113,114 @@ impl DeblockCtx<'_> {
     }
 }
 
+#[inline]
+fn luma_vertical_segment_params(
+    ctx: &DeblockCtx<'_>,
+    y: &[u16],
+    w: usize,
+    row0: usize,
+    row1: usize,
+    edge: usize,
+    s: usize,
+) -> Option<(i32, i32)> {
+    let mid = s + 1;
+    let qp_p = ctx.qp_at(edge - 1, mid);
+    let qp_q = ctx.qp_at(edge, mid);
+    if ctx.tqb_at(edge - 1, mid) || ctx.tqb_at(edge, mid) {
+        return None;
+    }
+    let avg_qp = (qp_p + qp_q + 1) >> 1;
+    let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
+    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
+    let beta = BETA[beta_prime as usize];
+    let tc = TC[tc_prime as usize];
+    if tc == 0 {
+        return None;
+    }
+
+    let seg_end = (s + 4).min(row1);
+    let mut d_total = 0i32;
+    for r in s..seg_end {
+        let lr = r - row0;
+        let p = |o: usize| y[lr * w + edge - 1 - o] as i32;
+        let q = |o: usize| y[lr * w + edge + o] as i32;
+        d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
+    }
+    (d_total < beta).then_some((beta, tc))
+}
+
+#[inline]
+fn luma_horizontal_segment_params(
+    ctx: &DeblockCtx<'_>,
+    y: &[u16],
+    w: usize,
+    row0: usize,
+    edge: usize,
+    scan: usize,
+) -> Option<(i32, i32)> {
+    let mid = scan + 1;
+    let qp_p = ctx.qp_at(mid, edge - 1);
+    let qp_q = ctx.qp_at(mid, edge);
+    if ctx.tqb_at(mid, edge - 1) || ctx.tqb_at(mid, edge) {
+        return None;
+    }
+    let avg_qp = (qp_p + qp_q + 1) >> 1;
+    let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
+    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
+    let beta = BETA[beta_prime as usize];
+    let tc = TC[tc_prime as usize];
+    if tc == 0 {
+        return None;
+    }
+
+    let at = |buf: &[u16], gy: usize, x: usize| -> i32 { buf[(gy - row0) * w + x] as i32 };
+    let mut d_total = 0i32;
+    for c in scan..scan + 4 {
+        let p = |o: usize| at(y, edge - 1 - o, c);
+        let q = |o: usize| at(y, edge + o, c);
+        d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
+    }
+    (d_total < beta).then_some((beta, tc))
+}
+
 /// Luma vertical edges for the global rows `[row0, row1)`. Writes and reads only
 /// touch those rows, so `y` may be a band slice whose local row 0 is `row0`.
 fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) {
     let w = ctx.w;
     let maxv = (1i32 << ctx.bd) - 1;
+    let filter = ctx.exec.luma_deblock_vertical;
+    let pair_filter = ctx.exec.luma_deblock_vertical_pair;
     let last_full_edge = w.saturating_sub(4);
     let mut edge = 8;
     while edge <= last_full_edge {
         let mut s = row0;
         while s + 4 <= row1 {
-            let mid = s + 1;
-            let qp_p = ctx.qp_at(edge - 1, mid);
-            let qp_q = ctx.qp_at(edge, mid);
-            if ctx.tqb_at(edge - 1, mid) || ctx.tqb_at(edge, mid) {
-                s += 4;
-                continue;
+            if let Some(pair_filter) = pair_filter
+                && s + 8 <= row1
+            {
+                let first = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s);
+                let second = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s + 4);
+                match (first, second) {
+                    (Some((beta0, tc0)), Some((beta1, tc1))) => {
+                        pair_filter(y, w, edge, s, row0, beta0, tc0, beta1, tc1, maxv);
+                        s += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        s += 4;
+                        continue;
+                    }
+                    (Some((beta, tc)), None) => {
+                        filter(y, w, edge, s, row0, beta, tc, maxv);
+                        s += 4;
+                        continue;
+                    }
+                }
             }
-            let avg_qp = (qp_p + qp_q + 1) >> 1;
-            let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-            let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
-            let beta = BETA[beta_prime as usize];
-            let tc = TC[tc_prime as usize];
-            if tc == 0 {
-                s += 4;
-                continue;
+
+            if let Some((beta, tc)) = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s) {
+                filter(y, w, edge, s, row0, beta, tc, maxv);
             }
-            // d over the (up to) 4 rows of this segment, clipped to the band.
-            let seg_end = (s + 4).min(row1);
-            let mut d_total = 0i32;
-            for r in s..seg_end {
-                let lr = r - row0;
-                let p = |o: usize| y[lr * w + edge - 1 - o] as i32;
-                let q = |o: usize| y[lr * w + edge + o] as i32;
-                d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
-            }
-            if d_total >= beta {
-                s += 4;
-                continue;
-            }
-            let filter = ctx.exec.luma_deblock_vertical;
-            filter(y, w, edge, s, row0, beta, tc, maxv);
             s += 4;
         }
         edge += 8;
@@ -169,6 +236,8 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
     let w = ctx.w;
     let h = ctx.h;
     let maxv = (1i32 << ctx.bd) - 1;
+    let filter = ctx.exec.luma_deblock_horizontal;
+    let pair_filter = ctx.exec.luma_deblock_horizontal_pair;
     let last_full_edge = h.saturating_sub(4);
     let mut edge = (row0.div_ceil(8) * 8).max(8);
     while edge <= last_full_edge {
@@ -177,38 +246,32 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
         }
         let mut scan = 0;
         while scan + 4 <= w {
-            let mid = scan + 1;
-            let qp_p = ctx.qp_at(mid, edge - 1);
-            let qp_q = ctx.qp_at(mid, edge);
-            if ctx.tqb_at(mid, edge - 1) || ctx.tqb_at(mid, edge) {
-                scan += 4;
-                continue;
-            }
-            let avg_qp = (qp_p + qp_q + 1) >> 1;
-            let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-            let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
-            let beta = BETA[beta_prime as usize];
-            let tc = TC[tc_prime as usize];
-            if tc == 0 {
-                scan += 4;
-                continue;
-            }
-            let at = |buf: &[u16], gy: usize, x: usize| -> i32 { buf[(gy - row0) * w + x] as i32 };
-            let mut d_total = 0i32;
-            for c in scan..scan + 4 {
-                if c >= w {
-                    break;
+            if let Some(pair_filter) = pair_filter
+                && scan + 8 <= w
+            {
+                let first = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan);
+                let second = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan + 4);
+                match (first, second) {
+                    (Some((beta0, tc0)), Some((beta1, tc1))) => {
+                        pair_filter(y, w, edge, scan, row0, beta0, tc0, beta1, tc1, maxv);
+                        scan += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        scan += 4;
+                        continue;
+                    }
+                    (Some((beta, tc)), None) => {
+                        filter(y, w, edge, scan, row0, beta, tc, maxv);
+                        scan += 4;
+                        continue;
+                    }
                 }
-                let p = |o: usize| at(y, edge - 1 - o, c);
-                let q = |o: usize| at(y, edge + o, c);
-                d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
             }
-            if d_total >= beta {
-                scan += 4;
-                continue;
+
+            if let Some((beta, tc)) = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan) {
+                filter(y, w, edge, scan, row0, beta, tc, maxv);
             }
-            let filter = ctx.exec.luma_deblock_horizontal;
-            filter(y, w, edge, scan, row0, beta, tc, maxv);
             scan += 4;
         }
         edge += 8;
@@ -217,9 +280,16 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) type LumaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
+#[allow(clippy::too_many_arguments)]
+pub(crate) type LumaDeblockPairFn =
+    fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32, i32, i32);
 
 static LUMA_VERTICAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
 static LUMA_HORIZONTAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
+static LUMA_VERTICAL_PAIR: std::sync::OnceLock<Option<LumaDeblockPairFn>> =
+    std::sync::OnceLock::new();
+static LUMA_HORIZONTAL_PAIR: std::sync::OnceLock<Option<LumaDeblockPairFn>> =
+    std::sync::OnceLock::new();
 
 #[inline]
 pub(crate) fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
@@ -235,6 +305,29 @@ pub(crate) fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::luma_vertical_plane_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::luma_vertical_plane_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_luma_vertical_pair() -> Option<LumaDeblockPairFn> {
+    *LUMA_VERTICAL_PAIR.get_or_init(|| {
+        let mut _f: Option<LumaDeblockPairFn> = None;
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = Some(crate::avx::luma_vertical_plane_pair_avx2);
             }
         }
 
@@ -256,6 +349,29 @@ pub(crate) fn resolve_luma_horizontal_plane() -> LumaDeblockPlaneFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::luma_horizontal_plane_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::luma_horizontal_plane_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_luma_horizontal_pair() -> Option<LumaDeblockPairFn> {
+    *LUMA_HORIZONTAL_PAIR.get_or_init(|| {
+        let mut _f: Option<LumaDeblockPairFn> = None;
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = Some(crate::avx::luma_horizontal_plane_pair_avx2);
             }
         }
 
@@ -434,10 +550,16 @@ fn luma_filter_lane_horizontal(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) type ChromaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32);
+#[allow(clippy::too_many_arguments)]
+pub(crate) type ChromaDeblockPairFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
 
 static CHROMA_VERTICAL_PLANE: std::sync::OnceLock<ChromaDeblockPlaneFn> =
     std::sync::OnceLock::new();
 static CHROMA_HORIZONTAL_PLANE: std::sync::OnceLock<ChromaDeblockPlaneFn> =
+    std::sync::OnceLock::new();
+static CHROMA_VERTICAL_PAIR: std::sync::OnceLock<Option<ChromaDeblockPairFn>> =
+    std::sync::OnceLock::new();
+static CHROMA_HORIZONTAL_PAIR: std::sync::OnceLock<Option<ChromaDeblockPairFn>> =
     std::sync::OnceLock::new();
 
 #[inline]
@@ -454,6 +576,29 @@ pub(crate) fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::chroma_vertical_plane_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::chroma_vertical_plane_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_chroma_vertical_pair() -> Option<ChromaDeblockPairFn> {
+    *CHROMA_VERTICAL_PAIR.get_or_init(|| {
+        let mut _f: Option<ChromaDeblockPairFn> = None;
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = Some(crate::avx::chroma_vertical_plane_pair_avx2);
             }
         }
 
@@ -475,6 +620,29 @@ pub(crate) fn resolve_chroma_horizontal_plane() -> ChromaDeblockPlaneFn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::chroma_horizontal_plane_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::chroma_horizontal_plane_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_chroma_horizontal_pair() -> Option<ChromaDeblockPairFn> {
+    *CHROMA_HORIZONTAL_PAIR.get_or_init(|| {
+        let mut _f: Option<ChromaDeblockPairFn> = None;
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = Some(crate::avx::chroma_horizontal_plane_pair_avx2);
             }
         }
 
@@ -530,6 +698,48 @@ pub(crate) fn chroma_horizontal_plane_scalar(
     }
 }
 
+#[inline]
+fn chroma_vertical_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, s: usize) -> Option<i32> {
+    let mid = s + 1;
+    let qlx = edge * ctx.sub_w;
+    let qly = mid * ctx.sub_h;
+    let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
+    let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
+    let tc_c = TC[tc_prime_c as usize];
+    if tc_c == 0 {
+        return None;
+    }
+    let px_p = (edge - 1) * ctx.sub_w;
+    let py_p = mid * ctx.sub_h;
+    let px_q = edge * ctx.sub_w;
+    let py_q = mid * ctx.sub_h;
+    if ctx.tqb_at(px_p, py_p) || ctx.tqb_at(px_q, py_q) {
+        return None;
+    }
+    Some(tc_c)
+}
+
+#[inline]
+fn chroma_horizontal_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, scan: usize) -> Option<i32> {
+    let mid = scan + 1;
+    let qlx = mid * ctx.sub_w;
+    let qly = edge * ctx.sub_h;
+    let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
+    let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
+    let tc_c = TC[tc_prime_c as usize];
+    if tc_c == 0 {
+        return None;
+    }
+    let px_p = mid * ctx.sub_w;
+    let py_p = (edge - 1) * ctx.sub_h;
+    let px_q = mid * ctx.sub_w;
+    let py_q = edge * ctx.sub_h;
+    if ctx.tqb_at(px_p, py_p) || ctx.tqb_at(px_q, py_q) {
+        return None;
+    }
+    Some(tc_c)
+}
+
 /// Chroma vertical edges for chroma rows `[crow0, crow1)`. Like luma vertical,
 /// every access for chroma row `s` is `s*cw + …`, so chroma-row bands are
 /// disjoint with no halo. Filters both Cb and Cr.
@@ -541,35 +751,43 @@ fn chroma_vertical(
     crow1: usize,
 ) {
     let cw = ctx.cw;
-    let w = ctx.w;
-    let h = ctx.h;
     let maxv_c = (1i32 << ctx.bd_c) - 1;
+    let filter = ctx.exec.chroma_deblock_vertical;
+    let pair_filter = ctx.exec.chroma_deblock_vertical_pair;
     let last_full_chroma_edge = cw.saturating_sub(2);
     let mut edge = 8;
     while edge <= last_full_chroma_edge {
         let mut s = crow0;
         while s + 4 <= crow1 {
-            let mid = s + 1;
-            let qlx = edge * ctx.sub_w;
-            let qly = mid * ctx.sub_h;
-            let avg_qp_l = ctx.qp_at(qlx.min(w - 1), qly.min(h - 1));
-            let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
-            let tc_c = TC[tc_prime_c as usize];
-            if tc_c == 0 {
-                s += 4;
-                continue;
+            if let Some(pair_filter) = pair_filter
+                && s + 8 <= crow1
+            {
+                let first = chroma_vertical_segment_tc(ctx, edge, s);
+                let second = chroma_vertical_segment_tc(ctx, edge, s + 4);
+                match (first, second) {
+                    (Some(tc0), Some(tc1)) => {
+                        pair_filter(cb, cw, edge, s, crow0, tc0, tc1, maxv_c);
+                        pair_filter(cr, cw, edge, s, crow0, tc0, tc1, maxv_c);
+                        s += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        s += 4;
+                        continue;
+                    }
+                    (Some(tc_c), None) => {
+                        filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
+                        filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
+                        s += 4;
+                        continue;
+                    }
+                }
             }
-            let px_p = (edge - 1) * ctx.sub_w;
-            let py_p = mid * ctx.sub_h;
-            let px_q = edge * ctx.sub_w;
-            let py_q = mid * ctx.sub_h;
-            if ctx.tqb_at(px_p, py_p) || ctx.tqb_at(px_q, py_q) {
-                s += 4;
-                continue;
+
+            if let Some(tc_c) = chroma_vertical_segment_tc(ctx, edge, s) {
+                filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
+                filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
             }
-            let filter = ctx.exec.chroma_deblock_vertical;
-            filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
-            filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
             s += 4;
         }
         edge += 8;
@@ -588,9 +806,9 @@ fn chroma_horizontal(
 ) {
     let cw = ctx.cw;
     let ch = ctx.ch;
-    let w = ctx.w;
-    let h = ctx.h;
     let maxv_c = (1i32 << ctx.bd_c) - 1;
+    let filter = ctx.exec.chroma_deblock_horizontal;
+    let pair_filter = ctx.exec.chroma_deblock_horizontal_pair;
     let last_full_chroma_edge = ch.saturating_sub(2);
     let mut edge = (crow0.div_ceil(8) * 8).max(8);
     while edge <= last_full_chroma_edge {
@@ -599,27 +817,35 @@ fn chroma_horizontal(
         }
         let mut scan = 0;
         while scan + 4 <= cw {
-            let mid = scan + 1;
-            let qlx = mid * ctx.sub_w;
-            let qly = edge * ctx.sub_h;
-            let avg_qp_l = ctx.qp_at(qlx.min(w - 1), qly.min(h - 1));
-            let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
-            let tc_c = TC[tc_prime_c as usize];
-            if tc_c == 0 {
-                scan += 4;
-                continue;
+            if let Some(pair_filter) = pair_filter
+                && scan + 8 <= cw
+            {
+                let first = chroma_horizontal_segment_tc(ctx, edge, scan);
+                let second = chroma_horizontal_segment_tc(ctx, edge, scan + 4);
+                match (first, second) {
+                    (Some(tc0), Some(tc1)) => {
+                        pair_filter(cb, cw, edge, scan, crow0, tc0, tc1, maxv_c);
+                        pair_filter(cr, cw, edge, scan, crow0, tc0, tc1, maxv_c);
+                        scan += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        scan += 4;
+                        continue;
+                    }
+                    (Some(tc_c), None) => {
+                        filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
+                        filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
+                        scan += 4;
+                        continue;
+                    }
+                }
             }
-            let px_p = mid * ctx.sub_w;
-            let py_p = (edge - 1) * ctx.sub_h;
-            let px_q = mid * ctx.sub_w;
-            let py_q = edge * ctx.sub_h;
-            if ctx.tqb_at(px_p, py_p) || ctx.tqb_at(px_q, py_q) {
-                scan += 4;
-                continue;
+
+            if let Some(tc_c) = chroma_horizontal_segment_tc(ctx, edge, scan) {
+                filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
+                filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
             }
-            let filter = ctx.exec.chroma_deblock_horizontal;
-            filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
-            filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
             scan += 4;
         }
         edge += 8;

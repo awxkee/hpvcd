@@ -1214,7 +1214,7 @@ impl<'cab> FullDecoder<'cab> {
                     let x_end = (x0 + ctb).min(self.w);
                     let y_end = (y0 + ctb).min(self.h);
                     match sao.type_idx[0] {
-                        1 => crate::sao::apply_sao_band_offset_inplace_scalar(
+                        1 => (self.exec.sao_band_offset_inplace)(
                             &mut self.y[..],
                             self.w,
                             x0,
@@ -1253,7 +1253,7 @@ impl<'cab> FullDecoder<'cab> {
                     let cy_end = ((y0 + ctb) / self.sub_h).min(ch);
 
                     match sao.type_idx[1] {
-                        1 => crate::sao::apply_sao_band_offset_inplace_scalar(
+                        1 => (self.exec.sao_band_offset_inplace)(
                             &mut self.cb[..],
                             cw,
                             cx0,
@@ -1282,7 +1282,7 @@ impl<'cab> FullDecoder<'cab> {
                         _ => {}
                     }
                     match sao.type_idx[2] {
-                        1 => crate::sao::apply_sao_band_offset_inplace_scalar(
+                        1 => (self.exec.sao_band_offset_inplace)(
                             &mut self.cr[..],
                             cw,
                             cx0,
@@ -1870,7 +1870,7 @@ impl<'cab> FullDecoder<'cab> {
                 None
             };
             let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-            let (transform_skip, max_x, _last_y) = residual_coding(
+            let (transform_skip, max_x, _last_y, max_abs_level) = residual_coding(
                 &mut self.cab,
                 &mut self.ctx,
                 self.exec.residual_scans,
@@ -1889,6 +1889,7 @@ impl<'cab> FullDecoder<'cab> {
                 luma_mode,
                 &coeffs,
                 max_x + 1,
+                max_abs_level,
                 transform_skip,
             );
             self.coeff_scratch = coeffs;
@@ -2099,6 +2100,7 @@ impl<'cab> FullDecoder<'cab> {
         mode: u8,
         levels: &[i32],
         nx: usize,
+        max_abs_level: i32,
         transform_skip: bool,
     ) {
         let n = 1usize << log2_ts;
@@ -2128,6 +2130,7 @@ impl<'cab> FullDecoder<'cab> {
                         n,
                         qp_prime_y,
                         self.bd,
+                        max_abs_level,
                         scaling,
                         &mut self.res_scratch16[..n * n],
                     );
@@ -2138,6 +2141,7 @@ impl<'cab> FullDecoder<'cab> {
                         n,
                         qp_prime_y,
                         self.bd,
+                        max_abs_level,
                         scaling,
                         &mut self.deq_scratch16[..n * n],
                     );
@@ -2191,6 +2195,7 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime_y,
                     self.bd,
+                    max_abs_level,
                     scaling,
                     &mut self.res_scratch[..n * n],
                 );
@@ -2201,6 +2206,7 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime_y,
                     self.bd,
+                    max_abs_level,
                     scaling,
                     &mut self.deq_scratch[..n * n],
                 );
@@ -2334,7 +2340,7 @@ impl<'cab> FullDecoder<'cab> {
                 } else {
                     None
                 };
-                let (transform_skip, max_x, _) = residual_coding(
+                let (transform_skip, max_x, _, max_abs_level) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     self.exec.residual_scans,
@@ -2355,6 +2361,7 @@ impl<'cab> FullDecoder<'cab> {
                     &coeffs,
                     qp_prime_cb,
                     max_x + 1,
+                    max_abs_level,
                     transform_skip,
                 );
                 self.coeff_scratch = coeffs;
@@ -2379,7 +2386,7 @@ impl<'cab> FullDecoder<'cab> {
                 } else {
                     None
                 };
-                let (transform_skip, max_x, _) = residual_coding(
+                let (transform_skip, max_x, _, max_abs_level) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     self.exec.residual_scans,
@@ -2400,6 +2407,7 @@ impl<'cab> FullDecoder<'cab> {
                     &coeffs,
                     qp_prime_cr,
                     max_x + 1,
+                    max_abs_level,
                     transform_skip,
                 );
                 self.coeff_scratch = coeffs;
@@ -2528,6 +2536,7 @@ impl<'cab> FullDecoder<'cab> {
         levels: &[i32],
         qp_prime: i32,
         nx: usize,
+        max_abs_level: i32,
         transform_skip: bool,
     ) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
@@ -2555,6 +2564,7 @@ impl<'cab> FullDecoder<'cab> {
                         n,
                         qp_prime,
                         self.bd_c,
+                        max_abs_level,
                         scaling,
                         &mut self.res_scratch16[..n2],
                     );
@@ -2565,6 +2575,7 @@ impl<'cab> FullDecoder<'cab> {
                         n,
                         qp_prime,
                         self.bd_c,
+                        max_abs_level,
                         scaling,
                         &mut self.deq_scratch16[..n2],
                     );
@@ -2600,6 +2611,7 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime,
                     self.bd_c,
+                    max_abs_level,
                     scaling,
                     &mut self.res_scratch[..n2],
                 );
@@ -2610,6 +2622,7 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime,
                     self.bd_c,
+                    max_abs_level,
                     scaling,
                     &mut self.deq_scratch[..n2],
                 );
@@ -2838,50 +2851,56 @@ fn scaling_matrix_from_lists<'a>(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn dequantize_scaled_into_i32(
     exec: &ExecContext,
     levels: &[i32],
     n: usize,
     qp_prime: i32,
     bit_depth: u8,
+    max_abs_level: i32,
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i32],
 ) {
     let params = transform::dequant_params(n, qp_prime, bit_depth);
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
-            (exec.dequant_scaled)(levels, n, params, scaling, out)
+            (exec.dequant_scaled)(levels, n, params, scaling, max_abs_level, out)
         }
-        _ => (exec.dequant)(levels, n, params, out),
+        _ => (exec.dequant)(levels, n, params, max_abs_level, out),
     }
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn dequantize_scaled_into_i16(
     exec: &ExecContext,
     levels: &[i32],
     n: usize,
     qp_prime: i32,
     bit_depth: u8,
+    max_abs_level: i32,
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i16],
 ) {
     let params = transform::dequant_params(n, qp_prime, bit_depth);
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
-            (exec.dequant_scaled16)(levels, n, params, scaling, out)
+            (exec.dequant_scaled16)(levels, n, params, scaling, max_abs_level, out)
         }
-        _ => (exec.dequant16)(levels, n, params, out),
+        _ => (exec.dequant16)(levels, n, params, max_abs_level, out),
     }
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn dequantize_transform_skip_scaled_into_i32(
     exec: &ExecContext,
     levels: &[i32],
     n: usize,
     qp_prime: i32,
     bit_depth: u8,
+    max_abs_level: i32,
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i32],
 ) {
@@ -2892,19 +2911,21 @@ fn dequantize_transform_skip_scaled_into_i32(
     let params = transform::transform_skip_params(n, qp_prime, bit_depth);
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
-            (exec.dequant_skip_scaled)(levels, n, params, scaling, out)
+            (exec.dequant_skip_scaled)(levels, n, params, scaling, max_abs_level, out)
         }
-        _ => (exec.dequant_skip)(levels, n, params, out),
+        _ => (exec.dequant_skip)(levels, n, params, max_abs_level, out),
     }
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn dequantize_transform_skip_scaled_into_i16(
     exec: &ExecContext,
     levels: &[i32],
     n: usize,
     qp_prime: i32,
     bit_depth: u8,
+    max_abs_level: i32,
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i16],
 ) {
@@ -2915,9 +2936,9 @@ fn dequantize_transform_skip_scaled_into_i16(
     let params = transform::transform_skip_params(n, qp_prime, bit_depth);
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
-            (exec.dequant_skip_scaled16)(levels, n, params, scaling, out)
+            (exec.dequant_skip_scaled16)(levels, n, params, scaling, max_abs_level, out)
         }
-        _ => (exec.dequant_skip16)(levels, n, params, out),
+        _ => (exec.dequant_skip16)(levels, n, params, max_abs_level, out),
     }
 }
 

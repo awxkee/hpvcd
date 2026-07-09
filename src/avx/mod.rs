@@ -4,8 +4,8 @@
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
  * //
- * // 1.  Redistributions of source code must retain the above copyright notice, this
- * // list of conditions and the following disclaimer.
+ * // 1.  Redistributions of source code must retain the above copyright notice,
+ * // this list of conditions and the following disclaimer.
  * //
  * // 2.  Redistributions in binary form must reproduce the above copyright notice,
  * // this list of conditions and the following disclaimer in the documentation
@@ -26,30 +26,44 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+#[cfg(target_arch = "x86_64")]
 mod deblock;
+#[cfg(target_arch = "x86_64")]
 mod dequant;
+#[cfg(target_arch = "x86_64")]
 mod intra;
+#[cfg(target_arch = "x86_64")]
 mod reconstruct;
+#[cfg(target_arch = "x86_64")]
 mod sao;
+#[cfg(target_arch = "x86_64")]
 mod transform;
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) use deblock::{
-    chroma_horizontal_plane_sse41, chroma_vertical_plane_sse41, luma_horizontal_plane_sse41,
-    luma_vertical_plane_sse41,
+    chroma_horizontal_plane_avx2, chroma_horizontal_plane_pair_avx2, chroma_vertical_plane_avx2,
+    chroma_vertical_plane_pair_avx2, luma_horizontal_plane_avx2, luma_horizontal_plane_pair_avx2,
+    luma_vertical_plane_avx2, luma_vertical_plane_pair_avx2,
 };
+#[cfg(target_arch = "x86_64")]
 pub(crate) use dequant::{
-    dequantize_into_sse41, dequantize_into_sse41_16, dequantize_scaled_into_sse41,
-    dequantize_scaled_into_sse41_16, dequantize_transform_skip_into_sse41,
-    dequantize_transform_skip_into_sse41_16, dequantize_transform_skip_scaled_into_sse41,
-    dequantize_transform_skip_scaled_into_sse41_16,
+    dequantize_into_avx2, dequantize_into_avx2_16, dequantize_scaled_into_avx2,
+    dequantize_scaled_into_avx2_16, dequantize_transform_skip_into_avx2,
+    dequantize_transform_skip_into_avx2_16, dequantize_transform_skip_scaled_into_avx2,
+    dequantize_transform_skip_scaled_into_avx2_16,
 };
-pub(crate) use intra::predict_into_sse41;
-pub(crate) use reconstruct::{add_residual_into_sse41, add_residual_into_sse41_16};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use intra::predict_into_avx2;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use reconstruct::{add_residual_into_avx2, add_residual_into_avx2_16};
+#[cfg(target_arch = "x86_64")]
 pub(crate) use sao::{
-    apply_sao_band_offset_banded_inplace_sse41, apply_sao_band_offset_inplace_sse41,
-    apply_sao_plane_banded_sse41, apply_sao_plane_sse41,
+    apply_sao_band_offset_banded_inplace_avx2, apply_sao_band_offset_inplace_avx2,
+    apply_sao_plane_avx2, apply_sao_plane_banded_avx2,
 };
+#[cfg(target_arch = "x86_64")]
 pub(crate) use transform::{
-    inv_transform_dst_into_sse41, inv_transform_dst_into_sse41_16, inv_transform_into_sse41,
-    inv_transform_into_sse41_16,
+    inv_transform_dst_into_avx2, inv_transform_dst_into_avx2_16, inv_transform_into_avx2,
+    inv_transform_into_avx2_16,
 };

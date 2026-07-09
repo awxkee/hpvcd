@@ -98,6 +98,29 @@ fn store_u16x8(dst: &mut [u16; 8], v: __m128i) {
 }
 
 #[inline]
+#[target_feature(enable = "sse4.1")]
+fn band_offset_tail8_inplace_sse41(
+    dst: &mut [u16],
+    offsets: &[i32; 4],
+    band_pos: __m128i,
+    shift: u8,
+    zero: __m128i,
+    max: __m128i,
+) {
+    debug_assert!(dst.len() <= 8);
+    if dst.is_empty() {
+        return;
+    }
+
+    let len = dst.len();
+    let mut tmp = [0u16; 8];
+    tmp[..len].copy_from_slice(dst);
+    let out = band_offset8_sse41(&tmp, &tmp, offsets, band_pos, shift, zero, max);
+    store_u16x8(&mut tmp, out);
+    dst.copy_from_slice(&tmp[..len]);
+}
+
+#[inline]
 fn apply_eo_sample_inbounds_sse41(
     dst: &mut u16,
     s: u16,
@@ -400,6 +423,92 @@ fn apply_sao_band_offset_sse41_impl(
                 *dst = (s + offsets[rel as usize]).clamp(0, max_val) as u16;
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn apply_sao_band_offset_inplace_sse41_impl(
+    dst_plane: &mut [u16],
+    w: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    bd: u8,
+) {
+    if w == 0 || x_end <= x0 || y_end <= y0 || y_end <= band_y0 {
+        return;
+    }
+    let Some(max_val) = (1u32)
+        .checked_shl(bd as u32)
+        .map(|v| v.saturating_sub(1) as i32)
+    else {
+        return;
+    };
+    let max = _mm_set1_epi32(max_val);
+    let zero = _mm_setzero_si128();
+    let band_pos_v = _mm_set1_epi32(band_pos as i32);
+    let shift = bd.saturating_sub(5);
+
+    for y in y0..y_end {
+        let Some(dst_base) = y.checked_sub(band_y0).and_then(|v| v.checked_mul(w)) else {
+            continue;
+        };
+        let dst_range = dst_base + x0..dst_base + x_end;
+        let Some(dst_row) = dst_plane.get_mut(dst_range) else {
+            continue;
+        };
+
+        let (dst8, dst_tail) = dst_row.as_chunks_mut::<8>();
+        for dst in dst8.iter_mut() {
+            let out = band_offset8_sse41(&*dst, &*dst, offsets, band_pos_v, shift, zero, max);
+            store_u16x8(dst, out);
+        }
+        band_offset_tail8_inplace_sse41(dst_tail, offsets, band_pos_v, shift, zero, max);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_sao_band_offset_inplace_sse41(
+    dst: &mut [u16],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    bd: u8,
+) {
+    unsafe {
+        apply_sao_band_offset_inplace_sse41_impl(
+            dst, w, 0, x0, y0, x_end, y_end, offsets, band_pos, bd,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_sao_band_offset_banded_inplace_sse41(
+    dst_band: &mut [u16],
+    w: usize,
+    band_y0: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    band_pos: u8,
+    bd: u8,
+) {
+    unsafe {
+        apply_sao_band_offset_inplace_sse41_impl(
+            dst_band, w, band_y0, x0, y0, x_end, y_end, offsets, band_pos, bd,
+        )
     }
 }
 

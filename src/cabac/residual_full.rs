@@ -339,10 +339,11 @@ pub(crate) fn residual_coding(
     transform_skip_ctx: Option<usize>, // Some(ctx_idx) if transform_skip allowed (TU≤4)
     transquant_bypass: bool,
     coeffs: &mut [i32],
-) -> (bool, usize, usize) {
+) -> (bool, usize, usize, i32) {
     let n = 1usize << log2_ts;
     coeffs[..n * n].fill(0);
     let mut max_x = 0usize;
+    let mut max_abs_level = 0i32;
 
     // transform_skip_flag
     let mut transform_skip = false;
@@ -554,6 +555,7 @@ pub(crate) fn residual_coding(
                 0
             };
             let level = base + rem as i32;
+            max_abs_level = max_abs_level.max(level);
             if level > (3 << rice) {
                 rice = (rice + 1).min(4);
             }
@@ -587,6 +589,5 @@ pub(crate) fn residual_coding(
         }
     }
 
-    // max_x = true max nonzero column; caller uses (max_x + 1) to bound stage-1 columns.
-    (transform_skip, max_x, last_y)
+    (transform_skip, max_x, last_y, max_abs_level)
 }

@@ -50,6 +50,13 @@ pub(crate) fn resolve_reconstruct_add_clip() -> ReconstructFn {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::add_residual_into_avx2;
+            }
+        }
+
         _f
     })
 }
@@ -68,6 +75,13 @@ pub(crate) fn resolve_reconstruct_add_clip16() -> ReconstructFn16 {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::add_residual_into_sse41_16;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::add_residual_into_avx2_16;
             }
         }
 

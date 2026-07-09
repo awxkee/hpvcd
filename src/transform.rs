@@ -634,6 +634,19 @@ impl<'a> ScalingMatrix<'a> {
         let sy = y >> downshift;
         self.coeffs[sy * 8 + sx] as i64
     }
+
+    #[inline]
+    pub(crate) fn max_coeff(self) -> i64 {
+        if self.flat_16 {
+            return 16;
+        }
+
+        let mut max_v = (if self.log2_size >= 4 { self.dc } else { 0 }) as i64;
+        for &v in self.coeffs.iter() {
+            max_v = max_v.max(v as i64);
+        }
+        max_v
+    }
 }
 
 #[inline]
@@ -753,6 +766,7 @@ pub(crate) fn dequantize_into_scalar_i32(
     levels: &[i32],
     n: usize,
     params: DequantParams,
+    _max_abs_level: i32,
     out: &mut [i32],
 ) {
     dequantize_into_scalar(levels, n, params, out);
@@ -762,6 +776,7 @@ pub(crate) fn dequantize_into_scalar_i16(
     levels: &[i32],
     n: usize,
     params: DequantParams,
+    _max_abs_level: i32,
     out: &mut [i16],
 ) {
     dequantize_into_scalar(levels, n, params, out);
@@ -771,6 +786,7 @@ pub(crate) fn dequantize_transform_skip_into_scalar_i32(
     levels: &[i32],
     n: usize,
     params: TransformSkipParams,
+    _max_abs_level: i32,
     out: &mut [i32],
 ) {
     dequantize_transform_skip_into_scalar(levels, n, params, out);
@@ -780,6 +796,7 @@ pub(crate) fn dequantize_transform_skip_into_scalar_i16(
     levels: &[i32],
     n: usize,
     params: TransformSkipParams,
+    _max_abs_level: i32,
     out: &mut [i16],
 ) {
     dequantize_transform_skip_into_scalar(levels, n, params, out);
@@ -790,6 +807,7 @@ pub(crate) fn dequantize_scaled_into_scalar_i32(
     n: usize,
     params: DequantParams,
     scaling: ScalingMatrix<'_>,
+    _max_abs_level: i32,
     out: &mut [i32],
 ) {
     dequantize_scaled_into_scalar(levels, n, params, scaling, out);
@@ -800,6 +818,7 @@ pub(crate) fn dequantize_scaled_into_scalar_i16(
     n: usize,
     params: DequantParams,
     scaling: ScalingMatrix<'_>,
+    _max_abs_level: i32,
     out: &mut [i16],
 ) {
     dequantize_scaled_into_scalar(levels, n, params, scaling, out);
@@ -810,6 +829,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into_scalar_i32(
     n: usize,
     params: TransformSkipParams,
     scaling: ScalingMatrix<'_>,
+    _max_abs_level: i32,
     out: &mut [i32],
 ) {
     dequantize_transform_skip_scaled_into_scalar(levels, n, params, scaling, out);
@@ -820,6 +840,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into_scalar_i16(
     n: usize,
     params: TransformSkipParams,
     scaling: ScalingMatrix<'_>,
+    _max_abs_level: i32,
     out: &mut [i16],
 ) {
     dequantize_transform_skip_scaled_into_scalar(levels, n, params, scaling, out);
@@ -827,18 +848,18 @@ pub(crate) fn dequantize_transform_skip_scaled_into_scalar_i16(
 
 // `n` = transform width/height. Output is clipped to the HEVC residual dynamic
 // range used by the rest of this decoder.
-pub(crate) type DequantFn = fn(&[i32], usize, DequantParams, &mut [i32]);
-pub(crate) type DequantFn16 = fn(&[i32], usize, DequantParams, &mut [i16]);
-pub(crate) type DequantSkipFn = fn(&[i32], usize, TransformSkipParams, &mut [i32]);
-pub(crate) type DequantSkipFn16 = fn(&[i32], usize, TransformSkipParams, &mut [i16]);
+pub(crate) type DequantFn = fn(&[i32], usize, DequantParams, i32, &mut [i32]);
+pub(crate) type DequantFn16 = fn(&[i32], usize, DequantParams, i32, &mut [i16]);
+pub(crate) type DequantSkipFn = fn(&[i32], usize, TransformSkipParams, i32, &mut [i32]);
+pub(crate) type DequantSkipFn16 = fn(&[i32], usize, TransformSkipParams, i32, &mut [i16]);
 pub(crate) type DequantScaledFn =
-    for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i32]);
+    for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, i32, &mut [i32]);
 pub(crate) type DequantScaledFn16 =
-    for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, &mut [i16]);
+    for<'a> fn(&[i32], usize, DequantParams, ScalingMatrix<'a>, i32, &mut [i16]);
 pub(crate) type DequantSkipScaledFn =
-    for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, &mut [i32]);
+    for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, i32, &mut [i32]);
 pub(crate) type DequantSkipScaledFn16 =
-    for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, &mut [i16]);
+    for<'a> fn(&[i32], usize, TransformSkipParams, ScalingMatrix<'a>, i32, &mut [i16]);
 
 static DEQUANT: std::sync::OnceLock<DequantFn> = std::sync::OnceLock::new();
 static DEQUANT16: std::sync::OnceLock<DequantFn16> = std::sync::OnceLock::new();
@@ -867,6 +888,13 @@ pub(crate) fn resolve_dequant() -> DequantFn {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_into_avx2;
+            }
+        }
+
         _f
     })
 }
@@ -885,6 +913,13 @@ pub(crate) fn resolve_dequant16() -> DequantFn16 {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::dequantize_into_sse41_16;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_into_avx2_16;
             }
         }
 
@@ -909,6 +944,13 @@ pub(crate) fn resolve_dequant_skip() -> DequantSkipFn {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_transform_skip_into_avx2;
+            }
+        }
+
         _f
     })
 }
@@ -927,6 +969,13 @@ pub(crate) fn resolve_dequant_skip16() -> DequantSkipFn16 {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::dequantize_transform_skip_into_sse41_16;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_transform_skip_into_avx2_16;
             }
         }
 
@@ -951,6 +1000,13 @@ pub(crate) fn resolve_dequant_scaled() -> DequantScaledFn {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_scaled_into_avx2;
+            }
+        }
+
         _f
     })
 }
@@ -969,6 +1025,13 @@ pub(crate) fn resolve_dequant_scaled16() -> DequantScaledFn16 {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::dequantize_scaled_into_sse41_16;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_scaled_into_avx2_16;
             }
         }
 
@@ -993,6 +1056,13 @@ pub(crate) fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_transform_skip_scaled_into_avx2;
+            }
+        }
+
         _f
     })
 }
@@ -1011,6 +1081,13 @@ pub(crate) fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::dequantize_transform_skip_scaled_into_sse41_16;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::dequantize_transform_skip_scaled_into_avx2_16;
             }
         }
 
@@ -1045,6 +1122,13 @@ pub(crate) fn resolve_inv_transform() -> InvTransformFn {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::inv_transform_into_avx2;
+            }
+        }
+
         _f
     })
 }
@@ -1063,6 +1147,13 @@ pub(crate) fn resolve_inv_transform_dst4() -> InvTransform4Fn {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::inv_transform_dst_into_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::inv_transform_dst_into_avx2;
             }
         }
 
@@ -1087,6 +1178,13 @@ pub(crate) fn resolve_inv_transform16() -> InvTransformFn16 {
             }
         }
 
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::inv_transform_into_avx2_16;
+            }
+        }
+
         _f
     })
 }
@@ -1105,6 +1203,13 @@ pub(crate) fn resolve_inv_transform_dst4_16() -> InvTransform4Fn16 {
         {
             if std::is_x86_feature_detected!("sse4.1") {
                 _f = crate::sse::inv_transform_dst_into_sse41_16;
+            }
+        }
+
+        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::inv_transform_dst_into_avx2_16;
             }
         }
 

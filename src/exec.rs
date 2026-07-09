@@ -53,11 +53,17 @@ pub(crate) struct ExecContext {
 
     pub(crate) sao_plane: sao::SaoPlaneFn,
     pub(crate) sao_plane_banded: sao::SaoPlaneBandedFn,
+    pub(crate) sao_band_offset_inplace: sao::SaoBandOffsetInplaceFn,
+    pub(crate) sao_band_offset_banded_inplace: sao::SaoBandOffsetBandedInplaceFn,
 
     pub(crate) luma_deblock_vertical: deblock::LumaDeblockPlaneFn,
     pub(crate) luma_deblock_horizontal: deblock::LumaDeblockPlaneFn,
     pub(crate) chroma_deblock_vertical: deblock::ChromaDeblockPlaneFn,
     pub(crate) chroma_deblock_horizontal: deblock::ChromaDeblockPlaneFn,
+    pub(crate) luma_deblock_vertical_pair: Option<deblock::LumaDeblockPairFn>,
+    pub(crate) luma_deblock_horizontal_pair: Option<deblock::LumaDeblockPairFn>,
+    pub(crate) chroma_deblock_vertical_pair: Option<deblock::ChromaDeblockPairFn>,
+    pub(crate) chroma_deblock_horizontal_pair: Option<deblock::ChromaDeblockPairFn>,
 }
 
 impl Default for ExecContext {
@@ -93,11 +99,17 @@ impl ExecContext {
 
             sao_plane: sao::resolve_apply_sao_plane(),
             sao_plane_banded: sao::resolve_apply_sao_plane_banded(),
+            sao_band_offset_inplace: sao::resolve_apply_sao_band_offset_inplace(),
+            sao_band_offset_banded_inplace: sao::resolve_apply_sao_band_offset_banded_inplace(),
 
             luma_deblock_vertical: deblock::resolve_luma_vertical_plane(),
             luma_deblock_horizontal: deblock::resolve_luma_horizontal_plane(),
             chroma_deblock_vertical: deblock::resolve_chroma_vertical_plane(),
             chroma_deblock_horizontal: deblock::resolve_chroma_horizontal_plane(),
+            luma_deblock_vertical_pair: deblock::resolve_luma_vertical_pair(),
+            luma_deblock_horizontal_pair: deblock::resolve_luma_horizontal_pair(),
+            chroma_deblock_vertical_pair: deblock::resolve_chroma_vertical_pair(),
+            chroma_deblock_horizontal_pair: deblock::resolve_chroma_horizontal_pair(),
         }
     }
 }

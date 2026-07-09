@@ -50,5 +50,5 @@ fn main() {
         )
         .unwrap(),
     );
-    img.save("./out1.jpg").unwrap();
+    img.save("./out.jpg").unwrap();
 }

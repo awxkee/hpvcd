@@ -28,6 +28,8 @@
  */
 
 #![deny(unreachable_pub)]
+#[cfg(all(feature = "sse", target_arch = "x86_64"))]
+mod avx;
 mod bitreader;
 mod cabac;
 mod color;
