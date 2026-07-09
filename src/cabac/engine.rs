@@ -254,4 +254,14 @@ impl<'a> CabacDecoder<'a> {
         self.bitcnt = 0;
         self.offset = self.read_bits(9);
     }
+
+    /// Read `n` (≤ 32) raw bits from the stream, MSB-first. Used for PCM sample
+    /// data (§7.3.8.5 / §9.3.1), which is coded as fixed-length uncompressed bits
+    /// between an engine byte-alignment and a subsequent re-initialization.
+    pub(crate) fn read_pcm_bits(&mut self, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        self.read_bits(n)
+    }
 }

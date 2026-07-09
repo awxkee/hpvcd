@@ -61,7 +61,7 @@ fn sort3_u8(mut v: [u8; 3]) -> [u8; 3] {
     v
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 struct SaoCtb {
     type_idx: [u8; 3], // 0=off,1=band,2=edge
     offsets: [[i32; 4]; 3],
@@ -102,11 +102,28 @@ pub(crate) struct FullDecoder<'cab> {
     mode_y: crate::plane::Plane<u8>,
     decoded: crate::plane::Plane<bool>, // per 4×4 luma block
     tqb: crate::plane::Plane<bool>,     // per 4×4 luma block: cu_transquant_bypass_flag (lossless)
-    cu_tqb: bool,                       // current CU's cu_transquant_bypass_flag
-    grid_w: usize,                      // ceil(w/4), one entry for every covered 4×4 luma grid cell
+    pcm: crate::plane::Plane<bool>,     // per 4×4 luma block: pcm_flag (I_PCM CU)
+    /// Per-4×4-luma deblock edge flags. `edge_v[g]` is set when a TU/PU/CU
+    /// vertical boundary lies on the left side of the 4×4 block at `g`;
+    /// `edge_h[g]` likewise for a horizontal boundary on its top side. Only
+    /// edges on the 8×8 sample grid are ever filtered (§8.7.2).
+    edge_v: crate::plane::Plane<bool>,
+    edge_h: crate::plane::Plane<bool>,
+    /// Per-4×4-luma boundary-strength for the left (`bs_v`) and top (`bs_h`)
+    /// edge of each block. For an all-intra picture this is 2 at a real
+    /// TU/PU/CU boundary and 0 elsewhere (§8.7.2.4).
+    bs_v: crate::plane::Plane<u8>,
+    bs_h: crate::plane::Plane<u8>,
+    /// Per-4×4-luma slice index, used to gate cross-slice filtering when
+    /// `loop_filter_across_slices` is disabled.
+    slice_idx: crate::plane::Plane<u16>,
+    /// Current slice index being decoded (incremented per independent segment).
+    cur_slice_idx: u16,
+    cu_tqb: bool,  // current CU's cu_transquant_bypass_flag
+    grid_w: usize, // ceil(w/4), one entry for every covered 4×4 luma grid cell
     #[allow(dead_code)]
     grid_h: usize, // ceil(h/4)
-    ct_depth: crate::plane::Plane<u8>,  // per 4×4, coding-tree depth (for split_cu_flag ctx)
+    ct_depth: crate::plane::Plane<u8>, // per 4×4, coding-tree depth (for split_cu_flag ctx)
 
     // QP tracking
     slice_qp: i32,
@@ -122,6 +139,10 @@ pub(crate) struct FullDecoder<'cab> {
     ctb_rows: usize,
     sao_luma: bool,
     sao_chroma: bool,
+
+    /// Resolved in-picture tile geometry (§6.5.1). `None` when the PPS does not
+    /// enable tiles (plain raster scan, single implicit tile).
+    tiles: Option<crate::tiles::TileGrid>,
 
     // Slice-level chroma QP offsets, added to the PPS offsets during chroma QP
     // derivation (§8.6.1).
@@ -139,6 +160,11 @@ pub(crate) struct FullDecoder<'cab> {
     // WPP context snapshots
     wpp_ctx_snap: Vec<Option<ContextSet>>,
     wpp_ictx_snap: Vec<Option<IntraModeContexts>>,
+
+    /// TileId of the CTB currently being decoded (0 when tiles are disabled).
+    /// Used to reject intra reference neighbors that lie in a different tile
+    /// (§6.4.1: a neighbor in a different tile is unavailable).
+    cur_tile_id: usize,
 
     /// Pre-allocated scratch memory reused every TU to avoid per-block
     /// heap allocations on the hot path (~4–6 allocs per TU eliminated).
@@ -216,6 +242,7 @@ impl FullDecoder<'static> {
         let ictx = IntraModeContexts::init_islice(slice_qp.clamp(0, 51) as u8);
         let ctb_cols = w.div_ceil(ctb);
         let ctb_rows = h.div_ceil(ctb);
+        let tiles = crate::tiles::TileGrid::from_pps(&pps, ctb_cols, ctb_rows);
         let log2_qg = sps.log2_ctb - pps.diff_cu_qp_delta_depth;
         Ok(FullDecoder {
             cab,
@@ -243,6 +270,13 @@ impl FullDecoder<'static> {
             mode_y: crate::plane::Plane::owned(vec![MODE_DC; grid_w * grid_h]),
             decoded: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             tqb: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            pcm: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            bs_v: crate::plane::Plane::owned(vec![0u8; grid_w * grid_h]),
+            bs_h: crate::plane::Plane::owned(vec![0u8; grid_w * grid_h]),
+            slice_idx: crate::plane::Plane::owned(vec![0u16; grid_w * grid_h]),
+            cur_slice_idx: 0,
             cu_tqb: false,
             ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
             grid_w,
@@ -259,6 +293,7 @@ impl FullDecoder<'static> {
             ctb_rows,
             sao_luma,
             sao_chroma,
+            tiles,
             slice_cb_qp_offset: hdr.cb_qp_offset,
             slice_cr_qp_offset: hdr.cr_qp_offset,
             deblocking_disabled: hdr.deblocking_disabled,
@@ -273,6 +308,7 @@ impl FullDecoder<'static> {
             deq_scratch16: vec![0i16; 1024],
             res_scratch16: vec![0i16; 1024],
             coeff_scratch: vec![0i32; 1024],
+            cur_tile_id: 0,
             strong_smoothing: true,
             sps,
             pps,
@@ -289,6 +325,7 @@ impl<'cab> FullDecoder<'cab> {
         self.cab.reset_with(cabac)?;
         if !hdr.dependent_slice_segment {
             // Independent segment: reset entropy contexts and slice-level state.
+            self.cur_slice_idx = self.cur_slice_idx.wrapping_add(1);
             let slice_qp = clamp_qpy(hdr.slice_qp, self.bd);
             self.slice_qp = slice_qp;
             self.qp_y_prev = slice_qp;
@@ -310,7 +347,7 @@ impl<'cab> FullDecoder<'cab> {
             // resets at the segment's first quantization group (handled by the
             // QG logic), so continue with the retained context.
         }
-        self.decode_slice(hdr.slice_segment_address)
+        self.decode_slice_ctx(hdr.slice_segment_address, Some((cabac, &hdr.entry_points)))
     }
 
     /// Decode one CTB at grid position `(rx, ry)`: parse SAO params, run the
@@ -331,6 +368,12 @@ impl<'cab> FullDecoder<'cab> {
     #[inline]
     fn decode_one_ctb_inner(&mut self, rx: usize, ry: usize, wpp: bool, store_snap: bool) -> bool {
         let ctb = 1usize << self.log2_ctb;
+        // Record the current CTB's tile so intra availability can reject
+        // neighbors that fall in a different tile (§6.4.1).
+        self.cur_tile_id = match &self.tiles {
+            Some(g) => g.tile_id_at(rx, ry),
+            None => 0,
+        };
         if self.sps.sao_enabled {
             self.parse_sao(rx, ry);
         }
@@ -430,6 +473,12 @@ impl<'cab> FullDecoder<'cab> {
             mode_y: (self.mode_y.as_mut_ptr(), self.mode_y.len()),
             decoded: (self.decoded.as_mut_ptr(), self.decoded.len()),
             tqb: (self.tqb.as_mut_ptr(), self.tqb.len()),
+            pcm: (self.pcm.as_mut_ptr(), self.pcm.len()),
+            edge_v: (self.edge_v.as_mut_ptr(), self.edge_v.len()),
+            edge_h: (self.edge_h.as_mut_ptr(), self.edge_h.len()),
+            bs_v: (self.bs_v.as_mut_ptr(), self.bs_v.len()),
+            bs_h: (self.bs_h.as_mut_ptr(), self.bs_h.len()),
+            slice_idx: (self.slice_idx.as_mut_ptr(), self.slice_idx.len()),
             ct_depth: (self.ct_depth.as_mut_ptr(), self.ct_depth.len()),
             qp_y_map: (self.qp_y_map.as_mut_ptr(), self.qp_y_map.len()),
             sao: (self.sao.as_mut_ptr(), self.sao.len()),
@@ -522,7 +571,110 @@ impl<'cab> FullDecoder<'cab> {
     /// Reconstruct CTBs starting at raster address `start_ctb`, stopping at the
     /// slice's `end_of_slice_segment_flag`. Does not run loop filters — call
     /// [`finish`] once, after all segments of the picture are decoded.
+    ///
+    /// With tiles enabled the CTBs are visited in tile-scan order (§6.5.1)
+    /// rather than raster; CABAC is re-initialised at the first CTB of each tile
+    /// (§9.3.1) by seeking to that tile's entry-point sub-stream. WPP is mutually
+    /// exclusive with tiles in this path.
     pub(crate) fn decode_slice(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
+        self.decode_slice_ctx(start_ctb, None)
+    }
+
+    /// As [`decode_slice`], but with the slice segment's CABAC payload and
+    /// entry-point sub-stream lengths available so the tiled path can seek to
+    /// each tile's sub-stream. `cabac_and_entries` is `(cabac_bytes,
+    /// entry_point_lengths)` where the lengths are `entry_point_offset_minus1+1`
+    /// (byte lengths of sub-streams `0..n-1`; the last is implied).
+    pub(crate) fn decode_slice_ctx(
+        &mut self,
+        start_ctb: usize,
+        cabac_and_entries: Option<(&[u8], &[u32])>,
+    ) -> Result<(), DecodeError> {
+        if self.tiles.is_some() {
+            return self.decode_slice_tiled(start_ctb, cabac_and_entries);
+        }
+        self.decode_slice_raster(start_ctb)
+    }
+
+    /// Tile-scan CTB decode. Advances through tile-scan addresses `ts`, mapping
+    /// each to its raster `(rx, ry)`. At each tile's first CTB the CABAC engine
+    /// is repositioned to that tile's entry-point sub-stream (when entry points
+    /// are available) and the contexts + QP predictor are re-initialised.
+    fn decode_slice_tiled(
+        &mut self,
+        start_ctb: usize,
+        cabac_and_entries: Option<(&[u8], &[u32])>,
+    ) -> Result<(), DecodeError> {
+        let grid = self.tiles.clone().unwrap();
+        let total = self.ctb_cols * self.ctb_rows;
+        let start_ctb = start_ctb.min(total);
+        let start_ts = grid.rs_to_ts(start_ctb);
+
+        // Precompute per-tile-boundary CABAC sub-stream start offsets (relative
+        // to the slice's CABAC payload) from the entry points. Entry point `i`
+        // ends sub-stream `i`; the cumulative sums give each sub-stream's start.
+        // For a single slice segment covering the whole picture the number of
+        // sub-streams is `num_tiles`, and the number of entry points is
+        // `num_tiles - 1`.
+        let sub_starts: Vec<usize> = match cabac_and_entries {
+            Some((_, entries)) if !entries.is_empty() => {
+                let mut acc = 0usize;
+                let mut v = Vec::with_capacity(entries.len() + 1);
+                v.push(0usize);
+                for &len in entries {
+                    acc = acc.saturating_add(len as usize);
+                    v.push(acc);
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
+
+        // Counter of how many tile sub-streams we've entered so far (indexes
+        // `sub_starts`). The slice segment begins in sub-stream 0.
+        let mut substream = 0usize;
+
+        let mut ts = start_ts;
+        while ts < total {
+            let rs = grid.ts_to_rs(ts);
+            let rx = rs % self.ctb_cols;
+            let ry = rs / self.ctb_cols;
+
+            // On entering a new tile (not the slice segment's first CTB), seek
+            // to that tile's sub-stream and re-initialise contexts (§9.3.1).
+            if ts != start_ts && grid.is_tile_start_rs(rs) {
+                substream += 1;
+                let mut seeked = false;
+                if let Some((cabac, _)) = cabac_and_entries
+                    && let Some(&off) = sub_starts.get(substream)
+                    && off <= cabac.len()
+                {
+                    // Reposition the arithmetic engine at the tile sub-stream.
+                    if self.cab.reset_with(&cabac[off..]).is_ok() {
+                        seeked = true;
+                    }
+                }
+                if !seeked {
+                    // Fallback: assume contiguous sub-streams (byte-aligned after
+                    // the previous tile's end_of_sub_stream_one_bit).
+                    self.cab.reinit_engine();
+                }
+                let qp = self.slice_qp.clamp(0, 51) as u8;
+                self.ctx = ContextSet::init_islice(qp);
+                self.ictx = IntraModeContexts::init_islice(qp);
+                self.qp_y_prev = self.slice_qp;
+            }
+
+            let terminated = self.decode_one_ctb(rx, ry, false);
+            if terminated {
+                break;
+            }
+            ts += 1;
+        }
+        Ok(())
+    }
+
+    fn decode_slice_raster(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
         let _ctb = 1usize << self.log2_ctb;
         let wpp = self.pps.entropy_coding_sync_enabled;
         let total = self.ctb_cols * self.ctb_rows;
@@ -603,9 +755,14 @@ impl<'cab> FullDecoder<'cab> {
             // Parallel SAO only when a pool is supplied (single-item path where
             // SAO is the only parallelism available). In the grid path each tile
             // already runs on a pool worker, so `None` keeps SAO serial there to
-            // avoid oversubscription.
+            // avoid oversubscription. The parallel EO kernels don't consult
+            // slice/tile/PCM boundary maps, so a boundary-restricted picture
+            // (§8.7.3.2) always takes the serial gated path.
+            let restricted = self.sao_boundary_restricted();
             match pool {
-                Some(p) if p.threads() > 1 && self.ctb_rows > 1 => self.apply_sao_parallel(p),
+                Some(p) if p.threads() > 1 && self.ctb_rows > 1 && !restricted => {
+                    self.apply_sao_parallel(p)
+                }
                 _ => self.apply_sao(),
             }
         }
@@ -742,13 +899,126 @@ impl<'cab> FullDecoder<'cab> {
             qp_bd_offset_y: 6 * (self.bd as i32 - 8),
             qp_bd_offset_c: 6 * (self.bd_c as i32 - 8),
             default_qp: self.slice_qp as i16,
+            log2_ctb: self.log2_ctb,
             qp_y_map: &self.qp_y_map[..],
             tqb: &self.tqb[..],
+            edge_v: &self.edge_v[..],
+            edge_h: &self.edge_h[..],
+            bs_v: &self.bs_v[..],
+            bs_h: &self.bs_h[..],
+            pcm: &self.pcm[..],
+            slice_idx: &self.slice_idx[..],
+            pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
+            loop_filter_across_slices: self.pps.loop_filter_across_slices,
+            tile_grid: match &self.tiles {
+                Some(g) if !g.loop_filter_across_tiles => Some(g.clone()),
+                _ => None,
+            },
         };
         let out = crate::deblock::apply_deblocking_parallel(pool, &ctx, self.log2_ctb, y, cb, cr);
         self.y = crate::plane::Plane::owned(out.y);
         self.cb = crate::plane::Plane::owned(out.cb);
         self.cr = crate::plane::Plane::owned(out.cr);
+    }
+
+    /// Boundary strength for the vertical edge to the *left* of luma pixel
+    /// `(px, py)` (px on the 8-sample grid). Returns 0 when the edge should not
+    /// be filtered: not a real TU/PU/CU boundary, a disabled cross-slice or
+    /// cross-tile boundary, or a PCM/transquant-bypass exemption (§8.7.2).
+    #[inline]
+    fn deblock_bs_v(&self, px: usize, py: usize) -> u8 {
+        if px == 0 || px >= self.w || py >= self.h {
+            return 0;
+        }
+        let g = match self.grid_idx(px, py) {
+            Some(g) => g,
+            None => return 0,
+        };
+        if !self.edge_v.get(g).copied().unwrap_or(false) {
+            return 0;
+        }
+        if !self.filter_across_boundary(px - 1, py, px, py) {
+            return 0;
+        }
+        self.bs_v.get(g).copied().unwrap_or(0)
+    }
+
+    /// Boundary strength for the horizontal edge *above* luma pixel `(px, py)`.
+    #[inline]
+    fn deblock_bs_h(&self, px: usize, py: usize) -> u8 {
+        if py == 0 || px >= self.w || py >= self.h {
+            return 0;
+        }
+        let g = match self.grid_idx(px, py) {
+            Some(g) => g,
+            None => return 0,
+        };
+        if !self.edge_h.get(g).copied().unwrap_or(false) {
+            return 0;
+        }
+        if !self.filter_across_boundary(px, py - 1, px, py) {
+            return 0;
+        }
+        self.bs_h.get(g).copied().unwrap_or(0)
+    }
+
+    /// Whether the boundary between P pixel `(pxp, pyp)` and Q pixel
+    /// `(pxq, pyq)` may be filtered given slice/tile/PCM/TQB exemptions.
+    #[inline]
+    fn filter_across_boundary(&self, pxp: usize, pyp: usize, pxq: usize, pyq: usize) -> bool {
+        // Transquant-bypass (lossless) blocks are never deblocked on the side
+        // that is bypass (§8.7.2 restore_tqb behaviour ≈ skip).
+        if self.tqb_at(pxp, pyp) || self.tqb_at(pxq, pyq) {
+            return false;
+        }
+        // I_PCM blocks are exempt when pcm_loop_filter_disabled_flag is set.
+        if self.sps.pcm_loop_filter_disabled && (self.pcm_at(pxp, pyp) || self.pcm_at(pxq, pyq)) {
+            return false;
+        }
+        // Cross-slice filtering: if disabled and the two sides are in different
+        // slices, do not filter (§8.7.1).
+        if !self.pps.loop_filter_across_slices {
+            let sp = self.slice_idx_at(pxp, pyp);
+            let sq = self.slice_idx_at(pxq, pyq);
+            if sp != sq {
+                return false;
+            }
+        }
+        // Cross-tile filtering: if disabled and the two sides are in different
+        // tiles, do not filter.
+        if let Some(g) = &self.tiles
+            && !g.loop_filter_across_tiles
+        {
+            let ctb = self.log2_ctb;
+            let tp = g.tile_id_at(pxp >> ctb, pyp >> ctb);
+            let tq = g.tile_id_at(pxq >> ctb, pyq >> ctb);
+            if tp != tq {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn pcm_at(&self, px: usize, py: usize) -> bool {
+        if px >= self.w || py >= self.h {
+            return false;
+        }
+        self.grid_idx(px, py)
+            .and_then(|g| self.pcm.get(g))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn slice_idx_at(&self, px: usize, py: usize) -> u16 {
+        if px >= self.w || py >= self.h {
+            return 0;
+        }
+        self.grid_idx(px, py)
+            .and_then(|g| self.slice_idx.get(g))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn apply_deblocking(&mut self) {
@@ -834,14 +1104,15 @@ impl<'cab> FullDecoder<'cab> {
                     if pass == 0 {
                         // vertical edge at x=edge, rows scan..scan+3
                         let mid = scan + 1; // representative row
-                        let qp_p = qp_at(&self.qp_y_map[..], edge - 1, mid);
-                        let qp_q = qp_at(&self.qp_y_map[..], edge, mid);
-                        // Lossless (transquant-bypass) CUs are exempt from deblocking
-                        // (HEVC §8.7.2): if either side is bypass, skip this segment.
-                        if self.tqb_at(edge - 1, mid) || self.tqb_at(edge, mid) {
+                        // Only a real TU/PU/CU boundary with Bs>0 that isn't a
+                        // disabled slice/tile/PCM/TQB boundary is filtered
+                        // (§8.7.2). For intra pictures Bs is 2 at such edges.
+                        if self.deblock_bs_v(edge, mid) == 0 {
                             scan += 4;
                             continue;
                         }
+                        let qp_p = qp_at(&self.qp_y_map[..], edge - 1, mid);
+                        let qp_q = qp_at(&self.qp_y_map[..], edge, mid);
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
                         let beta_prime = (avg_qp + qp_bd_offset_y + beta_offset).clamp(0, 51);
                         let tc_prime = (avg_qp + qp_bd_offset_y + 2 + tc_offset).clamp(0, 53);
@@ -852,94 +1123,33 @@ impl<'cab> FullDecoder<'cab> {
                             continue;
                         }
 
-                        // Compute d across all 4 rows of the segment
-                        let mut d_total = 0i32;
-                        for s in scan..scan + 4 {
-                            if s >= h {
-                                break;
-                            }
-                            let p = |o: usize| self.y[s * w + edge - 1 - o] as i32;
-                            let q = |o: usize| self.y[s * w + edge + o] as i32;
-                            d_total +=
-                                (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
-                        }
-                        if d_total >= beta {
-                            scan += 4;
-                            continue;
-                        }
-
-                        // Apply filter to each of the 4 rows
-                        for s in scan..scan + 4 {
-                            if s >= h {
-                                continue;
-                            }
-                            let base_p = s * w + edge - 1;
-                            let base_q = s * w + edge;
-                            let (p0, p1, p2, p3) = (
-                                self.y[base_p] as i32,
-                                self.y[base_p - 1] as i32,
-                                self.y[base_p - 2] as i32,
-                                self.y[base_p - 3] as i32,
-                            );
-                            let (q0, q1, q2, q3) = (
-                                self.y[base_q] as i32,
-                                self.y[base_q + 1] as i32,
-                                self.y[base_q + 2] as i32,
-                                self.y[base_q + 3] as i32,
-                            );
-                            let dp = (p2 - 2 * p1 + p0).abs();
-                            let dq = (q2 - 2 * q1 + q0).abs();
-                            let d = dp + dq;
-                            let strong = d < (beta >> 2)
-                                && (p0 - q0).abs() < (5 * tc + 1) >> 1
-                                && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
+                        // Vertical edge at x=edge; the 4 lines are rows
+                        // scan..scan+4. tap<0 selects the p side (edge-1-..),
+                        // tap>=0 the q side (edge+..).
+                        if scan + 4 <= h {
                             let maxv = (1i32 << self.bd) - 1;
-                            if strong {
-                                self.y[base_p] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3)
-                                    .clamp(0, maxv)
-                                    as u16;
-                                self.y[base_p - 1] =
-                                    ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(0, maxv) as u16;
-                                self.y[base_p - 2] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3)
-                                    .clamp(0, maxv)
-                                    as u16;
-                                self.y[base_q] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3)
-                                    .clamp(0, maxv)
-                                    as u16;
-                                self.y[base_q + 1] =
-                                    ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, maxv) as u16;
-                                self.y[base_q + 2] = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3)
-                                    .clamp(0, maxv)
-                                    as u16;
-                            } else {
-                                let delta =
-                                    ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-                                self.y[base_p] = (p0 + delta).clamp(0, maxv) as u16;
-                                self.y[base_q] = (q0 - delta).clamp(0, maxv) as u16;
-                                let thres = (tc * 10 + 1) >> 1;
-                                if (2 * (p0 - p1) - delta).abs() < thres {
-                                    let dp1 = (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1))
-                                        .clamp(-(tc >> 1), tc >> 1);
-                                    self.y[base_p - 1] = (p1 + dp1).clamp(0, maxv) as u16;
-                                }
-                                if (2 * (q0 - q1) + delta).abs() < thres {
-                                    let dq1 = (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1))
-                                        .clamp(-(tc >> 1), tc >> 1);
-                                    self.y[base_q + 1] = (q1 + dq1).clamp(0, maxv) as u16;
-                                }
-                            }
+                            crate::deblock::deblock_luma_segment(
+                                &mut self.y[..],
+                                beta,
+                                tc,
+                                maxv,
+                                |line, tap| {
+                                    let col = (edge as i32 + tap) as usize;
+                                    (scan + line) * w + col
+                                },
+                            );
                         }
                         scan += 4;
                         continue;
                     } else {
                         // horizontal edge at y=edge, cols scan..scan+3
                         let mid = scan + 1;
-                        let qp_p = qp_at(&self.qp_y_map[..], mid, edge - 1);
-                        let qp_q = qp_at(&self.qp_y_map[..], mid, edge);
-                        if self.tqb_at(mid, edge - 1) || self.tqb_at(mid, edge) {
+                        if self.deblock_bs_h(mid, edge) == 0 {
                             scan += 4;
                             continue;
                         }
+                        let qp_p = qp_at(&self.qp_y_map[..], mid, edge - 1);
+                        let qp_q = qp_at(&self.qp_y_map[..], mid, edge);
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
                         let beta_prime = (avg_qp + qp_bd_offset_y + beta_offset).clamp(0, 51);
                         let tc_prime = (avg_qp + qp_bd_offset_y + 2 + tc_offset).clamp(0, 53);
@@ -950,86 +1160,21 @@ impl<'cab> FullDecoder<'cab> {
                             continue;
                         }
 
-                        let mut d_total = 0i32;
-                        for s in scan..scan + 4 {
-                            if s >= w {
-                                break;
-                            }
-                            let p = |o: usize| self.y[(edge - 1 - o) * w + s] as i32;
-                            let q = |o: usize| self.y[(edge + o) * w + s] as i32;
-                            d_total +=
-                                (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
-                        }
-                        if d_total >= beta {
-                            scan += 4;
-                            continue;
-                        }
-
-                        for s in scan..scan + 4 {
-                            if s >= w {
-                                continue;
-                            }
-                            let (p0, p1, p2, p3) = (
-                                self.y[(edge - 1) * w + s] as i32,
-                                self.y[(edge - 2) * w + s] as i32,
-                                self.y[(edge - 3) * w + s] as i32,
-                                if edge >= 4 {
-                                    self.y[(edge - 4) * w + s] as i32
-                                } else {
-                                    0
-                                },
-                            );
-                            let (q0, q1, q2, q3) = (
-                                self.y[(edge) * w + s] as i32,
-                                self.y[(edge + 1) * w + s] as i32,
-                                self.y[(edge + 2) * w + s] as i32,
-                                if edge + 3 < h {
-                                    self.y[(edge + 3) * w + s] as i32
-                                } else {
-                                    0
-                                },
-                            );
-                            let dp = (p2 - 2 * p1 + p0).abs();
-                            let dq = (q2 - 2 * q1 + q0).abs();
-                            let d = dp + dq;
-                            let strong = d < (beta >> 2)
-                                && (p0 - q0).abs() < (5 * tc + 1) >> 1
-                                && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
+                        // Horizontal edge at y=edge; the 4 lines are columns
+                        // scan..scan+4. tap<0 selects the p side (rows above),
+                        // tap>=0 the q side (rows below).
+                        if scan + 4 <= w && edge + 4 <= h {
                             let maxv = (1i32 << self.bd) - 1;
-                            if strong {
-                                self.y[(edge - 1) * w + s] =
-                                    ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(0, maxv)
-                                        as u16;
-                                self.y[(edge - 2) * w + s] =
-                                    ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(0, maxv) as u16;
-                                self.y[(edge - 3) * w + s] =
-                                    ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(0, maxv)
-                                        as u16;
-                                self.y[(edge) * w + s] =
-                                    ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(0, maxv)
-                                        as u16;
-                                self.y[(edge + 1) * w + s] =
-                                    ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, maxv) as u16;
-                                self.y[(edge + 2) * w + s] =
-                                    ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(0, maxv)
-                                        as u16;
-                            } else {
-                                let delta =
-                                    ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-                                self.y[(edge - 1) * w + s] = (p0 + delta).clamp(0, maxv) as u16;
-                                self.y[(edge) * w + s] = (q0 - delta).clamp(0, maxv) as u16;
-                                let thres = (tc * 10 + 1) >> 1;
-                                if (2 * (p0 - p1) - delta).abs() < thres {
-                                    let dp1 = (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1))
-                                        .clamp(-(tc >> 1), tc >> 1);
-                                    self.y[(edge - 2) * w + s] = (p1 + dp1).clamp(0, maxv) as u16;
-                                }
-                                if (2 * (q0 - q1) + delta).abs() < thres {
-                                    let dq1 = (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1))
-                                        .clamp(-(tc >> 1), tc >> 1);
-                                    self.y[(edge + 1) * w + s] = (q1 + dq1).clamp(0, maxv) as u16;
-                                }
-                            }
+                            crate::deblock::deblock_luma_segment(
+                                &mut self.y[..],
+                                beta,
+                                tc,
+                                maxv,
+                                |line, tap| {
+                                    let row = (edge as i32 + tap) as usize;
+                                    row * w + (scan + line)
+                                },
+                            );
                         }
                         scan += 4;
                         continue;
@@ -1052,36 +1197,27 @@ impl<'cab> FullDecoder<'cab> {
                 let mut scan = 0;
                 while scan + 4 <= scan_max {
                     let mid = scan + 1;
-                    // QP for chroma — use luma QP at corresponding position
-                    let (qlx, qly) = if pass == 0 {
+                    // Chroma is filtered only where the co-located luma edge has
+                    // Bs == 2 and is a real, non-disabled boundary (§8.7.2.4).
+                    let (lex, ley) = if pass == 0 {
                         (edge * self.sub_w, mid * self.sub_h)
                     } else {
                         (mid * self.sub_w, edge * self.sub_h)
                     };
-                    let avg_qp_l = qp_at(&self.qp_y_map[..], qlx.min(w - 1), qly.min(h - 1));
-                    let tc_prime_c = (avg_qp_l + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
-                    let tc_c = TC[tc_prime_c as usize];
-                    if tc_c == 0 {
+                    let bs = if pass == 0 {
+                        self.deblock_bs_v(lex, ley)
+                    } else {
+                        self.deblock_bs_h(lex, ley)
+                    };
+                    if bs < 2 {
                         scan += 4;
                         continue;
                     }
-                    // Lossless CUs are exempt from chroma deblocking too.
-                    let (px_p, py_p, px_q, py_q) = if pass == 0 {
-                        (
-                            (edge - 1) * self.sub_w,
-                            mid * self.sub_h,
-                            edge * self.sub_w,
-                            mid * self.sub_h,
-                        )
-                    } else {
-                        (
-                            mid * self.sub_w,
-                            (edge - 1) * self.sub_h,
-                            mid * self.sub_w,
-                            edge * self.sub_h,
-                        )
-                    };
-                    if self.tqb_at(px_p, py_p) || self.tqb_at(px_q, py_q) {
+                    // Chroma QP derivation uses the co-located luma QP.
+                    let avg_qp_l = qp_at(&self.qp_y_map[..], lex.min(w - 1), ley.min(h - 1));
+                    let tc_prime_c = (avg_qp_l + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
+                    let tc_c = TC[tc_prime_c as usize];
+                    if tc_c == 0 {
                         scan += 4;
                         continue;
                     }
@@ -1189,6 +1325,44 @@ impl<'cab> FullDecoder<'cab> {
         (active, needs_src)
     }
 
+    /// Whether SAO edge-offset must honour slice/tile/PCM/TQB boundary
+    /// availability (§8.7.3.2). False for the common single-slice, no-tile,
+    /// no-PCM picture, where the fast SIMD/scalar EO path is exact.
+    fn sao_boundary_restricted(&self) -> bool {
+        if !self.pps.loop_filter_across_slices {
+            return true;
+        }
+        if let Some(g) = &self.tiles
+            && !g.loop_filter_across_tiles
+        {
+            return true;
+        }
+        if self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b) {
+            return true;
+        }
+        // Transquant-bypass samples are always loop-filter exempt.
+        if self.tqb.iter().any(|&b| b) {
+            return true;
+        }
+        false
+    }
+
+    /// Build the boundary map view used by the gated SAO edge-offset path.
+    fn sao_boundary(&self) -> crate::sao::SaoBoundary<'_> {
+        crate::sao::SaoBoundary {
+            gw: self.grid_w,
+            log2_ctb: self.log2_ctb,
+            sub_w: self.sub_w,
+            sub_h: self.sub_h,
+            slice_idx: &self.slice_idx[..],
+            tqb: &self.tqb[..],
+            pcm: &self.pcm[..],
+            loop_filter_across_slices: self.pps.loop_filter_across_slices,
+            pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
+            tile_grid: self.tiles.as_ref(),
+        }
+    }
+
     fn apply_sao(&mut self) {
         let ctb = 1usize << self.log2_ctb;
         let (active, needs_src) = self.sao_usage();
@@ -1202,117 +1376,151 @@ impl<'cab> FullDecoder<'cab> {
         let orig_cb = needs_src[1].then(|| self.cb.to_vec_clone());
         let orig_cr = needs_src[2].then(|| self.cr.to_vec_clone());
 
+        let restricted = self.sao_boundary_restricted();
+        // Take the planes out so the boundary map borrows (slice_idx/tqb/pcm/
+        // tiles) don't conflict with the &mut plane writes on the gated path.
+        let mut y = self.y.take_vec();
+        let mut cb = self.cb.take_vec();
+        let mut cr = self.cr.take_vec();
+        let bnd = self.sao_boundary();
+        let (w, h, cw, ch) = (self.w, self.h, self.cw, self.ch);
+        let (bd, bd_c) = (self.bd, self.bd_c);
+        let (sub_w, sub_h) = (self.sub_w, self.sub_h);
+        let exec = self.exec.clone();
+
         for ry in 0..self.ctb_rows {
             for rx in 0..self.ctb_cols {
                 let idx = ry * self.ctb_cols + rx;
-                let sao = &self.sao[idx];
+                let sao = self.sao[idx];
                 let x0 = rx * ctb;
                 let y0 = ry * ctb;
 
                 // Luma
                 if self.sao_luma && sao.type_idx[0] != 0 {
-                    let x_end = (x0 + ctb).min(self.w);
-                    let y_end = (y0 + ctb).min(self.h);
+                    let x_end = (x0 + ctb).min(w);
+                    let y_end = (y0 + ctb).min(h);
                     match sao.type_idx[0] {
-                        1 => (self.exec.sao_band_offset_inplace)(
-                            &mut self.y[..],
-                            self.w,
+                        1 => (exec.sao_band_offset_inplace)(
+                            &mut y[..],
+                            w,
                             x0,
                             y0,
                             x_end,
                             y_end,
                             &sao.offsets[0],
                             sao.band_pos[0],
-                            self.bd,
+                            bd,
                         ),
-                        2 => (self.exec.sao_plane)(
-                            &mut self.y[..],
-                            orig_y.as_deref().expect("SAO EO requires luma snapshot"),
-                            self.w,
-                            self.h,
-                            x0,
-                            y0,
-                            x_end,
-                            y_end,
-                            2,
-                            &sao.offsets[0],
-                            sao.band_pos[0],
-                            sao.eo_class[0],
-                            self.bd,
-                        ),
+                        2 => {
+                            let src = orig_y.as_deref().expect("SAO EO requires luma snapshot");
+                            if restricted {
+                                crate::sao::apply_sao_edge_offset_gated(
+                                    &mut y[..],
+                                    src,
+                                    w,
+                                    h,
+                                    x0,
+                                    y0,
+                                    x_end,
+                                    y_end,
+                                    &sao.offsets[0],
+                                    sao.eo_class[0],
+                                    bd,
+                                    &|cx, cy, nx, ny| bnd.luma_neighbor_ok(cx, cy, nx, ny),
+                                );
+                            } else {
+                                (exec.sao_plane)(
+                                    &mut y[..],
+                                    src,
+                                    w,
+                                    h,
+                                    x0,
+                                    y0,
+                                    x_end,
+                                    y_end,
+                                    2,
+                                    &sao.offsets[0],
+                                    sao.band_pos[0],
+                                    sao.eo_class[0],
+                                    bd,
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
                 // Chroma (Cb, Cr share eo_class)
                 if self.sao_chroma {
-                    let cw = self.cw;
-                    let ch = self.ch;
-                    let cx0 = x0 / self.sub_w;
-                    let cy0 = y0 / self.sub_h;
-                    let cx_end = ((x0 + ctb) / self.sub_w).min(cw);
-                    let cy_end = ((y0 + ctb) / self.sub_h).min(ch);
+                    let cx0 = x0 / sub_w;
+                    let cy0 = y0 / sub_h;
+                    let cx_end = ((x0 + ctb) / sub_w).min(cw);
+                    let cy_end = ((y0 + ctb) / sub_h).min(ch);
 
-                    match sao.type_idx[1] {
-                        1 => (self.exec.sao_band_offset_inplace)(
-                            &mut self.cb[..],
-                            cw,
-                            cx0,
-                            cy0,
-                            cx_end,
-                            cy_end,
-                            &sao.offsets[1],
-                            sao.band_pos[1],
-                            self.bd_c,
-                        ),
-                        2 => (self.exec.sao_plane)(
-                            &mut self.cb[..],
-                            orig_cb.as_deref().expect("SAO EO requires Cb snapshot"),
-                            cw,
-                            ch,
-                            cx0,
-                            cy0,
-                            cx_end,
-                            cy_end,
-                            2,
-                            &sao.offsets[1],
-                            sao.band_pos[1],
-                            sao.eo_class[1],
-                            self.bd_c,
-                        ),
-                        _ => {}
-                    }
-                    match sao.type_idx[2] {
-                        1 => (self.exec.sao_band_offset_inplace)(
-                            &mut self.cr[..],
-                            cw,
-                            cx0,
-                            cy0,
-                            cx_end,
-                            cy_end,
-                            &sao.offsets[2],
-                            sao.band_pos[2],
-                            self.bd_c,
-                        ),
-                        2 => (self.exec.sao_plane)(
-                            &mut self.cr[..],
-                            orig_cr.as_deref().expect("SAO EO requires Cr snapshot"),
-                            cw,
-                            ch,
-                            cx0,
-                            cy0,
-                            cx_end,
-                            cy_end,
-                            2,
-                            &sao.offsets[2],
-                            sao.band_pos[2],
-                            sao.eo_class[2],
-                            self.bd_c,
-                        ),
-                        _ => {}
+                    for (plane_i, (buf, src_opt)) in
+                        [(&mut cb, orig_cb.as_deref()), (&mut cr, orig_cr.as_deref())]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let ci = 1 + plane_i;
+                        match sao.type_idx[ci] {
+                            1 => (exec.sao_band_offset_inplace)(
+                                &mut buf[..],
+                                cw,
+                                cx0,
+                                cy0,
+                                cx_end,
+                                cy_end,
+                                &sao.offsets[ci],
+                                sao.band_pos[ci],
+                                bd_c,
+                            ),
+                            2 => {
+                                let src = src_opt.expect("SAO EO requires chroma snapshot");
+                                if restricted {
+                                    crate::sao::apply_sao_edge_offset_gated(
+                                        &mut buf[..],
+                                        src,
+                                        cw,
+                                        ch,
+                                        cx0,
+                                        cy0,
+                                        cx_end,
+                                        cy_end,
+                                        &sao.offsets[ci],
+                                        sao.eo_class[ci],
+                                        bd_c,
+                                        &|ccx, ccy, ncx, ncy| {
+                                            bnd.chroma_neighbor_ok(ccx, ccy, ncx, ncy)
+                                        },
+                                    );
+                                } else {
+                                    (exec.sao_plane)(
+                                        &mut buf[..],
+                                        src,
+                                        cw,
+                                        ch,
+                                        cx0,
+                                        cy0,
+                                        cx_end,
+                                        cy_end,
+                                        2,
+                                        &sao.offsets[ci],
+                                        sao.band_pos[ci],
+                                        sao.eo_class[ci],
+                                        bd_c,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
         }
+        drop(bnd);
+        self.y = crate::plane::Plane::owned(y);
+        self.cb = crate::plane::Plane::owned(cb);
+        self.cr = crate::plane::Plane::owned(cr);
     }
 
     fn coding_quadtree(&mut self, x0: usize, y0: usize, log2_cb: u32, depth: u8) {
@@ -1348,6 +1556,7 @@ impl<'cab> FullDecoder<'cab> {
     fn split_cu_ctx(&self, x0: usize, y0: usize, depth: u8) -> usize {
         let mut inc = 0;
         if x0 >= 4
+            && self.same_tile(x0 - 1, y0)
             && let Some(g) = self.grid_idx(x0 - 1, y0)
             && self.decoded[g]
             && self.ct_depth[g] as usize > depth as usize
@@ -1355,6 +1564,7 @@ impl<'cab> FullDecoder<'cab> {
             inc += 1;
         }
         if y0 >= 4
+            && self.same_tile(x0, y0 - 1)
             && let Some(g) = self.grid_idx(x0, y0 - 1)
             && self.decoded[g]
             && self.ct_depth[g] as usize > depth as usize
@@ -1399,6 +1609,18 @@ impl<'cab> FullDecoder<'cab> {
         if self.cu_tqb {
             let cb = 1usize << log2_cb;
             self.set_tqb(x0, y0, cb);
+        }
+
+        // pcm_flag (§7.3.8.5): present for an intra CU when I_PCM is enabled and
+        // the CB size is within [Log2MinIpcmCbSize, Log2MaxIpcmCbSize]. When set,
+        // the CU carries uncompressed samples instead of a prediction+residual.
+        if self.sps.pcm_enabled
+            && log2_cb >= self.sps.log2_min_pcm_cb
+            && log2_cb <= self.sps.log2_max_pcm_cb
+            && self.cab.decode_terminate() != 0
+        {
+            self.decode_pcm_cu(x0, y0, log2_cb);
+            return;
         }
 
         let cb_size = 1usize << log2_cb;
@@ -1481,10 +1703,169 @@ impl<'cab> FullDecoder<'cab> {
 
         // mark decoded
         self.mark_decoded(x0, y0, cb_size);
+        // CU outer boundary + (for NxN) the internal PU split lines are deblock
+        // edges. The CU boundary is already covered by the first TU's edges, but
+        // marking again is idempotent; the PU split at cb/2 must be added when
+        // the CU was partitioned NxN.
+        self.mark_block_edges(x0, y0, cb_size, 2);
+        if nxn {
+            let half = cb_size / 2;
+            self.mark_block_edges(x0 + half, y0, half, 2); // internal vertical PU edge
+            self.mark_block_edges(x0, y0 + half, half, 2); // internal horizontal PU edge
+        }
+        self.set_slice_idx(x0, y0, cb_size);
         let cur_qp = clamp_qpy(self.cur_qp, self.bd);
         self.qp_y_prev = cur_qp;
         self.cur_qp = cur_qp;
         self.set_qp(x0, y0, cb_size, cur_qp);
+    }
+
+    /// Decode an I_PCM coding unit (§7.3.8.5 pcm_sample, §8.4.5.2 reconstruction).
+    /// The arithmetic engine has just returned 1 for `pcm_flag`; the bitstream is
+    /// byte-aligned, raw fixed-length luma then chroma samples are read, scaled
+    /// up to the coded bit depth, and written directly into the planes. The
+    /// arithmetic engine is re-initialised afterward.
+    fn decode_pcm_cu(&mut self, x0: usize, y0: usize, log2_cb: u32) {
+        let n = 1usize << log2_cb;
+        // Align the raw bit pointer (pcm_alignment_zero_bit padding) — same
+        // terminate→align sequence as a WPP/tile sub-stream boundary.
+        self.cab.byte_align();
+
+        // Luma samples: n×n, each pcm_bit_depth_luma bits, scaled to bd.
+        let pbd_y = (self.sps.pcm_bit_depth_luma as u32).min(self.bd as u32);
+        let shift_y = self.bd as u32 - pbd_y;
+        let w = self.w;
+        for yy in 0..n {
+            let py = y0 + yy;
+            if py >= self.h {
+                // Still must consume the bits to stay in sync.
+                for _ in 0..n {
+                    self.cab.read_pcm_bits(pbd_y);
+                }
+                continue;
+            }
+            for xx in 0..n {
+                let s = self.cab.read_pcm_bits(pbd_y);
+                let px = x0 + xx;
+                if px < w {
+                    self.y[py * w + px] = (s << shift_y) as u16;
+                }
+            }
+        }
+
+        // Chroma samples (skipped for monochrome).
+        if !self.sps.chroma.is_monochrome() {
+            let cn_w = n / self.sub_w;
+            let cn_h = n / self.sub_h;
+            let cx0 = x0 / self.sub_w;
+            let cy0 = y0 / self.sub_h;
+            let pbd_c = (self.sps.pcm_bit_depth_chroma as u32).min(self.bd_c as u32);
+            let shift_c = self.bd_c as u32 - pbd_c;
+            let cw = self.cw;
+            for (is_cr, plane_is_cr) in [false, true].into_iter().enumerate() {
+                let _ = is_cr;
+                for yy in 0..cn_h {
+                    let py = cy0 + yy;
+                    let in_pic = py < self.ch;
+                    for xx in 0..cn_w {
+                        let s = self.cab.read_pcm_bits(pbd_c);
+                        if !in_pic {
+                            continue;
+                        }
+                        let px = cx0 + xx;
+                        if px < cw {
+                            let v = (s << shift_c) as u16;
+                            if plane_is_cr {
+                                self.cr[py * cw + px] = v;
+                            } else {
+                                self.cb[py * cw + px] = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Re-prime the arithmetic engine from the now byte-aligned position.
+        self.cab.reinit_engine();
+
+        // Bookkeeping: I_PCM CUs are intra (mode irrelevant for prediction but
+        // needed for neighbor availability), lossless-like for the deblocking
+        // filter when pcm_loop_filter_disabled, and always "decoded".
+        self.set_mode(x0, y0, n, MODE_DC);
+        self.set_pcm(x0, y0, n);
+        self.mark_decoded(x0, y0, n);
+        self.mark_block_edges(x0, y0, n, 2);
+        self.set_slice_idx(x0, y0, n);
+        // PCM CUs carry no delta QP; QpY stays at the predicted value.
+        let cur_qp = clamp_qpy(self.cur_qp, self.bd);
+        self.qp_y_prev = cur_qp;
+        self.cur_qp = cur_qp;
+        self.set_qp(x0, y0, n, cur_qp);
+    }
+
+    fn set_pcm(&mut self, x0: usize, y0: usize, size: usize) {
+        for yy in (y0..y0 + size).step_by(4) {
+            for xx in (x0..x0 + size).step_by(4) {
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.pcm[g] = true;
+                }
+            }
+        }
+    }
+
+    /// Mark the left (vertical) and top (horizontal) boundaries of the block
+    /// `[x0,x0+size) × [y0,y0+size)` as deblock filter edges with the given
+    /// boundary strength. Only edges on the 8-sample grid are ever *filtered*
+    /// (checked at filter time), but every TU/PU/CU boundary is recorded so the
+    /// filter can distinguish real block edges from transform-interior 8-grid
+    /// lines. For an all-intra picture `bs` is 2 (§8.7.2.4 rule: a boundary with
+    /// an intra block on either side has Bs = 2).
+    fn mark_block_edges(&mut self, x0: usize, y0: usize, size: usize, bs: u8) {
+        // Left vertical edge: the column of 4×4 cells at x0, for each row.
+        if x0 > 0 {
+            for yy in (y0..y0 + size).step_by(4) {
+                if yy < self.h
+                    && let Some(g) = self.grid_idx(x0, yy)
+                {
+                    self.edge_v[g] = true;
+                    if bs > self.bs_v[g] {
+                        self.bs_v[g] = bs;
+                    }
+                }
+            }
+        }
+        // Top horizontal edge.
+        if y0 > 0 {
+            for xx in (x0..x0 + size).step_by(4) {
+                if xx < self.w
+                    && let Some(g) = self.grid_idx(xx, y0)
+                {
+                    self.edge_h[g] = true;
+                    if bs > self.bs_h[g] {
+                        self.bs_h[g] = bs;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record the slice index over a block (for cross-slice filter gating).
+    fn set_slice_idx(&mut self, x0: usize, y0: usize, size: usize) {
+        let s = self.cur_slice_idx;
+        for yy in (y0..y0 + size).step_by(4) {
+            for xx in (x0..x0 + size).step_by(4) {
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.slice_idx[g] = s;
+                }
+            }
+        }
     }
 
     #[inline]
@@ -1616,6 +1997,16 @@ impl<'cab> FullDecoder<'cab> {
 
     fn neighbor_mode(&self, x: i32, y: i32, _left: bool) -> u8 {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+            return MODE_DC;
+        }
+        // §8.4.2: a neighbor in a different tile is unavailable and contributes
+        // candIntraPredMode = DC. The z-scan/decoded availability of the left and
+        // above neighbors is already guaranteed by raster decode order, and the
+        // above-CTB-row boundary case is handled by `mpm_list`, so only the tile
+        // boundary needs checking here — using full `luma_avail` (which also
+        // tests the `decoded` map) would wrongly zero valid candidates and
+        // desync CABAC.
+        if !self.same_tile(x as usize, y as usize) {
             return MODE_DC;
         }
         self.grid_idx(x as usize, y as usize)
@@ -1850,6 +2241,11 @@ impl<'cab> FullDecoder<'cab> {
         let any_chroma = cbf_cb.iter().any(|&b| b) || cbf_cr.iter().any(|&b| b);
         let need_qp = cbf_luma || any_chroma;
 
+        // Record this TU's left/top boundaries as deblock filter edges. In an
+        // all-intra picture the boundary strength is 2 (§8.7.2.4).
+        let tu_size = 1usize << log2_ts;
+        self.mark_block_edges(x0, y0, tu_size, 2);
+
         // cu_qp_delta
         if self.pps.cu_qp_delta_enabled && need_qp && !self.is_cu_qp_delta_coded {
             self.cu_qp_delta_val = self.decode_cu_qp_delta();
@@ -2037,8 +2433,24 @@ fn chroma_scan(mode: u8, log2_ts: u32, is_444: bool) -> u8 {
 }
 
 impl<'cab> FullDecoder<'cab> {
+    /// True when luma pixel `(x, y)` lies in the same tile as the CTB currently
+    /// being decoded. Always true when tiles are disabled.
+    #[inline]
+    fn same_tile(&self, x: usize, y: usize) -> bool {
+        match &self.tiles {
+            None => true,
+            Some(g) => {
+                let ctb = self.log2_ctb;
+                g.tile_id_at(x >> ctb, y >> ctb) == self.cur_tile_id
+            }
+        }
+    }
+
     fn luma_avail(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+            return false;
+        }
+        if !self.same_tile(x as usize, y as usize) {
             return false;
         }
         self.grid_idx(x as usize, y as usize)
@@ -2053,6 +2465,9 @@ impl<'cab> FullDecoder<'cab> {
         let lx = cx as usize * self.sub_w;
         let ly = cy as usize * self.sub_h;
         if lx >= self.w || ly >= self.h {
+            return false;
+        }
+        if !self.same_tile(lx, ly) {
             return false;
         }
         self.grid_idx(lx, ly)
@@ -2678,6 +3093,12 @@ pub(crate) struct RowFactory {
     mode_y: (*mut u8, usize),
     decoded: (*mut bool, usize),
     tqb: (*mut bool, usize),
+    pcm: (*mut bool, usize),
+    edge_v: (*mut bool, usize),
+    edge_h: (*mut bool, usize),
+    bs_v: (*mut u8, usize),
+    bs_h: (*mut u8, usize),
+    slice_idx: (*mut u16, usize),
     ct_depth: (*mut u8, usize),
     qp_y_map: (*mut i16, usize),
     sao: (*mut SaoCtb, usize),
@@ -2740,6 +3161,7 @@ impl RowFactory {
         let mk8 = |p: (*mut u8, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
         let mkb = |p: (*mut bool, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
         let mki = |p: (*mut i16, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
+        let mku16 = |p: (*mut u16, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
         let mks = |p: (*mut SaoCtb, usize)| unsafe { crate::plane::Plane::shared(p.0, p.1) };
         Ok(FullDecoder {
             cab,
@@ -2769,6 +3191,13 @@ impl RowFactory {
             mode_y: mk8(self.mode_y),
             decoded: mkb(self.decoded),
             tqb: mkb(self.tqb),
+            pcm: mkb(self.pcm),
+            edge_v: mkb(self.edge_v),
+            edge_h: mkb(self.edge_h),
+            bs_v: mk8(self.bs_v),
+            bs_h: mk8(self.bs_h),
+            slice_idx: mku16(self.slice_idx),
+            cur_slice_idx: 0,
             cu_tqb: false,
             grid_w: self.grid_w,
             grid_h: self.grid_h,
@@ -2785,6 +3214,9 @@ impl RowFactory {
             ctb_rows: self.ctb_rows,
             sao_luma: self.sao_luma,
             sao_chroma: self.sao_chroma,
+            // WPP and tiles are mutually exclusive; row decoders never see tiles.
+            tiles: None,
+            cur_tile_id: 0,
             slice_cb_qp_offset: self.slice_cb_qp_offset,
             slice_cr_qp_offset: self.slice_cr_qp_offset,
             deblocking_disabled: self.deblocking_disabled,

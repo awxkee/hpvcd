@@ -55,12 +55,12 @@ pub(crate) struct Sps {
     pub(crate) scaling_list: Option<ScalingList>,
     pub(crate) _amp_enabled: bool,
     pub(crate) sao_enabled: bool,
-    pub(crate) _pcm_enabled: bool,
-    pub(crate) _pcm_bit_depth_luma: u8,
-    pub(crate) _pcm_bit_depth_chroma: u8,
-    pub(crate) _log2_min_pcm_cb: u32,
-    pub(crate) _log2_max_pcm_cb: u32,
-    pub(crate) _pcm_loop_filter_disabled: bool,
+    pub(crate) pcm_enabled: bool,
+    pub(crate) pcm_bit_depth_luma: u8,
+    pub(crate) pcm_bit_depth_chroma: u8,
+    pub(crate) log2_min_pcm_cb: u32,
+    pub(crate) log2_max_pcm_cb: u32,
+    pub(crate) pcm_loop_filter_disabled: bool,
     pub(crate) strong_intra_smoothing: bool,
     pub(crate) video_full_range: bool,
     pub(crate) color_primaries: u8, // ISO/IEC 23091-2 Table 2; 2 = unspecified
@@ -87,6 +87,19 @@ pub(crate) struct Pps {
     pub(crate) _weighted_bipred: bool,
     pub(crate) transquant_bypass_enabled: bool,
     pub(crate) tiles_enabled: bool,
+    /// Tile column/row structure (§7.4.3.3). Only meaningful when `tiles_enabled`.
+    /// `num_tile_columns`/`num_tile_rows` are the counts (≥1); `uniform_spacing`
+    /// selects even division; when non-uniform, `column_widths`/`row_heights`
+    /// hold the explicit sizes in CTBs for all but the last column/row (the last
+    /// is implied). Resolved to pixel boundaries per-picture in the decoder.
+    pub(crate) num_tile_columns: u32,
+    pub(crate) num_tile_rows: u32,
+    pub(crate) tile_uniform_spacing: bool,
+    pub(crate) tile_column_widths: Vec<u32>,
+    pub(crate) tile_row_heights: Vec<u32>,
+    /// loop_filter_across_tiles_enabled_flag (§7.4.3.3). When false, in-loop
+    /// filters do not cross tile boundaries.
+    pub(crate) loop_filter_across_tiles: bool,
     pub(crate) entropy_coding_sync_enabled: bool,
     pub(crate) loop_filter_across_slices: bool,
     pub(crate) _deblocking_filter_control_present: bool,
@@ -107,6 +120,49 @@ impl Sps {
             10 => Ok(BitDepth::Ten),
             12 => Ok(BitDepth::Twelve),
             n => Err(DecodeError::UnsupportedBitDepth(n)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Pps {
+    /// All-defaults PPS for unit tests (tiles disabled, no offsets).
+    pub(crate) fn test_default() -> Pps {
+        Pps {
+            dependent_slice_segments_enabled: false,
+            output_flag_present: false,
+            num_extra_slice_header_bits: 0,
+            sign_data_hiding_enabled: false,
+            _cabac_init_present: false,
+            init_qp: 26,
+            _constrained_intra_pred: false,
+            transform_skip_enabled: false,
+            cu_qp_delta_enabled: false,
+            diff_cu_qp_delta_depth: 0,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
+            slice_chroma_qp_offsets_present: false,
+            _weighted_pred: false,
+            _weighted_bipred: false,
+            transquant_bypass_enabled: false,
+            tiles_enabled: false,
+            num_tile_columns: 1,
+            num_tile_rows: 1,
+            tile_uniform_spacing: true,
+            tile_column_widths: Vec::new(),
+            tile_row_heights: Vec::new(),
+            loop_filter_across_tiles: true,
+            entropy_coding_sync_enabled: false,
+            loop_filter_across_slices: true,
+            _deblocking_filter_control_present: false,
+            deblocking_filter_override_enabled: false,
+            deblocking_filter_disabled: false,
+            beta_offset_div2: 0,
+            tc_offset_div2: 0,
+            scaling_list: None,
+            _lists_modification_present: false,
+            _log2_parallel_merge_level: 2,
+            slice_segment_header_extension_present: false,
         }
     }
 }
@@ -583,12 +639,12 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         scaling_list_enabled,
         _amp_enabled: amp_enabled,
         sao_enabled,
-        _pcm_enabled: pcm_enabled,
-        _pcm_bit_depth_luma: pcm_bit_depth_luma,
-        _pcm_bit_depth_chroma: pcm_bit_depth_chroma,
-        _log2_min_pcm_cb: log2_min_pcm_cb,
-        _log2_max_pcm_cb: log2_max_pcm_cb,
-        _pcm_loop_filter_disabled: pcm_loop_filter_disabled,
+        pcm_enabled,
+        pcm_bit_depth_luma,
+        pcm_bit_depth_chroma,
+        log2_min_pcm_cb,
+        log2_max_pcm_cb,
+        pcm_loop_filter_disabled,
         strong_intra_smoothing,
         video_full_range,
         color_primaries,
@@ -627,19 +683,39 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
     let transquant_bypass_enabled = r.read_flag().map_err(|_| e("transquant_bypass"))?;
     let tiles_enabled = r.read_flag().map_err(|_| e("tiles"))?;
     let entropy_coding_sync_enabled = r.read_flag().map_err(|_| e("entropy_sync"))?;
+    // Tile structure (§7.3.2.3.1). num_tile_columns_minus1 / num_tile_rows_minus1
+    // are ue(v); the retained counts are the +1 values. When present but not
+    // uniform, the explicit per-column/row sizes (in CTBs) are for all but the
+    // last, which is implied by the picture size. Bound the counts to keep a
+    // malformed PPS from allocating unboundedly.
+    let mut num_tile_columns = 1u32;
+    let mut num_tile_rows = 1u32;
+    let mut tile_uniform_spacing = true;
+    let mut tile_column_widths: Vec<u32> = Vec::new();
+    let mut tile_row_heights: Vec<u32> = Vec::new();
+    let mut loop_filter_across_tiles = true;
     if tiles_enabled {
-        let cols = r.read_ue().map_err(|_| e("num_tile_cols"))?;
-        let rows = r.read_ue().map_err(|_| e("num_tile_rows"))?;
-        let uniform = r.read_flag().map_err(|_| e("uniform_spacing"))?;
-        if !uniform {
-            for _ in 0..cols {
-                r.read_ue().map_err(|_| e("col_width"))?;
+        num_tile_columns = r
+            .read_ue()
+            .map_err(|_| e("num_tile_cols"))?
+            .saturating_add(1);
+        num_tile_rows = r
+            .read_ue()
+            .map_err(|_| e("num_tile_rows"))?
+            .saturating_add(1);
+        if num_tile_columns > 1024 || num_tile_rows > 1024 {
+            return Err(e("tile count out of range"));
+        }
+        tile_uniform_spacing = r.read_flag().map_err(|_| e("uniform_spacing"))?;
+        if !tile_uniform_spacing {
+            for _ in 0..num_tile_columns.saturating_sub(1) {
+                tile_column_widths.push(r.read_ue().map_err(|_| e("col_width"))?.saturating_add(1));
             }
-            for _ in 0..rows {
-                r.read_ue().map_err(|_| e("row_height"))?;
+            for _ in 0..num_tile_rows.saturating_sub(1) {
+                tile_row_heights.push(r.read_ue().map_err(|_| e("row_height"))?.saturating_add(1));
             }
         }
-        r.read_flag().map_err(|_| e("loop_filter_across_tiles"))?;
+        loop_filter_across_tiles = r.read_flag().map_err(|_| e("loop_filter_across_tiles"))?;
     }
     let loop_filter_across_slices = r.read_flag().map_err(|_| e("loop_filter_across_slices"))?;
     let deblocking_filter_control_present = r.read_flag().map_err(|_| e("deblock_control"))?;
@@ -683,6 +759,12 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
         _weighted_bipred: weighted_bipred,
         transquant_bypass_enabled,
         tiles_enabled,
+        num_tile_columns,
+        num_tile_rows,
+        tile_uniform_spacing,
+        tile_column_widths,
+        tile_row_heights,
+        loop_filter_across_tiles,
         entropy_coding_sync_enabled,
         loop_filter_across_slices,
         _deblocking_filter_control_present: deblocking_filter_control_present,
