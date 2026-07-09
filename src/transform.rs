@@ -888,7 +888,7 @@ pub(crate) fn resolve_dequant() -> DequantFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_into_avx2;
@@ -916,7 +916,7 @@ pub(crate) fn resolve_dequant16() -> DequantFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_into_avx2_16;
@@ -944,7 +944,7 @@ pub(crate) fn resolve_dequant_skip() -> DequantSkipFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_into_avx2;
@@ -972,7 +972,7 @@ pub(crate) fn resolve_dequant_skip16() -> DequantSkipFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_into_avx2_16;
@@ -1000,7 +1000,7 @@ pub(crate) fn resolve_dequant_scaled() -> DequantScaledFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_scaled_into_avx2;
@@ -1028,7 +1028,7 @@ pub(crate) fn resolve_dequant_scaled16() -> DequantScaledFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_scaled_into_avx2_16;
@@ -1056,7 +1056,7 @@ pub(crate) fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_scaled_into_avx2;
@@ -1084,7 +1084,7 @@ pub(crate) fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_scaled_into_avx2_16;
@@ -1122,7 +1122,7 @@ pub(crate) fn resolve_inv_transform() -> InvTransformFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_into_avx2;
@@ -1150,7 +1150,7 @@ pub(crate) fn resolve_inv_transform_dst4() -> InvTransform4Fn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_dst_into_avx2;
@@ -1178,7 +1178,7 @@ pub(crate) fn resolve_inv_transform16() -> InvTransformFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_into_avx2_16;
@@ -1206,7 +1206,7 @@ pub(crate) fn resolve_inv_transform_dst4_16() -> InvTransform4Fn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_dst_into_avx2_16;

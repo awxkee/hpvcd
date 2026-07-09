@@ -28,7 +28,7 @@
  */
 
 #![deny(unreachable_pub)]
-#[cfg(all(feature = "sse", target_arch = "x86_64"))]
+#[cfg(all(feature = "avx", target_arch = "x86_64"))]
 mod avx;
 mod bitreader;
 mod cabac;
@@ -37,25 +37,32 @@ mod config;
 mod deblock;
 mod decode;
 mod decoder;
+mod demux;
+mod dpb;
 mod error;
 mod exec;
 mod fast_divide;
 mod fmt;
 mod heif;
 mod info;
+mod inter;
 mod intra;
 mod limits;
+mod mc;
 mod metadata;
+mod motion;
 #[cfg(all(feature = "neon", target_arch = "aarch64"))]
 mod neon;
 mod plane;
 mod reconstruct;
+mod rps;
 mod sao;
 #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
 mod sse;
 mod threadpool;
 mod tiles;
 mod transform;
+mod video;
 mod wpp;
 mod yuv;
 
@@ -66,6 +73,7 @@ pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
 pub use info::{ImageInfo, read_heic_info, read_heic_info_with_limits};
 pub use limits::ParseLimits;
 pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
+pub use video::{VideoDecoder, VideoFrame};
 
 /// Convert a decoded u16 YUV plane to the appropriate typed buffer.
 /// 8-bit images produce `SampleBuf::U8` (direct cast, no precision loss).

@@ -50,10 +50,20 @@ pub(crate) struct Sps {
     pub(crate) log2_min_tb: u32,
     pub(crate) log2_max_tb: u32,
     pub(crate) max_transform_hierarchy_intra: u32,
-    pub(crate) _max_transform_hierarchy_inter: u32,
+    pub(crate) max_transform_hierarchy_inter: u32,
+    /// log2 of MaxPicOrderCntLsb (§7.4.3.2), 4..=16.
+    pub(crate) log2_max_poc_lsb: u32,
+    /// Asymmetric motion partitions enabled (inter).
+    pub(crate) amp_enabled: bool,
+    /// SPS-level temporal motion vector prediction enabled.
+    pub(crate) temporal_mvp_enabled: bool,
+    /// Short-term reference picture sets parsed from the SPS.
+    pub(crate) short_term_rps: Vec<crate::rps::ShortTermRps>,
+    /// Long-term reference POC LSBs signalled at SPS level.
+    pub(crate) lt_ref_poc_lsb: Vec<u32>,
+    pub(crate) lt_used_by_curr: Vec<bool>,
     pub(crate) scaling_list_enabled: bool,
     pub(crate) scaling_list: Option<ScalingList>,
-    pub(crate) _amp_enabled: bool,
     pub(crate) sao_enabled: bool,
     pub(crate) pcm_enabled: bool,
     pub(crate) pcm_bit_depth_luma: u8,
@@ -74,7 +84,7 @@ pub(crate) struct Pps {
     pub(crate) output_flag_present: bool,
     pub(crate) num_extra_slice_header_bits: u32,
     pub(crate) sign_data_hiding_enabled: bool,
-    pub(crate) _cabac_init_present: bool,
+    pub(crate) cabac_init_present: bool,
     pub(crate) init_qp: i32,
     pub(crate) _constrained_intra_pred: bool,
     pub(crate) transform_skip_enabled: bool,
@@ -83,8 +93,8 @@ pub(crate) struct Pps {
     pub(crate) cb_qp_offset: i32,
     pub(crate) cr_qp_offset: i32,
     pub(crate) slice_chroma_qp_offsets_present: bool,
-    pub(crate) _weighted_pred: bool,
-    pub(crate) _weighted_bipred: bool,
+    pub(crate) weighted_pred: bool,
+    pub(crate) weighted_bipred: bool,
     pub(crate) transquant_bypass_enabled: bool,
     pub(crate) tiles_enabled: bool,
     /// Tile column/row structure (§7.4.3.3). Only meaningful when `tiles_enabled`.
@@ -108,8 +118,10 @@ pub(crate) struct Pps {
     pub(crate) beta_offset_div2: i32,
     pub(crate) tc_offset_div2: i32,
     pub(crate) scaling_list: Option<ScalingList>,
-    pub(crate) _lists_modification_present: bool,
-    pub(crate) _log2_parallel_merge_level: u32,
+    pub(crate) lists_modification_present: bool,
+    pub(crate) log2_parallel_merge_level: u32,
+    pub(crate) num_ref_idx_l0_default: usize,
+    pub(crate) num_ref_idx_l1_default: usize,
     pub(crate) slice_segment_header_extension_present: bool,
 }
 
@@ -133,7 +145,7 @@ impl Pps {
             output_flag_present: false,
             num_extra_slice_header_bits: 0,
             sign_data_hiding_enabled: false,
-            _cabac_init_present: false,
+            cabac_init_present: false,
             init_qp: 26,
             _constrained_intra_pred: false,
             transform_skip_enabled: false,
@@ -142,8 +154,8 @@ impl Pps {
             cb_qp_offset: 0,
             cr_qp_offset: 0,
             slice_chroma_qp_offsets_present: false,
-            _weighted_pred: false,
-            _weighted_bipred: false,
+            weighted_pred: false,
+            weighted_bipred: false,
             transquant_bypass_enabled: false,
             tiles_enabled: false,
             num_tile_columns: 1,
@@ -160,8 +172,10 @@ impl Pps {
             beta_offset_div2: 0,
             tc_offset_div2: 0,
             scaling_list: None,
-            _lists_modification_present: false,
-            _log2_parallel_merge_level: 2,
+            lists_modification_present: false,
+            log2_parallel_merge_level: 2,
+            num_ref_idx_l0_default: 1,
+            num_ref_idx_l1_default: 1,
             slice_segment_header_extension_present: false,
         }
     }
@@ -382,54 +396,6 @@ fn parse_scaling_list_data(r: &mut BitReader) -> Result<ScalingList, DecodeError
     Ok(out)
 }
 
-/// Parse a short_term_ref_pic_set (§7.3.7). Returns NumDeltaPocs for this set.
-fn parse_st_rps(
-    r: &mut BitReader,
-    idx: usize,
-    num_sets: usize,
-    num_delta_pocs: &mut Vec<u32>,
-) -> Result<(), DecodeError> {
-    let mut inter_pred = false;
-    if idx != 0 {
-        inter_pred = r.read_flag().map_err(|_| e("inter_ref_pic_set_pred"))?;
-    }
-    if inter_pred {
-        if idx == num_sets {
-            r.read_ue().map_err(|_| e("delta_idx_minus1"))?;
-        }
-        r.read_bit().map_err(|_| e("delta_rps_sign"))?;
-        r.read_ue().map_err(|_| e("abs_delta_rps_minus1"))?;
-        let ref_idx = idx - 1; // simplification (delta_idx assumed 1)
-        let n = num_delta_pocs.get(ref_idx).copied().unwrap_or(0);
-        let mut count = 0u32;
-        for _ in 0..=n {
-            let used = r.read_flag().map_err(|_| e("used_by_curr_pic"))?;
-            if !used {
-                let use_delta = r.read_flag().map_err(|_| e("use_delta_flag"))?;
-                if use_delta {
-                    count += 1;
-                }
-            } else {
-                count += 1;
-            }
-        }
-        num_delta_pocs.push(count);
-    } else {
-        let num_neg = r.read_ue().map_err(|_| e("num_negative_pics"))?;
-        let num_pos = r.read_ue().map_err(|_| e("num_positive_pics"))?;
-        for _ in 0..num_neg {
-            r.read_ue().map_err(|_| e("delta_poc_s0"))?;
-            r.read_bit().map_err(|_| e("used_by_curr_s0"))?;
-        }
-        for _ in 0..num_pos {
-            r.read_ue().map_err(|_| e("delta_poc_s1"))?;
-            r.read_bit().map_err(|_| e("used_by_curr_s1"))?;
-        }
-        num_delta_pocs.push(num_neg + num_pos);
-    }
-    Ok(())
-}
-
 pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let mut r = BitReader::new(rbsp);
     r.read_bits(4).map_err(|_| e("sps_vps_id"))?;
@@ -473,8 +439,8 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     if !matches!(bit_depth_chroma, 8 | 10 | 12) {
         return Err(DecodeError::UnsupportedBitDepth(bit_depth_chroma));
     }
-    let log2_max_poc = r.read_ue().map_err(|_| e("log2_max_poc"))? + 4;
-    let _ = log2_max_poc;
+    let log2_max_poc_lsb = r.read_ue().map_err(|_| e("log2_max_poc"))? + 4;
+    let log2_max_poc = log2_max_poc_lsb;
 
     let sub_layer_ordering = r.read_flag().map_err(|_| e("sub_layer_ordering"))?;
     let start = if sub_layer_ordering {
@@ -543,21 +509,26 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     }
 
     let num_st_rps = r.read_ue().map_err(|_| e("num_short_term_rps"))? as usize;
-    let mut num_delta_pocs = Vec::with_capacity(num_st_rps);
+    let mut short_term_rps: Vec<crate::rps::ShortTermRps> = Vec::with_capacity(num_st_rps);
     for i in 0..num_st_rps {
-        parse_st_rps(&mut r, i, num_st_rps, &mut num_delta_pocs)?;
+        let rps = crate::rps::parse_short_term_rps(&mut r, i, num_st_rps, &short_term_rps)?;
+        short_term_rps.push(rps);
     }
 
+    let mut lt_ref_poc_lsb = Vec::new();
+    let mut lt_used_by_curr = Vec::new();
     let long_term_present = r.read_flag().map_err(|_| e("long_term_present"))?;
     if long_term_present {
         let num_lt = r.read_ue().map_err(|_| e("num_long_term"))? as usize;
         for _ in 0..num_lt {
-            r.read_bits(log2_max_poc).map_err(|_| e("lt_ref_poc"))?;
-            r.read_bit().map_err(|_| e("used_by_curr_lt"))?;
+            let poc = r.read_bits(log2_max_poc).map_err(|_| e("lt_ref_poc"))?;
+            let used = r.read_flag().map_err(|_| e("used_by_curr_lt"))?;
+            lt_ref_poc_lsb.push(poc);
+            lt_used_by_curr.push(used);
         }
     }
 
-    let _temporal_mvp = r.read_flag().map_err(|_| e("temporal_mvp"))?;
+    let temporal_mvp_enabled = r.read_flag().map_err(|_| e("temporal_mvp"))?;
     let strong_intra_smoothing = r.read_flag().map_err(|_| e("strong_intra_smoothing"))?;
     // VUI parameters — extract matrix_coefficients and video_full_range_flag.
     let mut video_full_range = false;
@@ -634,10 +605,15 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         log2_min_tb,
         log2_max_tb,
         max_transform_hierarchy_intra,
-        _max_transform_hierarchy_inter: max_transform_hierarchy_inter,
+        max_transform_hierarchy_inter,
+        log2_max_poc_lsb,
+        amp_enabled,
+        temporal_mvp_enabled,
+        short_term_rps,
+        lt_ref_poc_lsb,
+        lt_used_by_curr,
         scaling_list,
         scaling_list_enabled,
-        _amp_enabled: amp_enabled,
         sao_enabled,
         pcm_enabled,
         pcm_bit_depth_luma,
@@ -662,8 +638,8 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
     let num_extra_slice_header_bits = r.read_bits(3).map_err(|_| e("extra_hdr_bits"))?;
     let sign_data_hiding_enabled = r.read_flag().map_err(|_| e("sign_hiding"))?;
     let cabac_init_present = r.read_flag().map_err(|_| e("cabac_init"))?;
-    let _nref0 = r.read_ue().map_err(|_| e("nref0"))?;
-    let _nref1 = r.read_ue().map_err(|_| e("nref1"))?;
+    let num_ref_idx_l0_default = r.read_ue().map_err(|_| e("nref0"))? as usize + 1;
+    let num_ref_idx_l1_default = r.read_ue().map_err(|_| e("nref1"))? as usize + 1;
     let init_qp = 26i32
         .saturating_add(r.read_se().map_err(|_| e("init_qp"))?)
         .clamp(0, 51);
@@ -746,7 +722,7 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
         output_flag_present,
         num_extra_slice_header_bits,
         sign_data_hiding_enabled,
-        _cabac_init_present: cabac_init_present,
+        cabac_init_present,
         init_qp,
         _constrained_intra_pred: constrained_intra_pred,
         transform_skip_enabled,
@@ -755,8 +731,8 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
         cb_qp_offset,
         cr_qp_offset,
         slice_chroma_qp_offsets_present,
-        _weighted_pred: weighted_pred,
-        _weighted_bipred: weighted_bipred,
+        weighted_pred,
+        weighted_bipred,
         transquant_bypass_enabled,
         tiles_enabled,
         num_tile_columns,
@@ -773,8 +749,10 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
         beta_offset_div2,
         tc_offset_div2,
         scaling_list,
-        _lists_modification_present: lists_modification_present,
-        _log2_parallel_merge_level: log2_parallel_merge_level,
+        lists_modification_present,
+        log2_parallel_merge_level,
+        num_ref_idx_l0_default,
+        num_ref_idx_l1_default,
         slice_segment_header_extension_present,
     })
 }

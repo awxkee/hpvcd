@@ -38,6 +38,24 @@ const Q13_KY_LIMITED: i64 = 9539;
 const Q13_KUV_LIMITED: i64 = 9326;
 
 /// Planar YCbCr image produced by the HEVC decoder.
+#[allow(dead_code)]
+impl YuvPlanes {
+    pub(crate) fn luma_len(&self) -> usize {
+        self.y.len()
+    }
+    pub(crate) fn dims(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+    pub(crate) fn y_u8(&self) -> Vec<u8> {
+        self.y.iter().map(|&v| v as u8).collect()
+    }
+    pub(crate) fn cb_u8(&self) -> Vec<u8> {
+        self.cb.iter().map(|&v| v as u8).collect()
+    }
+    pub(crate) fn cr_u8(&self) -> Vec<u8> {
+        self.cr.iter().map(|&v| v as u8).collect()
+    }
+}
 pub(crate) struct YuvPlanes {
     pub(crate) y: Vec<u16>,
     pub(crate) cb: Vec<u16>,

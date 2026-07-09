@@ -79,7 +79,7 @@ pub(crate) fn resolve_apply_sao_plane() -> SaoPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_plane_avx2;
@@ -107,7 +107,7 @@ pub(crate) fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_plane_banded_avx2;
@@ -135,7 +135,7 @@ pub(crate) fn resolve_apply_sao_band_offset_inplace() -> SaoBandOffsetInplaceFn 
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_band_offset_inplace_avx2;
@@ -163,7 +163,7 @@ pub(crate) fn resolve_apply_sao_band_offset_banded_inplace() -> SaoBandOffsetBan
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_band_offset_banded_inplace_avx2;
@@ -947,6 +947,53 @@ mod tests {
         apply_sao_edge_offset_gated(&mut dst, &src, 4, 1, 0, 0, 4, 1, &offsets, 0, 8, &ok);
         // x=1 unchanged because its right neighbor (x=2) was unavailable.
         assert_eq!(dst[1], 5);
+    }
+
+    #[test]
+    fn banded_eo_matches_serial_scalar_for_all_classes() {
+        let w = 19usize;
+        let h = 11usize;
+        let bd = 10u8;
+        let max_v = (1u16 << bd) - 1;
+        let src: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let x = i % w;
+                let y = i / w;
+                ((x * 73 + y * 191 + (x * y * 17)) & max_v as usize) as u16
+            })
+            .collect();
+        let offsets = [3i32, -2, 4, -5];
+        let x0 = 1usize;
+        let x_end = w - 1;
+        let y0 = 2usize;
+        let y_end = h - 2;
+
+        for eo_class in 0..4u8 {
+            let mut serial = src.clone();
+            apply_sao_plane_scalar(
+                &mut serial,
+                &src,
+                w,
+                h,
+                x0,
+                y0,
+                x_end,
+                y_end,
+                2,
+                &offsets,
+                0,
+                eo_class,
+                bd,
+            );
+
+            let band_y0 = y0;
+            let mut band = src[band_y0 * w..y_end * w].to_vec();
+            apply_sao_plane_banded_scalar(
+                &mut band, &src, w, h, band_y0, x0, y0, x_end, y_end, 2, &offsets, 0, eo_class, bd,
+            );
+
+            assert_eq!(&band[..], &serial[band_y0 * w..y_end * w]);
+        }
     }
 
     #[test]

@@ -316,11 +316,13 @@ fn luma_vertical_segment_params(
     if ctx.bs_v_at(edge, mid) == 0 {
         return None;
     }
+    let bs = ctx.bs_v_at(edge, mid) as i32;
     let qp_p = ctx.qp_at(edge - 1, mid);
     let qp_q = ctx.qp_at(edge, mid);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
     let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
+    // tc' = Q(qp + 2*(Bs-1) + tc_offset) (§8.7.2.5.3): Bs=2 adds 2, Bs=1 adds 0.
+    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
     let beta = BETA[beta_prime as usize];
     let tc = TC[tc_prime as usize];
     if tc == 0 {
@@ -348,11 +350,12 @@ fn luma_horizontal_segment_params(
     if ctx.bs_h_at(mid, edge) == 0 {
         return None;
     }
+    let bs = ctx.bs_h_at(mid, edge) as i32;
     let qp_p = ctx.qp_at(mid, edge - 1);
     let qp_q = ctx.qp_at(mid, edge);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
     let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
+    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
     let beta = BETA[beta_prime as usize];
     let tc = TC[tc_prime as usize];
     if tc == 0 {
@@ -492,7 +495,7 @@ pub(crate) fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::luma_vertical_plane_avx2;
@@ -508,7 +511,7 @@ pub(crate) fn resolve_luma_vertical_pair() -> Option<LumaDeblockPairFn> {
     *LUMA_VERTICAL_PAIR.get_or_init(|| {
         let mut _f: Option<LumaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::luma_vertical_plane_pair_avx2);
@@ -536,7 +539,7 @@ pub(crate) fn resolve_luma_horizontal_plane() -> LumaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::luma_horizontal_plane_avx2;
@@ -552,7 +555,7 @@ pub(crate) fn resolve_luma_horizontal_pair() -> Option<LumaDeblockPairFn> {
     *LUMA_HORIZONTAL_PAIR.get_or_init(|| {
         let mut _f: Option<LumaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::luma_horizontal_plane_pair_avx2);
@@ -687,7 +690,7 @@ pub(crate) fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::chroma_vertical_plane_avx2;
@@ -703,7 +706,7 @@ pub(crate) fn resolve_chroma_vertical_pair() -> Option<ChromaDeblockPairFn> {
     *CHROMA_VERTICAL_PAIR.get_or_init(|| {
         let mut _f: Option<ChromaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::chroma_vertical_plane_pair_avx2);
@@ -731,7 +734,7 @@ pub(crate) fn resolve_chroma_horizontal_plane() -> ChromaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::chroma_horizontal_plane_avx2;
@@ -747,7 +750,7 @@ pub(crate) fn resolve_chroma_horizontal_pair() -> Option<ChromaDeblockPairFn> {
     *CHROMA_HORIZONTAL_PAIR.get_or_init(|| {
         let mut _f: Option<ChromaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::chroma_horizontal_plane_pair_avx2);

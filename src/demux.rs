@@ -1,0 +1,235 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
+ * // BSD-3-Clause OR Apache-2.0
+ */
+
+//! NAL unit demultiplexing for HEVC video bitstreams.
+//!
+//! Two framings are supported and auto-detected:
+//! - Annex-B: NAL units separated by 3- or 4-byte start codes (`00 00 01` /
+//!   `00 00 00 01`). Used by `.hevc` / `.265` elementary streams.
+//! - Length-prefixed: each NAL prefixed by a big-endian length of
+//!   `length_size` bytes (1, 2, or 4). Used inside `hvcC` / mp4 samples.
+
+use crate::error::DecodeError;
+
+/// A single NAL unit sliced out of the input, with its parsed header fields.
+/// The slice still contains emulation-prevention bytes; callers unescape as
+/// needed (`bitreader::unescape_rbsp`).
+#[derive(Clone, Copy)]
+pub(crate) struct Nal<'a> {
+    pub(crate) nal_type: u8,
+    pub(crate) temporal_id: u8,
+    /// Full NAL bytes including the 2-byte NAL header.
+    pub(crate) bytes: &'a [u8],
+}
+
+impl<'a> Nal<'a> {
+    #[inline]
+    fn parse(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        // forbidden_zero_bit(1) type(6) layer_id(6) tid_plus1(3)
+        let nal_type = (bytes[0] >> 1) & 0x3f;
+        let temporal_id = (bytes[1] & 0x07).wrapping_sub(1);
+        Some(Nal {
+            nal_type,
+            temporal_id,
+            bytes,
+        })
+    }
+
+    /// RBSP payload after the 2-byte header, with emulation bytes removed.
+    #[inline]
+    pub(crate) fn rbsp(&self) -> Vec<u8> {
+        crate::bitreader::unescape_rbsp(&self.bytes[2..])
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framing {
+    AnnexB,
+    /// Length-prefixed with the given prefix size in bytes (1/2/4).
+    Length(u8),
+}
+
+/// Guess the framing of a raw byte stream. Annex-B is detected by a leading
+/// start code; otherwise we assume a 4-byte length prefix (the mp4 default).
+pub(crate) fn detect_framing(data: &[u8]) -> Framing {
+    if starts_with_start_code(data) {
+        Framing::AnnexB
+    } else {
+        Framing::Length(4)
+    }
+}
+
+#[inline]
+fn starts_with_start_code(d: &[u8]) -> bool {
+    d.len() >= 3
+        && d[0] == 0
+        && d[1] == 0
+        && (d[2] == 1 || (d.len() >= 4 && d[2] == 0 && d[3] == 1))
+}
+
+/// Iterate NAL units for a given framing, invoking `f` for each. Stops early
+/// (returning the callback's error) if `f` fails.
+pub(crate) fn for_each_nal<'a, F>(
+    data: &'a [u8],
+    framing: Framing,
+    mut f: F,
+) -> Result<(), DecodeError>
+where
+    F: FnMut(Nal<'a>) -> Result<(), DecodeError>,
+{
+    match framing {
+        Framing::AnnexB => for_each_annexb(data, f),
+        Framing::Length(sz) => {
+            let mut pos = 0usize;
+            let sz = sz as usize;
+            while pos + sz <= data.len() {
+                let mut len = 0usize;
+                for k in 0..sz {
+                    len = (len << 8) | data[pos + k] as usize;
+                }
+                pos += sz;
+                if len == 0 || pos + len > data.len() {
+                    break;
+                }
+                if let Some(n) = Nal::parse(&data[pos..pos + len]) {
+                    f(n)?;
+                }
+                pos += len;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn for_each_annexb<'a, F>(data: &'a [u8], mut f: F) -> Result<(), DecodeError>
+where
+    F: FnMut(Nal<'a>) -> Result<(), DecodeError>,
+{
+    let mut starts: Vec<(usize, usize)> = Vec::new(); // (payload_start, code_len)
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                starts.push((i + 3, 3));
+                i += 3;
+                continue;
+            } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                starts.push((i + 4, 4));
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    for k in 0..starts.len() {
+        let (s, _) = starts[k];
+        let end = if k + 1 < starts.len() {
+            // Trim the trailing start code (and its leading zero) of the next NAL.
+            starts[k + 1].0 - starts[k + 1].1
+        } else {
+            data.len()
+        };
+        if s < end
+            && let Some(n) = Nal::parse(trim_trailing_zeros(&data[s..end]))
+        {
+            f(n)?;
+        }
+    }
+    Ok(())
+}
+
+/// Annex-B NALs may carry trailing `cabac_zero_word`s / padding zeros; trim them
+/// so RBSP length is exact. Keeps at least the 2-byte header.
+#[inline]
+fn trim_trailing_zeros(b: &[u8]) -> &[u8] {
+    let mut end = b.len();
+    while end > 2 && b[end - 1] == 0 {
+        end -= 1;
+    }
+    &b[..end]
+}
+
+/// HEVC NAL unit type constants (Table 7-1).
+pub(crate) mod nal {
+    pub(crate) const BLA_W_LP: u8 = 16;
+    pub(crate) const BLA_N_LP: u8 = 18;
+    pub(crate) const IDR_W_RADL: u8 = 19;
+    pub(crate) const IDR_N_LP: u8 = 20;
+    pub(crate) const SPS: u8 = 33;
+    pub(crate) const PPS: u8 = 34;
+
+    #[inline]
+    pub(crate) fn is_vcl(t: u8) -> bool {
+        t <= 31
+    }
+    #[inline]
+    pub(crate) fn is_irap(t: u8) -> bool {
+        (16..=23).contains(&t)
+    }
+    #[inline]
+    pub(crate) fn is_idr(t: u8) -> bool {
+        t == IDR_W_RADL || t == IDR_N_LP
+    }
+    #[inline]
+    pub(crate) fn is_bla(t: u8) -> bool {
+        (BLA_W_LP..=BLA_N_LP).contains(&t)
+    }
+    /// Reference picture flag: `_R` VCL types and all IRAP are reference.
+    #[inline]
+    pub(crate) fn is_reference(t: u8) -> bool {
+        if t > 31 {
+            return false;
+        }
+        // Sub-layer non-reference types are the even values 0..=14.
+        !(t <= 14 && t.is_multiple_of(2))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_annexb_4byte() {
+        let data = [
+            0, 0, 0, 1, 0x40, 0x01, 0xaa, // VPS-ish
+            0, 0, 1, 0x42, 0x01, 0xbb, // SPS-ish 3-byte code
+        ];
+        let mut got = Vec::new();
+        for_each_nal(&data, Framing::AnnexB, |n| {
+            got.push(n.nal_type);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, vec![32, 33]);
+    }
+
+    #[test]
+    fn splits_length_prefixed() {
+        let data = [
+            0, 0, 0, 3, 0x26, 0x01, 0xcc, // len=3
+            0, 0, 0, 3, 0x28, 0x01, 0xdd,
+        ];
+        let mut got = Vec::new();
+        for_each_nal(&data, Framing::Length(4), |n| {
+            got.push(n.nal_type);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, vec![19, 20]);
+    }
+
+    #[test]
+    fn detects_framing() {
+        assert!(matches!(detect_framing(&[0, 0, 1, 0x40]), Framing::AnnexB));
+        assert!(matches!(
+            detect_framing(&[0, 0, 0, 5, 0x40]),
+            Framing::Length(4)
+        ));
+    }
+}
