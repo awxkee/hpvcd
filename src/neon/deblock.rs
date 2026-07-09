@@ -381,6 +381,7 @@ fn decompose(d: LumaDecision) -> (bool, bool, bool) {
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn luma_filter4_neon(
     p3: int32x4_t,
     p2: int32x4_t,

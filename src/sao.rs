@@ -298,16 +298,14 @@ fn apply_sao_edge_offset_scalar(
             let inb = |xx: i32, yy: i32| -> bool {
                 xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h
             };
-            let n1 = if inb(x1, y1) {
-                src[y1 as usize * w + x1 as usize] as i32
-            } else {
-                s
-            };
-            let n2 = if inb(x2, y2) {
-                src[y2 as usize * w + x2 as usize] as i32
-            } else {
-                s
-            };
+            // §8.7.3.2: if either neighbour lies outside the picture the sample
+            // is left unchanged (edgeIdx not applied). Substituting `s` is wrong
+            // — the other neighbour can still yield a nonzero edgeIdx.
+            if !inb(x1, y1) || !inb(x2, y2) {
+                continue;
+            }
+            let n1 = src[y1 as usize * w + x1 as usize] as i32;
+            let n2 = src[y2 as usize * w + x2 as usize] as i32;
 
             let sign1 = (s > n1) as i32 - (s < n1) as i32;
             let sign2 = (s > n2) as i32 - (s < n2) as i32;
@@ -733,22 +731,19 @@ pub(crate) fn apply_sao_plane_banded_scalar(
                     let s = s0 as i32;
                     let (x1, y1) = (x as i32 + dx, y as i32 + dy);
                     let (x2, y2) = (x as i32 - dx, y as i32 - dy);
-                    let n1 = if inb(x1, y1) {
-                        src_full
-                            .get(y1 as usize * w + x1 as usize)
-                            .copied()
-                            .unwrap_or(s0) as i32
-                    } else {
-                        s
-                    };
-                    let n2 = if inb(x2, y2) {
-                        src_full
-                            .get(y2 as usize * w + x2 as usize)
-                            .copied()
-                            .unwrap_or(s0) as i32
-                    } else {
-                        s
-                    };
+                    // §8.7.3.2: an out-of-picture neighbour makes the sample
+                    // unavailable → leave it unchanged (edgeIdx not applied).
+                    if !inb(x1, y1) || !inb(x2, y2) {
+                        continue;
+                    }
+                    let n1 = src_full
+                        .get(y1 as usize * w + x1 as usize)
+                        .copied()
+                        .unwrap_or(s0) as i32;
+                    let n2 = src_full
+                        .get(y2 as usize * w + x2 as usize)
+                        .copied()
+                        .unwrap_or(s0) as i32;
                     let sign1 = (s > n1) as i32 - (s < n1) as i32;
                     let sign2 = (s > n2) as i32 - (s < n2) as i32;
                     let offset = match sign1 + sign2 + 2 {

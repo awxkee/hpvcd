@@ -288,3 +288,37 @@ mod tests {
         assert_eq!(rows2[1].end, rbsp.len());
     }
 }
+
+/// Convert tile/WPP `entry_points` (NAL-domain sub-stream byte lengths) into
+/// RBSP offsets **relative to the CABAC payload start** (`cabac_rbsp_off`).
+/// Sub-stream 0 starts at 0; sub-stream i+1 starts after entry_points[0..=i].
+/// Mirrors `row_substreams` but returns starts relative to the slice's CABAC
+/// data so the tiled decoder can `reset_with(&cabac[start..])`. Emulation-
+/// prevention bytes make the NAL and RBSP domains diverge, so the accumulation
+/// must be done in NAL space and mapped back per boundary.
+pub(crate) fn substream_starts_rbsp_rel(
+    src_of: &[usize],
+    cabac_rbsp_off: usize,
+    entry_points: &[u32],
+    rbsp_len: usize,
+) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(entry_points.len() + 1);
+    starts.push(0usize);
+    if cabac_rbsp_off >= src_of.len() {
+        // No emulation map available; fall back to treating entries as RBSP-rel.
+        let mut acc = 0usize;
+        for &len in entry_points {
+            acc = acc.saturating_add(len as usize);
+            starts.push(acc.min(rbsp_len.saturating_sub(cabac_rbsp_off)));
+        }
+        return starts;
+    }
+    let nal_data_start = src_of[cabac_rbsp_off];
+    let mut nal_cursor = nal_data_start;
+    for &len in entry_points {
+        nal_cursor += len as usize;
+        let rbsp_abs = crate::bitreader::nal_to_rbsp_offset(src_of, nal_cursor).min(rbsp_len);
+        starts.push(rbsp_abs.saturating_sub(cabac_rbsp_off));
+    }
+    starts
+}

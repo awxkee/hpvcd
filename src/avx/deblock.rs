@@ -164,7 +164,6 @@ fn chroma_filter8_avx2(
 #[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx2")]
-#[inline]
 fn decompose(d: LumaDecision) -> (bool, bool, bool) {
     match d {
         LumaDecision::Skip => (false, false, false),
@@ -175,6 +174,7 @@ fn decompose(d: LumaDecision) -> (bool, bool, bool) {
 
 #[inline]
 #[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
 fn luma_filter8_avx2(
     p3: __m256i,
     p2: __m256i,

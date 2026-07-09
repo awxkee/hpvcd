@@ -321,6 +321,7 @@ impl<'cab> FullDecoder<'cab> {
         &mut self,
         cabac: &[u8],
         hdr: &SliceHeader,
+        sub_starts: &[usize],
     ) -> Result<(), DecodeError> {
         self.cab.reset_with(cabac)?;
         if !hdr.dependent_slice_segment {
@@ -347,7 +348,12 @@ impl<'cab> FullDecoder<'cab> {
             // resets at the segment's first quantization group (handled by the
             // QG logic), so continue with the retained context.
         }
-        self.decode_slice_ctx(hdr.slice_segment_address, Some((cabac, &hdr.entry_points)))
+        let starts = if sub_starts.is_empty() {
+            None
+        } else {
+            Some((cabac, sub_starts))
+        };
+        self.decode_slice_ctx(hdr.slice_segment_address, starts)
     }
 
     /// Decode one CTB at grid position `(rx, ry)`: parse SAO params, run the
@@ -406,6 +412,7 @@ impl<'cab> FullDecoder<'cab> {
         pool: &crate::threadpool::ThreadPool,
     ) -> Result<bool, DecodeError> {
         if !self.pps.entropy_coding_sync_enabled
+            || self.tiles.is_some()
             || hdr.slice_segment_address != 0
             || self.ctb_rows <= 1
             || pool.threads() <= 1
@@ -568,18 +575,6 @@ impl<'cab> FullDecoder<'cab> {
         Ok(())
     }
 
-    /// Reconstruct CTBs starting at raster address `start_ctb`, stopping at the
-    /// slice's `end_of_slice_segment_flag`. Does not run loop filters — call
-    /// [`finish`] once, after all segments of the picture are decoded.
-    ///
-    /// With tiles enabled the CTBs are visited in tile-scan order (§6.5.1)
-    /// rather than raster; CABAC is re-initialised at the first CTB of each tile
-    /// (§9.3.1) by seeking to that tile's entry-point sub-stream. WPP is mutually
-    /// exclusive with tiles in this path.
-    pub(crate) fn decode_slice(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
-        self.decode_slice_ctx(start_ctb, None)
-    }
-
     /// As [`decode_slice`], but with the slice segment's CABAC payload and
     /// entry-point sub-stream lengths available so the tiled path can seek to
     /// each tile's sub-stream. `cabac_and_entries` is `(cabac_bytes,
@@ -588,10 +583,10 @@ impl<'cab> FullDecoder<'cab> {
     pub(crate) fn decode_slice_ctx(
         &mut self,
         start_ctb: usize,
-        cabac_and_entries: Option<(&[u8], &[u32])>,
+        cabac_and_starts: Option<(&[u8], &[usize])>,
     ) -> Result<(), DecodeError> {
         if self.tiles.is_some() {
-            return self.decode_slice_tiled(start_ctb, cabac_and_entries);
+            return self.decode_slice_tiled(start_ctb, cabac_and_starts);
         }
         self.decode_slice_raster(start_ctb)
     }
@@ -603,32 +598,18 @@ impl<'cab> FullDecoder<'cab> {
     fn decode_slice_tiled(
         &mut self,
         start_ctb: usize,
-        cabac_and_entries: Option<(&[u8], &[u32])>,
+        cabac_and_starts: Option<(&[u8], &[usize])>,
     ) -> Result<(), DecodeError> {
         let grid = self.tiles.clone().unwrap();
         let total = self.ctb_cols * self.ctb_rows;
         let start_ctb = start_ctb.min(total);
         let start_ts = grid.rs_to_ts(start_ctb);
 
-        // Precompute per-tile-boundary CABAC sub-stream start offsets (relative
-        // to the slice's CABAC payload) from the entry points. Entry point `i`
-        // ends sub-stream `i`; the cumulative sums give each sub-stream's start.
-        // For a single slice segment covering the whole picture the number of
-        // sub-streams is `num_tiles`, and the number of entry points is
-        // `num_tiles - 1`.
-        let sub_starts: Vec<usize> = match cabac_and_entries {
-            Some((_, entries)) if !entries.is_empty() => {
-                let mut acc = 0usize;
-                let mut v = Vec::with_capacity(entries.len() + 1);
-                v.push(0usize);
-                for &len in entries {
-                    acc = acc.saturating_add(len as usize);
-                    v.push(acc);
-                }
-                v
-            }
-            _ => Vec::new(),
-        };
+        // `sub_starts[i]` is the RBSP offset (relative to the CABAC payload) of
+        // tile sub-stream `i`; index 0 is 0. Precomputed by the caller through
+        // the NAL→RBSP map so emulation-prevention bytes are handled correctly.
+        let empty: &[usize] = &[];
+        let sub_starts: &[usize] = cabac_and_starts.map(|(_, s)| s).unwrap_or(empty);
 
         // Counter of how many tile sub-streams we've entered so far (indexes
         // `sub_starts`). The slice segment begins in sub-stream 0.
@@ -645,7 +626,7 @@ impl<'cab> FullDecoder<'cab> {
             if ts != start_ts && grid.is_tile_start_rs(rs) {
                 substream += 1;
                 let mut seeked = false;
-                if let Some((cabac, _)) = cabac_and_entries
+                if let Some((cabac, _)) = cabac_and_starts
                     && let Some(&off) = sub_starts.get(substream)
                     && off <= cabac.len()
                 {
@@ -655,8 +636,8 @@ impl<'cab> FullDecoder<'cab> {
                     }
                 }
                 if !seeked {
-                    // Fallback: assume contiguous sub-streams (byte-aligned after
-                    // the previous tile's end_of_sub_stream_one_bit).
+                    // Fallback: contiguous sub-streams (byte-aligned after the
+                    // previous tile's end_of_sub_stream_one_bit).
                     self.cab.reinit_engine();
                 }
                 let qp = self.slice_qp.clamp(0, 51) as u8;
@@ -782,20 +763,25 @@ impl<'cab> FullDecoder<'cab> {
         if !self.sao_luma && !self.sao_chroma {
             return;
         }
+        // §7.3.8.3: merge flags are only coded when the neighbouring CTB is
+        // available — same tile and same slice. At a tile/slice boundary the
+        // flag is absent, so reading it would desync CABAC.
+        let left_avail = rx > 0 && self.ctb_merge_avail(rx, ry, rx - 1, ry);
+        let up_avail = ry > 0 && self.ctb_merge_avail(rx, ry, rx, ry - 1);
         let mut merge_left = false;
         let mut merge_up = false;
-        if rx > 0 {
+        if left_avail {
             merge_left = self.cab.decode_bin(&mut self.ctx.sao_merge_flag) != 0;
         }
-        if !merge_left && ry > 0 {
+        if !merge_left && up_avail {
             merge_up = self.cab.decode_bin(&mut self.ctx.sao_merge_flag) != 0;
         }
         if merge_left {
-            self.sao[idx] = self.sao[idx - 1].clone();
+            self.sao[idx] = self.sao[idx - 1];
             return;
         }
         if merge_up {
-            self.sao[idx] = self.sao[idx - self.ctb_cols].clone();
+            self.sao[idx] = self.sao[idx - self.ctb_cols];
             return;
         }
 
@@ -1517,7 +1503,6 @@ impl<'cab> FullDecoder<'cab> {
                 }
             }
         }
-        drop(bnd);
         self.y = crate::plane::Plane::owned(y);
         self.cb = crate::plane::Plane::owned(cb);
         self.cr = crate::plane::Plane::owned(cr);
@@ -1703,11 +1688,8 @@ impl<'cab> FullDecoder<'cab> {
 
         // mark decoded
         self.mark_decoded(x0, y0, cb_size);
-        // CU outer boundary + (for NxN) the internal PU split lines are deblock
-        // edges. The CU boundary is already covered by the first TU's edges, but
-        // marking again is idempotent; the PU split at cb/2 must be added when
-        // the CU was partitioned NxN.
-        self.mark_block_edges(x0, y0, cb_size, 2);
+        // The CU's outer boundary is already marked by its constituent TUs'
+        // left/top edges, so only the NxN internal PU split lines need adding.
         if nxn {
             let half = cb_size / 2;
             self.mark_block_edges(x0 + half, y0, half, 2); // internal vertical PU edge
@@ -1825,36 +1807,49 @@ impl<'cab> FullDecoder<'cab> {
     /// lines. For an all-intra picture `bs` is 2 (§8.7.2.4 rule: a boundary with
     /// an intra block on either side has Bs = 2).
     fn mark_block_edges(&mut self, x0: usize, y0: usize, size: usize, bs: u8) {
-        // Left vertical edge: the column of 4×4 cells at x0, for each row.
-        if x0 > 0 {
-            for yy in (y0..y0 + size).step_by(4) {
-                if yy < self.h
-                    && let Some(g) = self.grid_idx(x0, yy)
-                {
-                    self.edge_v[g] = true;
-                    if bs > self.bs_v[g] {
-                        self.bs_v[g] = bs;
-                    }
+        let gw = self.grid_w;
+        // Left vertical edge: the column of 4×4 cells at x0, for each row. The
+        // grid column is fixed (x0/4), so step the row index directly instead of
+        // recomputing `grid_idx` (bounds + mul) every iteration.
+        if x0 > 0 && x0 < self.w {
+            let gx = x0 / 4;
+            let y_end = (y0 + size).min(self.h);
+            let mut g = (y0 / 4) * gw + gx;
+            let mut yy = y0;
+            while yy < y_end {
+                self.edge_v[g] = true;
+                if bs > self.bs_v[g] {
+                    self.bs_v[g] = bs;
                 }
+                g += gw;
+                yy += 4;
             }
         }
-        // Top horizontal edge.
-        if y0 > 0 {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && let Some(g) = self.grid_idx(xx, y0)
-                {
-                    self.edge_h[g] = true;
-                    if bs > self.bs_h[g] {
-                        self.bs_h[g] = bs;
-                    }
+        // Top horizontal edge: the grid row is fixed (y0/4), step columns.
+        if y0 > 0 && y0 < self.h {
+            let x_end = (x0 + size).min(self.w);
+            let base = (y0 / 4) * gw;
+            let mut g = base + x0 / 4;
+            let mut xx = x0;
+            while xx < x_end {
+                self.edge_h[g] = true;
+                if bs > self.bs_h[g] {
+                    self.bs_h[g] = bs;
                 }
+                g += 1;
+                xx += 4;
             }
         }
     }
 
     /// Record the slice index over a block (for cross-slice filter gating).
     fn set_slice_idx(&mut self, x0: usize, y0: usize, size: usize) {
+        // Single independent slice: the array stays uniformly 0, so any pair of
+        // cells compares equal (same slice). Writing per-CU is pure overhead in
+        // the common case, so skip it until a second slice segment appears.
+        if self.cur_slice_idx <= 1 {
+            return;
+        }
         let s = self.cur_slice_idx;
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
@@ -2436,6 +2431,30 @@ impl<'cab> FullDecoder<'cab> {
     /// True when luma pixel `(x, y)` lies in the same tile as the CTB currently
     /// being decoded. Always true when tiles are disabled.
     #[inline]
+    /// Whether the neighbouring CTB `(nrx, nry)` is available for SAO merge from
+    /// the current CTB `(rx, ry)`: it must be in the same tile and the same
+    /// slice (§6.4.1). Uses per-CTB tile ids and the per-4×4 slice-index map.
+    fn ctb_merge_avail(&self, rx: usize, ry: usize, nrx: usize, nry: usize) -> bool {
+        // Fast path: no tiles and a single slice segment → the neighbour is
+        // always available (the raster/tile-scan caller already guarantees it
+        // was decoded). Avoids the per-CTB tile/slice map lookups.
+        if self.tiles.is_none() && self.cur_slice_idx <= 1 {
+            return true;
+        }
+        if let Some(g) = &self.tiles
+            && g.tile_id_at(nrx, nry) != g.tile_id_at(rx, ry)
+        {
+            return false;
+        }
+        // Same slice: the neighbour must belong to the slice segment currently
+        // being decoded. Its slice index was recorded when it was decoded; the
+        // current CTB's own index is `cur_slice_idx` (its samples aren't marked
+        // until its CUs are decoded, after SAO parsing).
+        let ctb = 1usize << self.log2_ctb;
+        let nbr = self.slice_idx_at(nrx * ctb, nry * ctb);
+        nbr == self.cur_slice_idx
+    }
+
     fn same_tile(&self, x: usize, y: usize) -> bool {
         match &self.tiles {
             None => true,

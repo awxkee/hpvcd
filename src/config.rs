@@ -695,8 +695,14 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
     let mut tile_row_heights: Vec<u32> = Vec::new();
     let mut loop_filter_across_tiles = true;
     if tiles_enabled {
-        num_tile_columns = r.read_ue().map_err(|_| e("num_tile_cols"))?.saturating_add(1);
-        num_tile_rows = r.read_ue().map_err(|_| e("num_tile_rows"))?.saturating_add(1);
+        num_tile_columns = r
+            .read_ue()
+            .map_err(|_| e("num_tile_cols"))?
+            .saturating_add(1);
+        num_tile_rows = r
+            .read_ue()
+            .map_err(|_| e("num_tile_rows"))?
+            .saturating_add(1);
         if num_tile_columns > 1024 || num_tile_rows > 1024 {
             return Err(e("tile count out of range"));
         }

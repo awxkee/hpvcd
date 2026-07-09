@@ -384,6 +384,7 @@ fn decompose(d: LumaDecision) -> (bool, bool, bool) {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
 fn luma_filter4_sse41(
     p3: __m128i,
     p2: __m128i,

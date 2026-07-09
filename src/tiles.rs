@@ -225,22 +225,23 @@ fn scan_tables(
     let pic = ctb_cols * ctb_rows;
     let mut rs_to_ts = vec![0usize; pic];
     // §6.5.1: for each raster address, count CTBs preceding it in tile-scan order.
-    for rs in 0..pic {
+    for (rs, dst) in rs_to_ts[..pic].iter_mut().enumerate() {
         let tbx = rs % ctb_cols;
         let tby = rs / ctb_cols;
         let tile_x = col_index(col_bd, col_width, cols, tbx);
         let tile_y = row_index(row_bd, row_height, rows, tby);
         let mut ts = 0usize;
         // Whole tiles before this tile in tile-scan order.
-        for j in 0..tile_y {
-            ts += row_height[j] * ctb_cols;
+        for &rh in row_height[..tile_y].iter() {
+            ts += rh * ctb_cols;
         }
-        for i in 0..tile_x {
-            ts += row_height[tile_y] * col_width[i];
+        let rwhy = row_height[tile_y];
+        for &col_w in col_width[..tile_x].iter() {
+            ts += rwhy * col_w;
         }
         // Within-tile raster offset.
         ts += (tby - row_bd[tile_y]) * col_width[tile_x] + (tbx - col_bd[tile_x]);
-        rs_to_ts[rs] = ts;
+        *dst = ts;
     }
     let mut ts_to_rs = vec![0usize; pic];
     for (rs, &ts) in rs_to_ts.iter().enumerate() {

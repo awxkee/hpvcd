@@ -669,6 +669,14 @@ fn decode_hevc_item(
             Err(_) => continue, // skip a slice we can't parse rather than failing whole image
         };
         let cabac = &rbsp[hdr.cabac_offset.min(rbsp.len())..];
+        // Tile/WPP sub-stream starts (RBSP offsets relative to `cabac`),
+        // converted from NAL-domain entry points through the emulation map.
+        let sub_starts: Vec<usize> = if hdr.entry_points.is_empty() {
+            Vec::new()
+        } else {
+            let src_of = bitreader::rbsp_src_map(nal_bytes);
+            wpp::substream_starts_rbsp_rel(&src_of, hdr.cabac_offset, &hdr.entry_points, rbsp.len())
+        };
 
         match dec.as_mut() {
             None => {
@@ -686,13 +694,18 @@ fn decode_hevc_item(
                     None => false,
                 };
                 if !ran_wavefront {
-                    d.decode_slice(hdr.slice_segment_address)?;
+                    let starts = if sub_starts.is_empty() {
+                        None
+                    } else {
+                        Some((cabac, sub_starts.as_slice()))
+                    };
+                    d.decode_slice_ctx(hdr.slice_segment_address, starts)?;
                 }
                 dec = Some(d);
             }
             Some(d) => {
                 // Subsequent segment of the same picture.
-                d.decode_segment(cabac, &hdr)?;
+                d.decode_segment(cabac, &hdr, &sub_starts)?;
             }
         }
     }
