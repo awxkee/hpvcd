@@ -186,9 +186,12 @@ pub(crate) fn filter_refs_into(
         let cl = left[n] as i32;
         let ct = above[n] as i32;
         if (bl + tl - 2 * cl).abs() < thr && (tr + tl - 2 * ct).abs() < thr {
-            for i in 1..2 * n {
-                fa_out[i] = ((((2 * n - i) as i32) * tl + (i as i32) * tr + n as i32) >> 6) as u16;
-                fl_out[i] = ((((2 * n - i) as i32) * tl + (i as i32) * bl + n as i32) >> 6) as u16;
+            for ((i, fa), fl) in (1..2 * n)
+                .zip(fa_out[1..2 * n].iter_mut())
+                .zip(fl_out[1..2 * n].iter_mut())
+            {
+                *fa = ((((2 * n - i) as i32) * tl + (i as i32) * tr + n as i32) >> 6) as u16;
+                *fl = ((((2 * n - i) as i32) * tl + (i as i32) * bl + n as i32) >> 6) as u16;
             }
             fa_out[0] = above[0];
             fl_out[0] = left[0];
@@ -201,11 +204,12 @@ pub(crate) fn filter_refs_into(
     let corner = above[0] as i32;
     fa_out[0] = ((left[1] as i32 + 2 * corner + above[1] as i32 + 2) >> 2) as u16;
     fl_out[0] = fa_out[0];
-    for i in 1..2 * n {
-        fa_out[i] =
-            ((above[i - 1] as i32 + 2 * above[i] as i32 + above[i + 1] as i32 + 2) >> 2) as u16;
-        fl_out[i] =
-            ((left[i - 1] as i32 + 2 * left[i] as i32 + left[i + 1] as i32 + 2) >> 2) as u16;
+    for ((i, fa), fl) in (1..2 * n)
+        .zip(fa_out[1..2 * n].iter_mut())
+        .zip(fl_out[1..2 * n].iter_mut())
+    {
+        *fa = ((above[i - 1] as i32 + 2 * above[i] as i32 + above[i + 1] as i32 + 2) >> 2) as u16;
+        *fl = ((left[i - 1] as i32 + 2 * left[i] as i32 + left[i + 1] as i32 + 2) >> 2) as u16;
     }
     fa_out[2 * n] = above[2 * n];
     fl_out[2 * n] = left[2 * n];
