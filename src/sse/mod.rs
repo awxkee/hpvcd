@@ -49,7 +49,9 @@ pub(crate) use mc::{
     bi_mc_sse41, bi_mc_weighted_sse41, chroma_interp_sse41, luma_interp_sse41, uni_mc_sse41,
     uni_mc_weighted_sse41,
 };
-pub(crate) use reconstruct::{add_residual_into_sse41, add_residual_into_sse41_16};
+pub(crate) use reconstruct::{
+    add_residual_into_sse41, add_residual_into_sse41_16, narrow_i32_to_i16_sse41,
+};
 pub(crate) use sao::{
     apply_sao_band_offset_banded_inplace_sse41, apply_sao_band_offset_inplace_sse41,
     apply_sao_plane_banded_sse41, apply_sao_plane_sse41,

@@ -29,9 +29,11 @@
 
 pub(crate) type ReconstructFn = fn(&mut [u16], usize, &[u16], &[i32], usize, usize, usize, u8);
 pub(crate) type ReconstructFn16 = fn(&mut [u16], usize, &[u16], &[i16], usize, usize, usize, u8);
+pub(crate) type NarrowI32ToI16Fn = fn(&[i32], &mut [i16]);
 
 static RECONSTRUCT_ADD_CLIP: std::sync::OnceLock<ReconstructFn> = std::sync::OnceLock::new();
 static RECONSTRUCT_ADD_CLIP16: std::sync::OnceLock<ReconstructFn16> = std::sync::OnceLock::new();
+static NARROW_I32_TO_I16: std::sync::OnceLock<NarrowI32ToI16Fn> = std::sync::OnceLock::new();
 
 #[inline]
 pub(crate) fn resolve_reconstruct_add_clip() -> ReconstructFn {
@@ -87,6 +89,43 @@ pub(crate) fn resolve_reconstruct_add_clip16() -> ReconstructFn16 {
 
         _f
     })
+}
+
+#[inline]
+pub(crate) fn resolve_narrow_i32_to_i16() -> NarrowI32ToI16Fn {
+    *NARROW_I32_TO_I16.get_or_init(|| {
+        let mut _f: NarrowI32ToI16Fn = narrow_i32_to_i16_scalar;
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            _f = crate::neon::narrow_i32_to_i16_neon;
+        }
+
+        #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                _f = crate::sse::narrow_i32_to_i16_sse41;
+            }
+        }
+
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::avx::narrow_i32_to_i16_avx2;
+            }
+        }
+
+        _f
+    })
+}
+
+/// Saturating `i32` to `i16` conversion used by 8-bit transquant-bypass
+/// reconstruction. Source and destination may differ in length; only their
+/// common prefix is written.
+pub(crate) fn narrow_i32_to_i16_scalar(src: &[i32], dst: &mut [i16]) {
+    for (dst, &src) in dst.iter_mut().zip(src.iter()) {
+        *dst = src.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
 }
 
 #[inline]
@@ -231,5 +270,39 @@ fn add_residual_generic<R: Res>(
         for ((dst, &pred), &res) in dst_row.iter_mut().zip(pred_row.iter()).zip(res_row.iter()) {
             *dst = (pred as i32 + res.widen()).clamp(0, max) as u16;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::narrow_i32_to_i16_scalar;
+
+    #[test]
+    fn narrow_i32_to_i16_saturates_and_preserves_order() {
+        let src = [i32::MIN, -32769, -32768, -1, 0, 1, 32767, 32768, i32::MAX];
+        let mut dst = [0i16; 9];
+        narrow_i32_to_i16_scalar(&src, &mut dst);
+        assert_eq!(
+            dst,
+            [
+                i16::MIN,
+                i16::MIN,
+                i16::MIN,
+                -1,
+                0,
+                1,
+                i16::MAX,
+                i16::MAX,
+                i16::MAX,
+            ]
+        );
+    }
+
+    #[test]
+    fn narrow_i32_to_i16_writes_only_common_prefix() {
+        let src = [1, 2, 3, 4];
+        let mut dst = [9i16; 2];
+        narrow_i32_to_i16_scalar(&src, &mut dst);
+        assert_eq!(dst, [1, 2]);
     }
 }

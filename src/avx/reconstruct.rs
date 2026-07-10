@@ -29,7 +29,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::reconstruct::{can_reconstruct_full_block, sample_max};
+use crate::reconstruct::{can_reconstruct_full_block, narrow_i32_to_i16_scalar, sample_max};
 
 #[inline(always)]
 fn supported_n(n: usize) -> bool {
@@ -366,4 +366,60 @@ pub(crate) fn add_residual_into_avx2_16(
     }
 
     unsafe { add_residual_into_avx2_impl_16(dst, stride, pred, res, n, bit_depth) }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn narrow_i32x16_avx2(src: &[i32; 16]) -> __m256i {
+    let (src8, _) = src.as_chunks::<8>();
+    _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi32(
+        load_i32x8(&src8[0]),
+        load_i32x8(&src8[1]),
+    ))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn narrow_i32_to_i16_avx2_impl(src: &[i32], dst: &mut [i16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(src.len() & 15, 0);
+
+    let (src64, src_rem) = src.as_chunks::<64>();
+    let (dst64, dst_rem) = dst.as_chunks_mut::<64>();
+    for (src, dst) in src64.iter().zip(dst64.iter_mut()) {
+        let (src16, _) = src.as_chunks::<16>();
+        let (dst16, _) = dst.as_chunks_mut::<16>();
+
+        let p0 = narrow_i32x16_avx2(&src16[0]);
+        let p1 = narrow_i32x16_avx2(&src16[1]);
+        let p2 = narrow_i32x16_avx2(&src16[2]);
+        let p3 = narrow_i32x16_avx2(&src16[3]);
+        unsafe {
+            _mm256_storeu_si256(dst16[0].as_mut_ptr().cast::<__m256i>(), p0);
+            _mm256_storeu_si256(dst16[1].as_mut_ptr().cast::<__m256i>(), p1);
+            _mm256_storeu_si256(dst16[2].as_mut_ptr().cast::<__m256i>(), p2);
+            _mm256_storeu_si256(dst16[3].as_mut_ptr().cast::<__m256i>(), p3);
+        }
+    }
+
+    let (src16, src_tail) = src_rem.as_chunks::<16>();
+    let (dst16, dst_tail) = dst_rem.as_chunks_mut::<16>();
+    debug_assert!(src_tail.is_empty());
+    debug_assert!(dst_tail.is_empty());
+    for (src, dst) in src16.iter().zip(dst16.iter_mut()) {
+        let packed = narrow_i32x16_avx2(src);
+        unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast::<__m256i>(), packed) };
+    }
+}
+
+pub(crate) fn narrow_i32_to_i16_avx2(src: &[i32], dst: &mut [i16]) {
+    let len = src.len().min(dst.len());
+    let simd_len = len & !15;
+    let (src_simd, src_tail) = src[..len].split_at(simd_len);
+    let (dst_simd, dst_tail) = dst[..len].split_at_mut(simd_len);
+
+    if simd_len != 0 {
+        unsafe { narrow_i32_to_i16_avx2_impl(src_simd, dst_simd) };
+    }
+    narrow_i32_to_i16_scalar(src_tail, dst_tail);
 }

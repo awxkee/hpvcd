@@ -3116,6 +3116,50 @@ fn copy_pred_block_clipped(
     }
 }
 
+/// Load an n×n plane block into contiguous scratch, zero-padding the portion
+/// outside the visible plane. The common fully in-frame case is only one
+/// `copy_from_slice` per row.
+#[inline]
+fn load_plane_block_clipped(
+    plane: &[u16],
+    stride: usize,
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    pred: &mut [u16],
+) {
+    debug_assert!(pred.len() >= n * n);
+    let pred = &mut pred[..n * n];
+    let valid_w = width.saturating_sub(x0).min(n);
+    let valid_h = height.saturating_sub(y0).min(n);
+
+    if valid_w != n || valid_h != n {
+        pred.fill(0);
+    }
+    if valid_w == 0 || valid_h == 0 || stride == 0 {
+        return;
+    }
+
+    let Some(row_off) = y0.checked_mul(stride) else {
+        pred.fill(0);
+        return;
+    };
+    let Some(rows) = plane.get(row_off..) else {
+        pred.fill(0);
+        return;
+    };
+
+    for (src, dst) in rows
+        .chunks_exact(stride)
+        .take(valid_h)
+        .zip(pred.chunks_exact_mut(n))
+    {
+        dst[..valid_w].copy_from_slice(&src[x0..x0 + valid_w]);
+    }
+}
+
 fn luma_scan(mode: u8, log2_ts: u32) -> u8 {
     if log2_ts == 2 || log2_ts == 3 {
         if (6..=14).contains(&mode) {
@@ -3314,9 +3358,7 @@ impl<'cab> FullDecoder<'cab> {
         // 8-bit depth: residuals fit i16, halving memory traffic and widening SIMD.
         if self.bd <= 8 {
             if self.cu_tqb {
-                for (o, &l) in self.res_scratch16[..n * n].iter_mut().zip(levels.iter()) {
-                    *o = l.clamp(-32768, 32767) as i16;
-                }
+                (self.exec.narrow_i32_to_i16)(levels, &mut self.res_scratch16[..n * n]);
             } else {
                 let qp_prime_y = qp_prime(self.cur_qp, self.bd);
                 let scaling = scaling_matrix_from_lists(
@@ -3462,40 +3504,31 @@ impl<'cab> FullDecoder<'cab> {
     /// scratch (row-major n×n), zero-padding out-of-frame samples. Used for
     /// inter reconstruction where the MC prediction is already in the plane.
     fn load_plane_pred_luma(&mut self, x0: usize, y0: usize, n: usize) {
-        let stride = self.w;
-        let pred = &mut self.scratch.pred[..n * n];
-        for row in 0..n {
-            let py = y0 + row;
-            for col in 0..n {
-                let px = x0 + col;
-                pred[row * n + col] = if px < self.w && py < self.h {
-                    self.y[py * stride + px]
-                } else {
-                    0
-                };
-            }
-        }
+        load_plane_block_clipped(
+            &self.y,
+            self.w,
+            self.w,
+            self.h,
+            x0,
+            y0,
+            n,
+            &mut self.scratch.pred,
+        );
     }
 
     /// Chroma counterpart of [`load_plane_pred_luma`].
     fn load_plane_pred_chroma(&mut self, is_cb: bool, cx0: usize, cy0: usize, n: usize) {
-        let stride = self.cw;
-        let pred = &mut self.scratch.pred[..n * n];
-        for row in 0..n {
-            let py = cy0 + row;
-            for col in 0..n {
-                let px = cx0 + col;
-                pred[row * n + col] = if px < self.cw && py < self.ch {
-                    if is_cb {
-                        self.cb[py * stride + px]
-                    } else {
-                        self.cr[py * stride + px]
-                    }
-                } else {
-                    0
-                };
-            }
-        }
+        let plane = if is_cb { &self.cb } else { &self.cr };
+        load_plane_block_clipped(
+            plane,
+            self.cw,
+            self.cw,
+            self.ch,
+            cx0,
+            cy0,
+            n,
+            &mut self.scratch.pred,
+        );
     }
 
     fn predict_luma_block_into(&mut self, x0: usize, y0: usize, n: usize, mode: u8) {
@@ -3503,7 +3536,7 @@ impl<'cab> FullDecoder<'cab> {
         let mut left = std::mem::take(&mut self.scratch.raw_left);
         let corner = self.gather_luma_refs_into(x0, y0, n, &mut above[..2 * n], &mut left[..2 * n]);
         let neutral = 1u16
-            .checked_shl((self.bd.saturating_sub(1)) as u32)
+            .checked_shl(self.bd.saturating_sub(1) as u32)
             .unwrap_or(0);
         let strong = self.strong_smoothing && self.sps.strong_intra_smoothing;
         let sc = &mut self.scratch;
@@ -3799,9 +3832,7 @@ impl<'cab> FullDecoder<'cab> {
         let valid_h = self.ch.saturating_sub(cy0).min(n);
         if self.bd_c <= 8 {
             if self.cu_tqb {
-                for (o, &l) in self.res_scratch16[..n2].iter_mut().zip(levels.iter()) {
-                    *o = l.clamp(-32768, 32767) as i16;
-                }
+                (self.exec.narrow_i32_to_i16)(levels, &mut self.res_scratch16[..n2]);
             } else {
                 if transform_skip {
                     dequantize_transform_skip_scaled_into_i16(
@@ -6061,7 +6092,8 @@ fn ceil_log2(n: u64) -> u32 {
 mod tests {
     use super::{
         ceil_log2, clamp_qpy, derive_qpy_from_delta, fill_slice_owner_rect, inter_motion_differs,
-        peek_slice_pps_id, promote_first_slice_owners, qp_prime, qpc, qpy_min,
+        load_plane_block_clipped, peek_slice_pps_id, promote_first_slice_owners, qp_prime, qpc,
+        qpy_min,
     };
     use crate::inter::{MotionInfo, Mv, PredFlags};
 
@@ -6151,6 +6183,22 @@ mod tests {
         assert_eq!(derive_qpy_from_delta(51, 0, 8), 51);
         assert!((qpy_min(12)..=51).contains(&derive_qpy_from_delta(i32::MAX, i32::MAX, 12)));
         assert!((qpy_min(12)..=51).contains(&derive_qpy_from_delta(i32::MIN, i32::MIN, 12)));
+    }
+
+    #[test]
+    fn plane_prediction_load_copies_rows_and_zero_pads_edges() {
+        let plane: Vec<u16> = (0..20).collect();
+
+        let mut full = [u16::MAX; 9];
+        load_plane_block_clipped(&plane, 5, 5, 4, 1, 1, 3, &mut full);
+        assert_eq!(full, [6, 7, 8, 11, 12, 13, 16, 17, 18]);
+
+        let mut clipped = [u16::MAX; 16];
+        load_plane_block_clipped(&plane, 5, 5, 4, 3, 2, 4, &mut clipped);
+        assert_eq!(
+            clipped,
+            [13, 14, 0, 0, 18, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]

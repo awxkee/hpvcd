@@ -50,6 +50,7 @@ pub(crate) struct ExecContext {
 
     pub(crate) reconstruct: reconstruct::ReconstructFn,
     pub(crate) reconstruct16: reconstruct::ReconstructFn16,
+    pub(crate) narrow_i32_to_i16: reconstruct::NarrowI32ToI16Fn,
 
     pub(crate) sao_plane: sao::SaoPlaneFn,
     pub(crate) sao_plane_banded: sao::SaoPlaneBandedFn,
@@ -103,6 +104,7 @@ impl ExecContext {
 
             reconstruct: reconstruct::resolve_reconstruct_add_clip(),
             reconstruct16: reconstruct::resolve_reconstruct_add_clip16(),
+            narrow_i32_to_i16: reconstruct::resolve_narrow_i32_to_i16(),
 
             sao_plane: sao::resolve_apply_sao_plane(),
             sao_plane_banded: sao::resolve_apply_sao_plane_banded(),

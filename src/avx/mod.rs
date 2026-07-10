@@ -51,7 +51,9 @@ pub(crate) use mc::{
     bi_mc_avx2, bi_mc_weighted_avx2, chroma_interp_avx2, luma_interp_avx2, uni_mc_avx2,
     uni_mc_weighted_avx2,
 };
-pub(crate) use reconstruct::{add_residual_into_avx2, add_residual_into_avx2_16};
+pub(crate) use reconstruct::{
+    add_residual_into_avx2, add_residual_into_avx2_16, narrow_i32_to_i16_avx2,
+};
 pub(crate) use sao::{
     apply_sao_band_offset_banded_inplace_avx2, apply_sao_band_offset_inplace_avx2,
     apply_sao_plane_avx2, apply_sao_plane_banded_avx2,

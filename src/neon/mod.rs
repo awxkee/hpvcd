@@ -54,7 +54,9 @@ pub(crate) use mc::{
     bi_mc_neon, bi_mc_weighted_neon, chroma_interp_neon, luma_interp_neon, uni_mc_neon,
     uni_mc_weighted_neon,
 };
-pub(crate) use reconstruct::{add_residual_into_neon, add_residual_into_neon16};
+pub(crate) use reconstruct::{
+    add_residual_into_neon, add_residual_into_neon16, narrow_i32_to_i16_neon,
+};
 pub(crate) use sao::{
     apply_sao_band_offset_banded_inplace_neon, apply_sao_band_offset_inplace_neon,
     apply_sao_plane_banded_neon, apply_sao_plane_neon,
