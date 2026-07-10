@@ -139,7 +139,7 @@ impl TileGrid {
     }
 
     /// True when the raster CTB at `rs` is the first CTB (in tile-scan order) of
-    /// its tile — i.e. CABAC must be (re-)initialised here (§9.3.1).
+    /// its tile — i.e. CABAC must be (re-)initialized here (§9.3.1).
     #[inline]
     pub(crate) fn is_tile_start_rs(&self, rs: usize) -> bool {
         let ts = self.rs_to_ts(rs);
@@ -182,6 +182,18 @@ impl TileGrid {
     #[inline]
     pub(crate) fn tile_id_at(&self, cx: usize, cy: usize) -> usize {
         self.row_of(cy) * self.cols + self.col_of(cx)
+    }
+
+    /// Left CTB-column boundary of the tile containing CTB column `cx`.
+    #[inline]
+    pub(crate) fn tile_col_start(&self, cx: usize) -> usize {
+        self.col_bd[self.col_of(cx)]
+    }
+
+    /// Top CTB-row boundary of the tile containing CTB row `cy`.
+    #[inline]
+    pub(crate) fn tile_row_start(&self, cy: usize) -> usize {
+        self.row_bd[self.row_of(cy)]
     }
 }
 

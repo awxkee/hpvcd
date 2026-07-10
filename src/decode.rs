@@ -72,7 +72,8 @@ struct SaoCtb {
 
 /// Per-slice deblocking parameters, captured for each independent slice so the
 /// single post-picture deblocking pass can apply the correct values per edge
-/// (§7.4.7.1, §8.7.2). Slice indices start at 1; a default fills index 0.
+/// (§7.4.7.1, §8.7.2). Slice indices start at 1; owner 0 aliases slice 1
+/// until a second independent slice makes explicit ownership necessary.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SliceDeblock {
     disabled: bool,
@@ -287,18 +288,6 @@ impl FullDecoder<'static> {
                 w, h
             )));
         }
-        // Tiles combined with WPP (entropy_coding_sync) is not supported: the
-        // substream layout is one per CTB row *within* each tile, which neither
-        // the tiled nor the wavefront path handles. Reject explicitly rather
-        // than silently mis-positioning CABAC substreams and producing garbage.
-        if pps.tiles_enabled
-            && pps.entropy_coding_sync_enabled
-            && (pps.num_tile_columns > 1 || pps.num_tile_rows > 1)
-        {
-            return Err(DecodeError::Unsupported(
-                "tiles combined with entropy_coding_sync (WPP) is not supported".into(),
-            ));
-        }
         // The pixel/output paths are implemented for 8/10/12-bit streams only.
         // Reject malformed SPS values before they reach shifts like `1 << (bd - 1)`.
         sps.bit_depth()?;
@@ -395,8 +384,17 @@ impl FullDecoder<'static> {
                 hdr.slice_loop_filter_across_slices,
                 hdr.slice_loop_filter_across_slices,
             ],
+            // Owner 0 is the implicit representation of slice 1 until a
+            // second slice appears, so both entries must resolve to slice 1's
+            // effective deblocking parameters.
             slice_deblock: vec![
-                SliceDeblock::default(),
+                SliceDeblock {
+                    disabled: hdr.deblocking_disabled,
+                    beta_offset_div2: hdr.beta_offset_div2,
+                    tc_offset_div2: hdr.tc_offset_div2,
+                    cb_qp_offset: hdr.cb_qp_offset,
+                    cr_qp_offset: hdr.cr_qp_offset,
+                },
                 SliceDeblock {
                     disabled: hdr.deblocking_disabled,
                     beta_offset_div2: hdr.beta_offset_div2,
@@ -464,6 +462,91 @@ impl FullDecoder<'static> {
     }
 }
 
+/// Whether two inter blocks require boundary strength 1 from their reference
+/// pictures / motion vectors (§8.7.2.4).
+///
+/// Keep unused reference lists as `None` rather than a sentinel POC: negative
+/// POCs are valid, so `-1` cannot safely stand for "no reference".
+#[inline]
+fn inter_motion_differs(p: &MotionInfo, q: &MotionInfo) -> bool {
+    let reference = |m: &MotionInfo, list: usize| m.pred_used(list).then_some(m.ref_poc[list]);
+    let p_ref = [reference(p, 0), reference(p, 1)];
+    let q_ref = [reference(q, 0), reference(q, 1)];
+
+    let direct = p_ref[0] == q_ref[0] && p_ref[1] == q_ref[1];
+    let crossed = p_ref[0] == q_ref[1] && p_ref[1] == q_ref[0];
+    if !direct && !crossed {
+        return true;
+    }
+
+    let motion = |m: &MotionInfo, list: usize| {
+        if m.pred_used(list) {
+            m.mv[list]
+        } else {
+            crate::inter::Mv::default()
+        }
+    };
+    let p_mv = [motion(p, 0), motion(p, 1)];
+    let q_mv = [motion(q, 0), motion(q, 1)];
+    let far = |a: crate::inter::Mv, b: crate::inter::Mv| {
+        (a.x as i32 - b.x as i32).abs() >= 4 || (a.y as i32 - b.y as i32).abs() >= 4
+    };
+
+    if p_ref[0] != p_ref[1] {
+        if direct {
+            far(p_mv[0], q_mv[0]) || far(p_mv[1], q_mv[1])
+        } else {
+            far(p_mv[0], q_mv[1]) || far(p_mv[1], q_mv[0])
+        }
+    } else {
+        (far(p_mv[0], q_mv[0]) || far(p_mv[1], q_mv[1]))
+            && (far(p_mv[0], q_mv[1]) || far(p_mv[1], q_mv[0]))
+    }
+}
+
+/// Fill slice ownership for a pixel-aligned rectangle on the decoder's 4x4
+/// metadata grid. Slice boundaries are CTB-aligned, but the helper also serves
+/// CU/PU bookkeeping and therefore accepts any 4-sample-aligned rectangle.
+fn fill_slice_owner_rect(
+    owners: &mut [u16],
+    grid_w: usize,
+    grid_h: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    owner: u16,
+) {
+    if grid_w == 0 || grid_h == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let gx0 = (x0 / 4).min(grid_w);
+    let gy0 = (y0 / 4).min(grid_h);
+    let gx1 = x0.saturating_add(width).div_ceil(4).min(grid_w);
+    let gy1 = y0.saturating_add(height).div_ceil(4).min(grid_h);
+    if gx0 >= gx1 || gy0 >= gy1 {
+        return;
+    }
+    for gy in gy0..gy1 {
+        let row0 = gy * grid_w;
+        if let Some(row) = owners.get_mut(row0..row0 + grid_w) {
+            row[gx0..gx1].fill(owner);
+        }
+    }
+}
+
+/// Convert the implicit owner-0 representation used by the single-slice fast
+/// path into the explicit owner-1 representation needed once another independent
+/// slice appears. Only already-decoded cells belong to the first slice.
+fn promote_first_slice_owners(decoded: &[bool], owners: &mut [u16]) {
+    debug_assert_eq!(decoded.len(), owners.len());
+    for (&is_decoded, owner) in decoded.iter().zip(owners.iter_mut()) {
+        if is_decoded && *owner == 0 {
+            *owner = 1;
+        }
+    }
+}
+
 impl<'cab> FullDecoder<'cab> {
     pub(crate) fn decode_segment(
         &mut self,
@@ -472,12 +555,35 @@ impl<'cab> FullDecoder<'cab> {
         sub_starts: &[usize],
     ) -> Result<(), DecodeError> {
         self.cab.reset_with(cabac)?;
-        self.slice_type = hdr.slice_type;
-        self.cabac_init = hdr.cabac_init;
-        self.pred_weights = hdr.pred_weights.clone();
         if !hdr.dependent_slice_segment {
-            // Independent segment: reset entropy contexts and slice-level state.
+            // Independent segment: reset entropy contexts and every piece of
+            // slice-owned state. Dependent segments intentionally retain these
+            // values from their parent independent segment.
+            self.slice_type = hdr.slice_type;
+            self.cabac_init = hdr.cabac_init;
+            self.pred_weights = hdr.pred_weights.clone();
+            self.mvd_l1_zero = hdr.mvd_l1_zero;
+            self.temporal_mvp = hdr.temporal_mvp;
+            self.max_num_merge_cand = hdr.max_num_merge_cand.clamp(1, 5);
+            self.collocated_from_l0 = hdr.collocated_from_l0;
+            self.collocated_ref_idx = hdr.collocated_ref_idx;
+            self.last_pu_merge = false;
+            self.cur_cu_inter = false;
+
+            // The single-slice fast path avoids writing owner 1 into every 4x4
+            // cell. Once a second independent slice appears, promote already
+            // decoded cells before assigning owner 2 so all per-slice tables
+            // use the same non-zero indexing convention.
+            if self.cur_slice_idx == 1 {
+                promote_first_slice_owners(&self.decoded, &mut self.slice_idx);
+            }
             self.cur_slice_idx = self.cur_slice_idx.wrapping_add(1);
+
+            // WPP entropy synchronization is scoped to one independent slice.
+            // A snapshot produced by a previous tile-slice must never seed a row
+            // in this slice merely because its absolute picture row aliases.
+            self.wpp_ctx_snap.fill(None);
+            self.wpp_ictx_snap.fill(None);
             // Record this slice's loop_filter_across_slices flag so boundary
             // filtering can consult the owning slice (§8.7.1).
             let idx = self.cur_slice_idx as usize;
@@ -513,7 +619,7 @@ impl<'cab> FullDecoder<'cab> {
             let qp = slice_qp.clamp(0, 51) as u8;
             // CABAC init type (§9.3.2.2): I=0; P=1/2 and B=2/1, swapped by
             // cabac_init_flag. Using the I-slice tables for every slice leaves
-            // the inter contexts mis-initialised and eventually desyncs CABAC.
+            // the inter contexts mis-initialized and eventually desyncs CABAC.
             let init_type = match hdr.slice_type {
                 crate::inter::SLICE_I => 0u8,
                 crate::inter::SLICE_P => {
@@ -564,6 +670,19 @@ impl<'cab> FullDecoder<'cab> {
     #[inline]
     fn decode_one_ctb_inner(&mut self, rx: usize, ry: usize, wpp: bool, store_snap: bool) -> bool {
         let ctb = 1usize << self.log2_ctb;
+        // Slice membership is known at CTB granularity before any CU syntax is
+        // decoded. Record it now, rather than waiting until each CU completes.
+        //
+        // This matters for later independent slices: intra NxN modes are derived
+        // PU-by-PU before the enclosing CU is marked decoded. The first slice's
+        // owner-0 fast path masked that ordering, but slice 2+ rejected an
+        // earlier PU in the same CU as "different slice", producing a wrong MPM
+        // and eventually a different coefficient scan/CABAC path. CTB-level
+        // pre-tagging is safe because slice-segment boundaries are CTB-aligned;
+        // availability checks that require reconstruction still consult
+        // `decoded` separately.
+        self.set_slice_idx(rx * ctb, ry * ctb, ctb);
+
         // Record the current CTB's tile so intra availability can reject
         // neighbors that fall in a different tile (§6.4.1).
         self.cur_tile_id = match &self.tiles {
@@ -820,7 +939,7 @@ impl<'cab> FullDecoder<'cab> {
     /// Tile-scan CTB decode. Advances through tile-scan addresses `ts`, mapping
     /// each to its raster `(rx, ry)`. At each tile's first CTB the CABAC engine
     /// is repositioned to that tile's entry-point sub-stream (when entry points
-    /// are available) and the contexts + QP predictor are re-initialised.
+    /// are available) and the contexts + QP predictor are re-initialized.
     fn decode_slice_tiled(
         &mut self,
         start_ctb: usize,
@@ -830,16 +949,36 @@ impl<'cab> FullDecoder<'cab> {
         let total = self.ctb_cols * self.ctb_rows;
         let start_ctb = start_ctb.min(total);
         let start_ts = grid.rs_to_ts(start_ctb);
+        let wpp = self.pps.entropy_coding_sync_enabled;
 
         // `sub_starts[i]` is the RBSP offset (relative to the CABAC payload) of
-        // tile sub-stream `i`; index 0 is 0. Precomputed by the caller through
-        // the NAL→RBSP map so emulation-prevention bytes are handled correctly.
+        // sub-stream `i`; index 0 is 0. With WPP disabled there is one sub-stream
+        // per tile; with WPP enabled there is one per CTB row *within* each tile
+        // (§7.3.8.1), both laid out in tile-scan order. Precomputed by the caller
+        // through the NAL→RBSP map so emulation-prevention bytes are handled.
         let empty: &[usize] = &[];
         let sub_starts: &[usize] = cabac_and_starts.map(|(_, s)| s).unwrap_or(empty);
 
-        // Counter of how many tile sub-streams we've entered so far (indexes
+        // Counter of how many sub-streams we've entered so far (indexes
         // `sub_starts`). The slice segment begins in sub-stream 0.
         let mut substream = 0usize;
+
+        // Seek the arithmetic engine to sub-stream `substream`, falling back to a
+        // byte-aligned re-init of the contiguous stream when no entry point is
+        // available.
+        let seek = |dec: &mut Self, substream: usize| {
+            let mut seeked = false;
+            if let Some((cabac, _)) = cabac_and_starts
+                && let Some(&off) = sub_starts.get(substream)
+                && off <= cabac.len()
+                && dec.cab.reset_with(&cabac[off..]).is_ok()
+            {
+                seeked = true;
+            }
+            if !seeked {
+                dec.cab.reinit_engine();
+            }
+        };
 
         let mut ts = start_ts;
         while ts < total {
@@ -847,55 +986,87 @@ impl<'cab> FullDecoder<'cab> {
             let rx = rs % self.ctb_cols;
             let ry = rs / self.ctb_cols;
 
-            // On entering a new tile (not the slice segment's first CTB), seek
-            // to that tile's sub-stream and re-initialise contexts (§9.3.1).
-            if ts != start_ts && grid.is_tile_start_rs(rs) {
+            let tile_start = grid.is_tile_start_rs(rs);
+            let tile_col0 = grid.tile_col_start(rx);
+            let tile_row0 = grid.tile_row_start(ry);
+            // First CTB of a CTB row within the current tile (but not the tile's
+            // own first CTB, which `tile_start` covers).
+            let tile_row_start = rx == tile_col0 && ry > tile_row0;
+
+            // A new sub-stream begins at every tile start and, with WPP, at every
+            // CTB-row boundary inside a tile. Matching HM's TDecSlice: the CABAC
+            // contexts are re-initialized at each sub-stream, then — at the first
+            // column *of the tile* — restored from the model saved after the
+            // second CTB of the row above, but only when that row-above's
+            // upper-right CTB lies in the same tile (and slice).
+            let new_substream = (ts != start_ts && tile_start) || (wpp && tile_row_start);
+            if new_substream {
                 substream += 1;
-                let mut seeked = false;
-                if let Some((cabac, _)) = cabac_and_starts
-                    && let Some(&off) = sub_starts.get(substream)
-                    && off <= cabac.len()
-                {
-                    // Reposition the arithmetic engine at the tile sub-stream.
-                    if self.cab.reset_with(&cabac[off..]).is_ok() {
-                        seeked = true;
+                seek(self, substream);
+                self.reinit_slice_contexts();
+                if wpp && rx == tile_col0 && ry > tile_row0 {
+                    // Upper-right CTB of the row above: (rx+1, ry-1). WPP sync
+                    // uses its stored model only when that CTB is in the same
+                    // tile and slice as the current one (HM CUIsFromSameSliceAndTile).
+                    let ctb = 1usize << self.log2_ctb;
+                    let ur_ok = rx + 1 < self.ctb_cols
+                        && grid.tile_id_at(rx + 1, ry - 1) == grid.tile_id_at(rx, ry)
+                        && (self.cur_slice_idx <= 1
+                            || self.slice_idx_at((rx + 1) * ctb, (ry - 1) * ctb)
+                                == self.cur_slice_idx);
+                    if ur_ok
+                        && let (Some(ctx), Some(ictx)) = (
+                            self.wpp_ctx_snap[ry - 1].clone(),
+                            self.wpp_ictx_snap[ry - 1],
+                        )
+                    {
+                        self.ctx = ctx;
+                        self.ictx = ictx;
                     }
                 }
-                if !seeked {
-                    // Fallback: contiguous sub-streams (byte-aligned after the
-                    // previous tile's end_of_sub_stream_one_bit).
-                    self.cab.reinit_engine();
-                }
-                let qp = self.slice_qp.clamp(0, 51) as u8;
-                let init_type = match self.slice_type {
-                    crate::inter::SLICE_I => 0u8,
-                    crate::inter::SLICE_P => {
-                        if self.cabac_init {
-                            2
-                        } else {
-                            1
-                        }
-                    }
-                    _ => {
-                        if self.cabac_init {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                };
-                self.ctx = ContextSet::init(init_type, qp);
-                self.ictx = IntraModeContexts::init(init_type, qp);
                 self.qp_y_prev = self.slice_qp;
             }
 
             let terminated = self.decode_one_ctb(rx, ry, false);
+
+            // WPP model store: after the second CTB *of the tile row* (tile
+            // column 1), keyed by absolute row so the next row can restore it.
+            if wpp && rx == tile_col0 + 1 {
+                self.wpp_ctx_snap[ry] = Some(self.ctx.clone());
+                self.wpp_ictx_snap[ry] = Some(self.ictx);
+            }
+
             if terminated {
                 break;
             }
             ts += 1;
         }
         Ok(())
+    }
+
+    /// Re-initialize the CABAC context models and intra-mode contexts for the
+    /// current slice type and QP (used at tile starts and WPP row resets).
+    fn reinit_slice_contexts(&mut self) {
+        let qp = self.slice_qp.clamp(0, 51) as u8;
+        let init_type = match self.slice_type {
+            crate::inter::SLICE_I => 0u8,
+            crate::inter::SLICE_P => {
+                if self.cabac_init {
+                    2
+                } else {
+                    1
+                }
+            }
+            _ => {
+                if self.cabac_init {
+                    1
+                } else {
+                    2
+                }
+            }
+        };
+        self.ctx = ContextSet::init(init_type, qp);
+        self.ictx = IntraModeContexts::init(init_type, qp);
     }
 
     fn decode_slice_raster(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
@@ -2069,7 +2240,7 @@ impl<'cab> FullDecoder<'cab> {
     /// The arithmetic engine has just returned 1 for `pcm_flag`; the bitstream is
     /// byte-aligned, raw fixed-length luma then chroma samples are read, scaled
     /// up to the coded bit depth, and written directly into the planes. The
-    /// arithmetic engine is re-initialised afterward.
+    /// arithmetic engine is re-initialized afterward.
     fn decode_pcm_cu(&mut self, x0: usize, y0: usize, log2_cb: u32) {
         let n = 1usize << log2_cb;
         // Align the raw bit pointer (pcm_alignment_zero_bit padding) — same
@@ -2263,40 +2434,6 @@ impl<'cab> FullDecoder<'cab> {
         let gh = self.grid_h;
         let have_motion = self.motion.len() >= gw * gh;
         let is_intra = |m: &[crate::inter::MotionInfo], g: usize| have_motion && m[g].is_intra;
-        // Inter boundary strength (§8.7.2.4): bS = 1 between two inter blocks
-        // that use different reference pictures, a different number of MVs, or
-        // whose motion vectors differ by ≥ 4 quarter-samples in any component.
-        let inter_bs1 = |p: &crate::inter::MotionInfo, q: &crate::inter::MotionInfo| -> bool {
-            let rp = |m: &crate::inter::MotionInfo, l: usize| {
-                if m.pred_used(l) { m.ref_poc[l] } else { -1 }
-            };
-            let (rp0, rp1) = (rp(p, 0), rp(p, 1));
-            let (rq0, rq1) = (rp(q, 0), rp(q, 1));
-            let same_pics = (rp0 == rq0 && rp1 == rq1) || (rp0 == rq1 && rp1 == rq0);
-            if !same_pics {
-                return true;
-            }
-            let mv = |m: &crate::inter::MotionInfo, l: usize| {
-                if m.pred_used(l) {
-                    m.mv[l]
-                } else {
-                    crate::inter::Mv::default()
-                }
-            };
-            let (mp0, mp1, mq0, mq1) = (mv(p, 0), mv(p, 1), mv(q, 0), mv(q, 1));
-            let far = |a: crate::inter::Mv, b: crate::inter::Mv| {
-                (a.x - b.x).abs() >= 4 || (a.y - b.y).abs() >= 4
-            };
-            if rp0 != rp1 {
-                if rp0 == rq0 {
-                    far(mp0, mq0) || far(mp1, mq1)
-                } else {
-                    far(mp0, mq1) || far(mp1, mq0)
-                }
-            } else {
-                (far(mp0, mq0) || far(mp1, mq1)) && (far(mp0, mq1) || far(mp1, mq0))
-            }
-        };
         for gy in 0..gh {
             let row = gy * gw;
             for gx in 0..gw {
@@ -2317,7 +2454,7 @@ impl<'cab> FullDecoder<'cab> {
                         self.edge_v[g] = true;
                     } else if self.bs_v[g] < 1
                         && have_motion
-                        && inter_bs1(&self.motion[g], &self.motion[g - 1])
+                        && inter_motion_differs(&self.motion[g], &self.motion[g - 1])
                     {
                         self.bs_v[g] = 1;
                         self.edge_v[g] = true;
@@ -2339,7 +2476,7 @@ impl<'cab> FullDecoder<'cab> {
                         self.edge_h[g] = true;
                     } else if self.bs_h[g] < 1
                         && have_motion
-                        && inter_bs1(&self.motion[g], &self.motion[g - gw])
+                        && inter_motion_differs(&self.motion[g], &self.motion[g - gw])
                     {
                         self.bs_h[g] = 1;
                         self.edge_h[g] = true;
@@ -2385,25 +2522,25 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    /// Record the slice index over a block (for cross-slice filter gating).
+    /// Record the slice index over a block (for prediction/context
+    /// availability and cross-slice loop-filter gating).
     fn set_slice_idx(&mut self, x0: usize, y0: usize, size: usize) {
         // Single independent slice: the array stays uniformly 0, so any pair of
-        // cells compares equal (same slice). Writing per-CU is pure overhead in
-        // the common case, so skip it until a second slice segment appears.
+        // cells compares equal (same slice). Ownership writes are pure overhead
+        // in the common case, so skip them until a second slice appears.
         if self.cur_slice_idx <= 1 {
             return;
         }
-        let s = self.cur_slice_idx;
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.slice_idx[g] = s;
-                }
-            }
-        }
+        fill_slice_owner_rect(
+            &mut self.slice_idx,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            self.cur_slice_idx,
+        );
     }
 
     #[inline]
@@ -2420,8 +2557,14 @@ impl<'cab> FullDecoder<'cab> {
         let ctb_x = (xqg / ctb) * ctb;
         let ctb_y = (yqg / ctb) * ctb;
 
-        // WPP (HEVC §8.6.1): for the first QG in a CTB row, qPY_PRED = SliceQpY.
-        let first_in_ctb_row = xqg == 0 && (yqg & (ctb - 1)) == 0;
+        // WPP (HEVC §8.6.1): the first QG of a CTB row resets qPY_PRED to
+        // SliceQpY. With tiles the row is tile-relative (HM), so the reset is at
+        // the first QG of the row within the tile.
+        let row_start_col = match &self.tiles {
+            Some(g) => g.tile_col_start(xqg / ctb) * ctb,
+            None => 0,
+        };
+        let first_in_ctb_row = xqg == row_start_col && (yqg & (ctb - 1)) == 0;
         if self.pps.entropy_coding_sync_enabled && first_in_ctb_row {
             return self.slice_qp;
         }
@@ -2478,26 +2621,30 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    fn mark_decoded(&mut self, x0: usize, y0: usize, size: usize) {
+    fn mark_decoded_rect(&mut self, x0: usize, y0: usize, width: usize, height: usize) {
         let mark_slice = self.cur_slice_idx > 1;
         let s = self.cur_slice_idx;
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
+        for yy in (y0..y0 + height).step_by(4) {
+            for xx in (x0..x0 + width).step_by(4) {
                 if xx < self.w
                     && yy < self.h
                     && let Some(g) = self.grid_idx(xx, yy)
                 {
                     self.decoded[g] = true;
-                    // Keep slice ownership in lock-step with `decoded` so that
-                    // intra neighbors decoded earlier in this same slice (but
-                    // before the enclosing CU's set_slice_idx runs) are seen as
-                    // same-slice rather than defaulting to the initial 0.
+                    // Keep ownership in lock-step for alternate/PU-granular
+                    // decode paths too. The normal CTB path has already pre-tagged
+                    // the whole CTB before parsing any CU syntax.
                     if mark_slice {
                         self.slice_idx[g] = s;
                     }
                 }
             }
         }
+    }
+
+    #[inline]
+    fn mark_decoded(&mut self, x0: usize, y0: usize, size: usize) {
+        self.mark_decoded_rect(x0, y0, size, size);
     }
 
     fn set_tqb(&mut self, x0: usize, y0: usize, size: usize) {
@@ -3020,10 +3167,12 @@ impl<'cab> FullDecoder<'cab> {
         {
             return false;
         }
-        // Same slice: the neighbor must belong to the slice segment currently
-        // being decoded. Its slice index was recorded when it was decoded; the
-        // current CTB's own index is `cur_slice_idx` (its samples aren't marked
-        // until its CUs are decoded, after SAO parsing).
+        // Same slice: the neighbor must belong to the slice currently being
+        // decoded. Multi-slice CTBs are pre-tagged before SAO/CU syntax; with a
+        // single slice the map stays uniformly 0, so only the tile check applies.
+        if self.cur_slice_idx <= 1 {
+            return true;
+        }
         let ctb = 1usize << self.log2_ctb;
         let nbr = self.slice_idx_at(nrx * ctb, nry * ctb);
         nbr == self.cur_slice_idx
@@ -4429,18 +4578,7 @@ impl<'cab> FullDecoder<'cab> {
         if n.is_intra {
             return true;
         }
-        let count_a = n.pred.l0 as u8 + n.pred.l1 as u8;
-        let count_b = mi.pred.l0 as u8 + mi.pred.l1 as u8;
-        if count_a != count_b {
-            return true;
-        }
-        // Compare L0 (P-slice common case); different reference → BS 1.
-        if n.pred.l0 && (n.ref_poc[0] != mi.ref_poc[0]) {
-            return true;
-        }
-        let dx = (n.mv[0].x as i32 - mi.mv[0].x as i32).abs();
-        let dy = (n.mv[0].y as i32 - mi.mv[0].y as i32).abs();
-        dx >= 4 || dy >= 4
+        inter_motion_differs(&n, mi)
     }
 
     /// Decode an inter (or skip) coding unit: partition, per-PU motion, MC, and
@@ -4487,15 +4625,19 @@ impl<'cab> FullDecoder<'cab> {
                 self.mark_pu_edge_h(px, py, pw);
             }
         }
-        // Parse all PUs' motion first (bins are contiguous), then reconstruct.
+        // Motion of an earlier PU in this CU is available to later PUs for
+        // spatial merge / AMVP derivation. Store and expose each PU as soon as
+        // its syntax has been decoded; delaying all stores until the second pass
+        // silently removes same-CU candidates and changes decoded MVs.
         let mut motions: [crate::inter::MotionInfo; 4] = Default::default();
         for (i, &(px, py, pw, ph)) in pus.iter().enumerate() {
             let mi = self.decode_prediction_unit(px, py, pw, ph, x0, y0, cb, cb, i);
             motions[i] = mi;
+            self.store_motion(px, py, pw, ph, mi);
+            self.mark_decoded_rect(px, py, pw, ph);
         }
         for (i, &(px, py, pw, ph)) in pus.iter().enumerate() {
             self.motion_compensate(px, py, pw, ph, &motions[i]);
-            self.store_motion(px, py, pw, ph, motions[i]);
         }
         let _ = npus;
 
@@ -4928,14 +5070,19 @@ impl<'cab> FullDecoder<'cab> {
         let mut lead = 0u32;
         while self.cab.decode_bypass() != 0 {
             lead += 1;
-            if lead > 31 {
+            if lead > 30 {
                 break;
             }
         }
-        for _ in 0..(lead + k) {
+        let total = lead + k;
+        for _ in 0..total {
             value = (value << 1) | self.cab.decode_bypass() as u32;
         }
-        value + ((1u32 << (lead + k)) - (1u32 << k))
+        // Guard the shifts: a CABAC desync can drive `total` up to the cap, and
+        // `1 << 32` is UB/panics. Saturate instead of overflowing.
+        let hi = 1u32.checked_shl(total).unwrap_or(0);
+        let lo = 1u32 << k;
+        value.wrapping_add(hi.wrapping_sub(lo))
     }
 
     /// Motion-compensate a PU into the reconstruction planes.
@@ -5913,8 +6060,10 @@ fn ceil_log2(n: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ceil_log2, clamp_qpy, derive_qpy_from_delta, peek_slice_pps_id, qp_prime, qpc, qpy_min,
+        ceil_log2, clamp_qpy, derive_qpy_from_delta, fill_slice_owner_rect, inter_motion_differs,
+        peek_slice_pps_id, promote_first_slice_owners, qp_prime, qpc, qpy_min,
     };
+    use crate::inter::{MotionInfo, Mv, PredFlags};
 
     // Build a slice-header prefix: 2-byte NAL header, first_slice flag,
     // [no_output_of_prior_pics if IRAP], then pps_id as ue(v). Values are packed
@@ -6002,5 +6151,61 @@ mod tests {
         assert_eq!(derive_qpy_from_delta(51, 0, 8), 51);
         assert!((qpy_min(12)..=51).contains(&derive_qpy_from_delta(i32::MAX, i32::MAX, 12)));
         assert!((qpy_min(12)..=51).contains(&derive_qpy_from_delta(i32::MIN, i32::MIN, 12)));
+    }
+
+    #[test]
+    fn second_slice_ctb_is_owned_before_cu_completion() {
+        // 8x4 metadata cells represent a 32x16 picture. Pretend the left half
+        // already belongs to slice 1, then pre-tag the right CTB for slice 2.
+        // Intra PU mode derivation inside that CTB must see owner 2 even though
+        // no CU has been marked decoded yet.
+        let mut owners = vec![1u16; 8 * 4];
+        fill_slice_owner_rect(&mut owners, 8, 4, 16, 0, 16, 16, 2);
+
+        for row in owners.chunks_exact(8) {
+            assert_eq!(&row[..4], &[1, 1, 1, 1]);
+            assert_eq!(&row[4..], &[2, 2, 2, 2]);
+        }
+    }
+
+    #[test]
+    fn second_slice_promotes_only_decoded_first_slice_cells() {
+        let decoded = [true, false, true, true];
+        let mut owners = [0, 0, 0, 7];
+        promote_first_slice_owners(&decoded, &mut owners);
+        assert_eq!(owners, [1, 0, 1, 7]);
+    }
+
+    #[test]
+    fn deblock_motion_compares_l1_and_crossed_lists() {
+        let l1_a = MotionInfo {
+            pred: PredFlags {
+                l0: false,
+                l1: true,
+            },
+            mv: [Mv::default(), Mv::new(4, 0)],
+            ref_idx: [-1, 0],
+            ref_poc: [0, -1],
+            ..Default::default()
+        };
+        let l1_b = MotionInfo {
+            mv: [Mv::default(), Mv::new(8, 0)],
+            ..l1_a
+        };
+        assert!(inter_motion_differs(&l1_a, &l1_b));
+
+        // The same valid POC (-1) may appear in opposite lists. It must not be
+        // confused with an unused-list sentinel, and equal crossed motion is bS 0.
+        let l0 = MotionInfo {
+            pred: PredFlags {
+                l0: true,
+                l1: false,
+            },
+            mv: [Mv::new(4, 0), Mv::default()],
+            ref_idx: [0, -1],
+            ref_poc: [-1, 0],
+            ..Default::default()
+        };
+        assert!(!inter_motion_differs(&l0, &l1_a));
     }
 }

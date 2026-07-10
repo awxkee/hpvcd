@@ -257,25 +257,32 @@ fn temporal_merge<N: Neighbors>(
     let ref0_poc = list0.first().map(|r| r.poc).unwrap_or(cur_poc);
     let mv0 = br
         .and_then(|b| nb.temporal(b.0, b.1, 0, ref0_poc, cur_poc))
-        .or_else(|| nb.temporal(ctr.0, ctr.1, 0, ref0_poc, cur_poc))?;
-    let mut cand = MergeCand {
-        pred: PredFlags {
-            l0: true,
-            l1: false,
-        },
-        mv: [mv0, Mv::default()],
-        ref_idx: [0, -1],
-    };
-    if pu.is_b {
+        .or_else(|| nb.temporal(ctr.0, ctr.1, 0, ref0_poc, cur_poc));
+    let mv1 = if pu.is_b {
         let ref1_poc = list1.first().map(|r| r.poc).unwrap_or(cur_poc);
-        if let Some(mv1) = br
-            .and_then(|b| nb.temporal(b.0, b.1, 1, ref1_poc, cur_poc))
+        br.and_then(|b| nb.temporal(b.0, b.1, 1, ref1_poc, cur_poc))
             .or_else(|| nb.temporal(ctr.0, ctr.1, 1, ref1_poc, cur_poc))
-        {
-            cand.pred.l1 = true;
-            cand.mv[1] = mv1;
-            cand.ref_idx[1] = 0;
-        }
+    } else {
+        None
+    };
+    if mv0.is_none() && mv1.is_none() {
+        return None;
+    }
+
+    let mut cand = MergeCand {
+        pred: PredFlags::default(),
+        mv: [Mv::default(); 2],
+        ref_idx: [-1; 2],
+    };
+    if let Some(mv0) = mv0 {
+        cand.pred.l0 = true;
+        cand.mv[0] = mv0;
+        cand.ref_idx[0] = 0;
+    }
+    if let Some(mv1) = mv1 {
+        cand.pred.l1 = true;
+        cand.mv[1] = mv1;
+        cand.ref_idx[1] = 0;
     }
     Some(cand)
 }
@@ -517,6 +524,37 @@ impl MotionInfo {
 mod tests {
     use super::*;
 
+    struct L1OnlyTemporal;
+
+    impl Neighbors for L1OnlyTemporal {
+        fn motion_at(&self, _x: isize, _y: isize) -> Option<MotionInfo> {
+            None
+        }
+
+        fn available(&self, _x: isize, _y: isize) -> bool {
+            false
+        }
+
+        fn temporal(
+            &self,
+            _x: usize,
+            _y: usize,
+            list: usize,
+            _ref_poc: i32,
+            _cur_poc: i32,
+        ) -> Option<Mv> {
+            (list == 1).then_some(Mv::new(12, -4))
+        }
+
+        fn cur_poc(&self) -> i32 {
+            8
+        }
+
+        fn ctb_log2(&self) -> u32 {
+            6
+        }
+    }
+
     #[test]
     fn scale_identity_when_equal_dist() {
         let mv = Mv::new(10, -6);
@@ -530,5 +568,41 @@ mod tests {
         // col_dist 8, cur_dist 4 -> factor ~0.5
         let s = scale_mv(mv, 8, 4);
         assert!((s.x - 8).abs() <= 1);
+    }
+
+    #[test]
+    fn temporal_merge_keeps_l1_only_candidate() {
+        let pu = PuGeom {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+            is_b: true,
+            part_idx: 0,
+            cu_w: 16,
+            cu_h: 16,
+            par_mrg_level: 2,
+        };
+        let refs0 = [RefEntry {
+            _dpb_index: 0,
+            poc: 4,
+            long_term: false,
+        }];
+        let refs1 = [RefEntry {
+            _dpb_index: 1,
+            poc: 12,
+            long_term: false,
+        }];
+
+        let cand = temporal_merge(&L1OnlyTemporal, &pu, &refs0, &refs1).unwrap();
+        assert_eq!(
+            cand.pred,
+            PredFlags {
+                l0: false,
+                l1: true
+            }
+        );
+        assert_eq!(cand.mv, [Mv::default(), Mv::new(12, -4)]);
+        assert_eq!(cand.ref_idx, [-1, 0]);
     }
 }
