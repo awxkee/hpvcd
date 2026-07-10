@@ -123,11 +123,20 @@ pub(crate) struct FullDecoder<'cab> {
     /// coefficient BS-1 condition applies only at transform edges.
     tu_edge_v: crate::plane::Plane<bool>,
     tu_edge_h: crate::plane::Plane<bool>,
+    /// Per-4×4 prediction-unit boundary flags. Inter PU edges that are not also
+    /// TU edges still get a boundary-strength evaluation (§8.7.2.4); marking them
+    /// separately lets `finalize_coeff_bs` cover PU-only edges.
+    pu_edge_v: crate::plane::Plane<bool>,
+    pu_edge_h: crate::plane::Plane<bool>,
     /// Per-4×4-luma slice index, used to gate cross-slice filtering when
     /// `loop_filter_across_slices` is disabled.
     slice_idx: crate::plane::Plane<u16>,
     /// Current slice index being decoded (incremented per independent segment).
     cur_slice_idx: u16,
+    /// slice_loop_filter_across_slices_enabled_flag per slice index. Index 0 is
+    /// unused (slice indices start at 1); grows as slices are decoded so a
+    /// boundary can consult the flag of the slice that owns it (§8.7.1).
+    slice_lf_across: Vec<bool>,
     cu_tqb: bool,  // current CU's cu_transquant_bypass_flag
     grid_w: usize, // ceil(w/4), one entry for every covered 4×4 luma grid cell
     #[allow(dead_code)]
@@ -347,8 +356,15 @@ impl FullDecoder<'static> {
             nz_coeff: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             tu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             tu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            pu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
+            pu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             slice_idx: crate::plane::Plane::owned(vec![0u16; grid_w * grid_h]),
             cur_slice_idx: 1,
+            // Index 0 unused; index 1 is the first (independent) slice.
+            slice_lf_across: vec![
+                hdr.slice_loop_filter_across_slices,
+                hdr.slice_loop_filter_across_slices,
+            ],
             cu_tqb: false,
             ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
             grid_w,
@@ -422,6 +438,14 @@ impl<'cab> FullDecoder<'cab> {
         if !hdr.dependent_slice_segment {
             // Independent segment: reset entropy contexts and slice-level state.
             self.cur_slice_idx = self.cur_slice_idx.wrapping_add(1);
+            // Record this slice's loop_filter_across_slices flag so boundary
+            // filtering can consult the owning slice (§8.7.1).
+            let idx = self.cur_slice_idx as usize;
+            if self.slice_lf_across.len() <= idx {
+                self.slice_lf_across
+                    .resize(idx + 1, hdr.slice_loop_filter_across_slices);
+            }
+            self.slice_lf_across[idx] = hdr.slice_loop_filter_across_slices;
             let slice_qp = clamp_qpy(hdr.slice_qp, self.bd);
             self.slice_qp = slice_qp;
             self.qp_y_prev = slice_qp;
@@ -1079,7 +1103,8 @@ impl<'cab> FullDecoder<'cab> {
             pcm: &self.pcm[..],
             slice_idx: &self.slice_idx[..],
             pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
-            loop_filter_across_slices: self.pps.loop_filter_across_slices,
+            loop_filter_across_slices: self.pps.loop_filter_across_slices
+                && self.slice_lf_across.iter().all(|&f| f),
             tile_grid: match &self.tiles {
                 Some(g) if !g.loop_filter_across_tiles => Some(g.clone()),
                 _ => None,
@@ -1145,11 +1170,18 @@ impl<'cab> FullDecoder<'cab> {
         if self.sps.pcm_loop_filter_disabled && (self.pcm_at(pxp, pyp) || self.pcm_at(pxq, pyq)) {
             return false;
         }
-        // Cross-slice filtering: if disabled and the two sides are in different
-        // slices, do not filter (§8.7.1).
-        if !self.pps.loop_filter_across_slices {
+        // Cross-slice filtering: disabled when the current (q-side) slice's
+        // slice_loop_filter_across_slices_enabled_flag is 0 and the two sides
+        // are in different slices (§8.7.1). The flag is per-slice, so consult
+        // the slice that owns the q sample rather than the PPS default.
+        let sq = self.slice_idx_at(pxq, pyq);
+        let q_across = self
+            .slice_lf_across
+            .get(sq as usize)
+            .copied()
+            .unwrap_or(self.pps.loop_filter_across_slices);
+        if !q_across {
             let sp = self.slice_idx_at(pxp, pyp);
-            let sq = self.slice_idx_at(pxq, pyq);
             if sp != sq {
                 return false;
             }
@@ -1521,6 +1553,11 @@ impl<'cab> FullDecoder<'cab> {
     /// availability (§8.7.3.2). False for the common single-slice, no-tile,
     /// no-PCM picture, where the fast SIMD/scalar EO path is exact.
     fn sao_boundary_restricted(&self) -> bool {
+        // Any slice (not just the PPS default) may disable cross-slice
+        // filtering; if so, SAO must take the boundary-aware path.
+        if self.slice_lf_across.iter().any(|&f| !f) {
+            return true;
+        }
         if !self.pps.loop_filter_across_slices {
             return true;
         }
@@ -1549,7 +1586,8 @@ impl<'cab> FullDecoder<'cab> {
             slice_idx: &self.slice_idx[..],
             tqb: &self.tqb[..],
             pcm: &self.pcm[..],
-            loop_filter_across_slices: self.pps.loop_filter_across_slices,
+            loop_filter_across_slices: self.pps.loop_filter_across_slices
+                && self.slice_lf_across.iter().all(|&f| f),
             pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
             tile_grid: self.tiles.as_ref(),
         }
@@ -2059,6 +2097,42 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
+    /// Mark an internal prediction-unit vertical boundary (left edge of a PU
+    /// that starts inside its CU) so `finalize_coeff_bs` evaluates its inter
+    /// boundary strength even if it is not a transform edge.
+    fn mark_pu_edge_v(&mut self, x0: usize, y0: usize, height: usize) {
+        if x0 == 0 || x0 >= self.w {
+            return;
+        }
+        let gw = self.grid_w;
+        let gx = x0 / 4;
+        let y_end = (y0 + height).min(self.h);
+        let mut g = (y0 / 4) * gw + gx;
+        let mut yy = y0;
+        while yy < y_end {
+            self.pu_edge_v[g] = true;
+            g += gw;
+            yy += 4;
+        }
+    }
+
+    /// Mark an internal prediction-unit horizontal boundary (top edge of a PU
+    /// that starts inside its CU).
+    fn mark_pu_edge_h(&mut self, x0: usize, y0: usize, width: usize) {
+        if y0 == 0 || y0 >= self.h {
+            return;
+        }
+        let gw = self.grid_w;
+        let x_end = (x0 + width).min(self.w);
+        let mut g = (y0 / 4) * gw + x0 / 4;
+        let mut xx = x0;
+        while xx < x_end {
+            self.pu_edge_h[g] = true;
+            g += 1;
+            xx += 4;
+        }
+    }
+
     /// Record that the transform block at (x0,y0) carries nonzero luma
     /// coefficients, over its whole 4×4-grid footprint.
     fn set_nz_coeff(&mut self, x0: usize, y0: usize, size: usize) {
@@ -2126,13 +2200,18 @@ impl<'cab> FullDecoder<'cab> {
             let row = gy * gw;
             for gx in 0..gw {
                 let g = row + gx;
-                if gx > 0 && self.tu_edge_v[g] {
+                let v_edge = self.tu_edge_v[g] || self.pu_edge_v[g];
+                if gx > 0 && v_edge {
                     if self.bs_v[g] < 2
                         && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - 1))
                     {
                         self.bs_v[g] = 2;
                         self.edge_v[g] = true;
-                    } else if self.bs_v[g] < 1 && (self.nz_coeff[g] || self.nz_coeff[g - 1]) {
+                    } else if self.bs_v[g] < 1
+                        && self.tu_edge_v[g]
+                        && (self.nz_coeff[g] || self.nz_coeff[g - 1])
+                    {
+                        // Coefficient-based bS is a transform-edge property.
                         self.bs_v[g] = 1;
                         self.edge_v[g] = true;
                     } else if self.bs_v[g] < 1
@@ -2143,13 +2222,17 @@ impl<'cab> FullDecoder<'cab> {
                         self.edge_v[g] = true;
                     }
                 }
-                if gy > 0 && self.tu_edge_h[g] {
+                let h_edge = self.tu_edge_h[g] || self.pu_edge_h[g];
+                if gy > 0 && h_edge {
                     if self.bs_h[g] < 2
                         && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - gw))
                     {
                         self.bs_h[g] = 2;
                         self.edge_h[g] = true;
-                    } else if self.bs_h[g] < 1 && (self.nz_coeff[g] || self.nz_coeff[g - gw]) {
+                    } else if self.bs_h[g] < 1
+                        && self.tu_edge_h[g]
+                        && (self.nz_coeff[g] || self.nz_coeff[g - gw])
+                    {
                         self.bs_h[g] = 1;
                         self.edge_h[g] = true;
                     } else if self.bs_h[g] < 1
@@ -3711,8 +3794,14 @@ impl RowFactory {
             nz_coeff: mkb(self.nz_coeff),
             tu_edge_v: mkb(self.tu_edge_v),
             tu_edge_h: mkb(self.tu_edge_h),
+            // WPP rows are intra I-slices with no inter PU edges.
+            pu_edge_v: crate::plane::Plane::owned(vec![false; self.grid_w * self.grid_h]),
+            pu_edge_h: crate::plane::Plane::owned(vec![false; self.grid_w * self.grid_h]),
             slice_idx: mku16(self.slice_idx),
             cur_slice_idx: 1,
+            // WPP rows belong to a single slice; cross-slice filtering is not
+            // gated within a wavefront. Default both entries to "allow".
+            slice_lf_across: vec![true, true],
             cu_tqb: false,
             grid_w: self.grid_w,
             grid_h: self.grid_h,
@@ -4229,6 +4318,17 @@ impl<'cab> FullDecoder<'cab> {
         let part = self.decode_part_mode_inter(log2_cb);
         let pus = part.pu_rects(x0, y0, cb);
         let npus = pus.len();
+        // Mark the internal prediction-unit split boundaries so their boundary
+        // strength is evaluated even when they don't coincide with a TU edge
+        // (§8.7.2.4 applies at PU *and* TU edges).
+        for &(px, py, pw, ph) in pus.iter() {
+            if px > x0 {
+                self.mark_pu_edge_v(px, py, ph);
+            }
+            if py > y0 {
+                self.mark_pu_edge_h(px, py, pw);
+            }
+        }
         // Parse all PUs' motion first (bins are contiguous), then reconstruct.
         let mut motions: [crate::inter::MotionInfo; 4] = Default::default();
         for (i, &(px, py, pw, ph)) in pus.iter().enumerate() {
@@ -4402,8 +4502,6 @@ impl<'cab> FullDecoder<'cab> {
             h: ph,
             is_b: self.slice_type == crate::inter::SLICE_B,
             part_idx,
-            cu_x: cux,
-            cu_y: cuy,
             cu_w: cuw,
             cu_h: cuh,
             par_mrg_level,
@@ -4494,7 +4592,7 @@ impl<'cab> FullDecoder<'cab> {
 
         if use_l0 {
             let (mv, ridx, poc) =
-                self.decode_mvd_amvp(px, py, pw, ph, cux, cuy, cuw, cuh, part_idx, 0, false);
+                self.decode_mvd_amvp(px, py, pw, ph, cuw, cuh, part_idx, 0, false);
             mi.mv[0] = mv;
             mi.ref_idx[0] = ridx as i8;
             mi.ref_poc[0] = poc;
@@ -4503,8 +4601,7 @@ impl<'cab> FullDecoder<'cab> {
         }
         if use_l1 {
             let zero = self.mvd_l1_zero && use_l0;
-            let (mv, ridx, poc) =
-                self.decode_mvd_amvp(px, py, pw, ph, cux, cuy, cuw, cuh, part_idx, 1, zero);
+            let (mv, ridx, poc) = self.decode_mvd_amvp(px, py, pw, ph, cuw, cuh, part_idx, 1, zero);
             mi.mv[1] = mv;
             mi.ref_idx[1] = ridx as i8;
             mi.ref_poc[1] = poc;
@@ -4541,8 +4638,6 @@ impl<'cab> FullDecoder<'cab> {
         py: usize,
         pw: usize,
         ph: usize,
-        cux: usize,
-        cuy: usize,
         cuw: usize,
         cuh: usize,
         part_idx: usize,
@@ -4581,8 +4676,6 @@ impl<'cab> FullDecoder<'cab> {
             h: ph,
             is_b: self.slice_type == crate::inter::SLICE_B,
             part_idx,
-            cu_x: cux,
-            cu_y: cuy,
             cu_w: cuw,
             cu_h: cuh,
             par_mrg_level: self.pps.log2_parallel_merge_level,
@@ -4847,7 +4940,19 @@ impl<'cab> FullDecoder<'cab> {
                             uni_mc(src, w, h, valid_w, valid_h, bd, dst, dst_stride);
                         }
                     }
-                    (false, false) => {}
+                    (false, false) => {
+                        // No usable reference (e.g. a reference missing during
+                        // random access). Write the defined mid-grey
+                        // "unavailable reference" value (§8.3.3) instead of
+                        // leaving stale/zero luma so output is deterministic.
+                        let gray = 1u16 << bd.saturating_sub(1);
+                        for r in 0..valid_h {
+                            let row = r * dst_stride;
+                            for c in 0..valid_w {
+                                dst[row + c] = gray;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5025,7 +5130,16 @@ impl<'cab> FullDecoder<'cab> {
                             uni_mc(src, cw, ch, valid_w, valid_h, bd_c, dst, c_stride);
                         }
                     }
-                    (false, false) => {}
+                    (false, false) => {
+                        // Missing chroma reference: defined mid-grey (§8.3.3).
+                        let gray = 1u16 << bd_c.saturating_sub(1);
+                        for r in 0..valid_h {
+                            let row = r * c_stride;
+                            for cc in 0..valid_w {
+                                dst[row + cc] = gray;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5175,7 +5289,7 @@ pub(crate) struct SliceHeader {
     /// Long-term reference POCs for this picture. Each is (poc_or_lsb,
     /// used_by_curr, has_msb): when `has_msb` the value is a full POC, otherwise
     /// only the POC LSB is known and matching is by LSB.
-    pub(crate) lt_refs: Vec<(i32, bool, bool)>,
+    pub(crate) lt_refs: Vec<(i32, bool, bool, i32)>,
     /// num_ref_idx_l0/l1 active minus nothing (already the active counts).
     pub(crate) num_ref_idx_l0: usize,
     pub(crate) num_ref_idx_l1: usize,
@@ -5195,6 +5309,12 @@ pub(crate) struct SliceHeader {
     pub(crate) max_num_merge_cand: usize,
     /// Weighted-prediction table (luma/chroma weights+offsets), if present.
     pub(crate) pred_weights: Option<crate::inter::PredWeightTable>,
+    /// slice_loop_filter_across_slices_enabled_flag (inherits the PPS default
+    /// when absent). Controls whether the in-loop filters cross this slice's
+    /// boundaries.
+    pub(crate) slice_loop_filter_across_slices: bool,
+    /// pic_output_flag: false suppresses this picture from output.
+    pub(crate) pic_output_flag: bool,
     /// WPP/tiles entry-point sub-stream byte lengths, i.e.
     /// `entry_point_offset_minus1[i] + 1` for each `i`. For WPP these are the
     /// byte lengths of every CTB-row sub-stream except the last (whose length is
@@ -5202,6 +5322,19 @@ pub(crate) struct SliceHeader {
     /// no entry points. Used to position an independent CABAC engine per row for
     /// the parallel wavefront decode.
     pub(crate) entry_points: Vec<u32>,
+}
+
+/// Read just the leading fields of a slice segment header to recover the
+/// pic_parameter_set_id it activates, so the caller can select the matching
+/// PPS/SPS before the full parse (§7.3.6.1). Returns None on a short read.
+pub(crate) fn peek_slice_pps_id(rbsp: &[u8], nal_type: u8) -> Option<u32> {
+    let mut r = crate::bitreader::BitReader::new(rbsp);
+    r.read_bits(16).ok()?; // NAL header
+    r.read_flag().ok()?; // first_slice_segment_in_pic_flag
+    if (16..=23).contains(&nal_type) {
+        r.read_flag().ok()?; // no_output_of_prior_pics_flag
+    }
+    r.read_ue().ok()
 }
 
 /// Parse a slice header from the RBSP (after 2-byte NAL header has been consumed
@@ -5283,6 +5416,8 @@ pub(crate) fn parse_slice_header_full(
             collocated_ref_idx: 0,
             max_num_merge_cand: 5,
             pred_weights: None,
+            slice_loop_filter_across_slices: pps.loop_filter_across_slices,
+            pic_output_flag: true,
         });
     }
 
@@ -5290,8 +5425,10 @@ pub(crate) fn parse_slice_header_full(
         r.read_bit().map_err(|_| e("extra_bits"))?;
     }
     let slice_type = r.read_ue().map_err(|_| e("slice_type"))? as u8;
+    // pic_output_flag: when 0 the picture is decoded but not output (§7.4.7.1).
+    let mut pic_output_flag = true;
     if pps.output_flag_present {
-        r.read_flag().map_err(|_| e("pic_output_flag"))?;
+        pic_output_flag = r.read_flag().map_err(|_| e("pic_output_flag"))?;
     }
     if sps.separate_color_plane {
         r.read_bits(2).map_err(|_| e("color_plane"))?;
@@ -5302,8 +5439,7 @@ pub(crate) fn parse_slice_header_full(
     // POC LSB + reference picture set (§7.3.6.1). IDR pictures have POC 0 and no RPS.
     let mut poc_lsb = 0i32;
     let mut cur_rps = crate::rps::ShortTermRps::default();
-    let mut num_lt = 0usize;
-    let mut lt_refs: Vec<(i32, bool, bool)> = Vec::new();
+    let mut lt_refs: Vec<(i32, bool, bool, i32)> = Vec::new();
     if !is_idr {
         poc_lsb = r
             .read_bits(sps.log2_max_poc_lsb)
@@ -5332,8 +5468,7 @@ pub(crate) fn parse_slice_header_full(
                 0
             };
             let num_lt_pics = r.read_ue().map_err(|_| e("num_lt_pics"))? as usize;
-            num_lt = num_lt_sps + num_lt_pics;
-            let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
+            let num_lt = num_lt_sps + num_lt_pics;
             let mut prev_delta_msb = 0i32;
             for i in 0..num_lt {
                 let (poc_lsb_lt, used) = if i < num_lt_sps {
@@ -5365,12 +5500,14 @@ pub(crate) fn parse_slice_header_full(
                         delta_msb + prev_delta_msb
                     };
                     prev_delta_msb = cycle;
-                    let cur_msb = poc_lsb - (poc_lsb % max_poc_lsb);
-                    let poc = cur_msb - cycle * max_poc_lsb + poc_lsb_lt;
-                    lt_refs.push((poc, used, true));
+                    // The full long-term POC (§8.3.2) needs the current
+                    // picture's full POC, which is not known at parse time; only
+                    // the LSB is. Carry poc_lsb_lt and the delta MSB cycle so the
+                    // DPB can resolve it once the current POC is derived.
+                    lt_refs.push((poc_lsb_lt, used, true, cycle));
                 } else {
                     // No MSB: only the LSB is known; match references by LSB.
-                    lt_refs.push((poc_lsb_lt, used, false));
+                    lt_refs.push((poc_lsb_lt, used, false, 0));
                 }
             }
         }
@@ -5415,7 +5552,13 @@ pub(crate) fn parse_slice_header_full(
         if !is_b {
             num_ref_idx_l1 = 0;
         }
-        let num_pics_total = cur_rps.num_delta_pocs() + num_lt; // pictures usable in lists (approx)
+        // NumPicTotalCurr (§7.4.7.2): the number of reference pictures marked
+        // used_by_curr_pic — the short-term S0/S1 entries whose used flag is set
+        // plus the long-term entries used by the current picture. This (not the
+        // total delta-POC count) sizes the list_entry_lX fixed-length codes.
+        let num_pics_total = cur_rps.used_s0.iter().filter(|&&u| u).count()
+            + cur_rps.used_s1.iter().filter(|&&u| u).count()
+            + lt_refs.iter().filter(|&&(_, used, _, _)| used).count();
         if pps.lists_modification_present && num_pics_total > 1 {
             let bits = ceil_log2(num_pics_total as u64);
             if r.read_flag().map_err(|_| e("ref_pic_list_mod_l0"))? {
@@ -5492,8 +5635,12 @@ pub(crate) fn parse_slice_header_full(
             tc_offset_div2 = r.read_se().map_err(|_| e("tc_off"))?;
         }
     }
+    // slice_loop_filter_across_slices_enabled_flag: per-slice override of the
+    // PPS default; when absent it inherits the PPS value (§7.4.7.1).
+    let mut slice_loop_filter_across_slices = pps.loop_filter_across_slices;
     if pps.loop_filter_across_slices && (sao_luma || sao_chroma || !deblocking_disabled) {
-        r.read_flag()
+        slice_loop_filter_across_slices = r
+            .read_flag()
             .map_err(|_| e("loop_filter_across_slices_flag"))?;
     }
     let mut entry_points: Vec<u32> = Vec::new();
@@ -5548,6 +5695,8 @@ pub(crate) fn parse_slice_header_full(
         collocated_ref_idx,
         max_num_merge_cand,
         pred_weights,
+        slice_loop_filter_across_slices,
+        pic_output_flag,
     })
 }
 
@@ -5569,7 +5718,49 @@ fn ceil_log2(n: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ceil_log2, clamp_qpy, derive_qpy_from_delta, qp_prime, qpc, qpy_min};
+    use super::{
+        ceil_log2, clamp_qpy, derive_qpy_from_delta, peek_slice_pps_id, qp_prime, qpc, qpy_min,
+    };
+
+    // Build a slice-header prefix: 2-byte NAL header, first_slice flag,
+    // [no_output_of_prior_pics if IRAP], then pps_id as ue(v). Values are packed
+    // MSB-first to mirror the bitstream.
+    fn slice_prefix(is_irap: bool, first_slice: bool, pps_id_ue_bits: &[u8]) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        for _ in 0..16 {
+            bits.push(0);
+        } // NAL header (value irrelevant to peek)
+        bits.push(first_slice as u8);
+        if is_irap {
+            bits.push(0);
+        } // no_output_of_prior_pics_flag
+        bits.extend_from_slice(pps_id_ue_bits);
+        // pack to bytes
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, b) in bits.iter().enumerate() {
+            if *b != 0 {
+                out[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn peek_pps_id_zero() {
+        // ue(0) = '1'
+        let buf = slice_prefix(false, true, &[1]);
+        assert_eq!(peek_slice_pps_id(&buf, 1), Some(0));
+    }
+
+    #[test]
+    fn peek_pps_id_nonzero_and_irap_offset() {
+        // ue(1) = '0 1 0'; with an IRAP the extra no_output flag must be skipped.
+        let buf = slice_prefix(true, true, &[0, 1, 0]);
+        assert_eq!(peek_slice_pps_id(&buf, 19), Some(1)); // 19 = IDR_W_RADL
+        // ue(2) = '0 1 1'
+        let buf2 = slice_prefix(false, false, &[0, 1, 1]);
+        assert_eq!(peek_slice_pps_id(&buf2, 1), Some(2));
+    }
 
     #[test]
     fn ceil_log2_matches_slice_address_widths() {

@@ -33,6 +33,8 @@ use crate::fmt::{BitDepth, ChromaFormat};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Sps {
+    /// seq_parameter_set_id (0..15).
+    pub(crate) id: u32,
     pub(crate) chroma_idc: u8,
     pub(crate) chroma: ChromaFormat,
     pub(crate) separate_color_plane: bool,
@@ -86,6 +88,9 @@ pub(crate) struct Sps {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Pps {
+    /// pic_parameter_set_id (0..63) and the seq_parameter_set_id it references.
+    pub(crate) id: u32,
+    pub(crate) sps_id: u32,
     pub(crate) dependent_slice_segments_enabled: bool,
     pub(crate) output_flag_present: bool,
     pub(crate) num_extra_slice_header_bits: u32,
@@ -147,6 +152,8 @@ impl Pps {
     /// All-defaults PPS for unit tests (tiles disabled, no offsets).
     pub(crate) fn test_default() -> Pps {
         Pps {
+            id: 0,
+            sps_id: 0,
             dependent_slice_segments_enabled: false,
             output_flag_present: false,
             num_extra_slice_header_bits: 0,
@@ -409,7 +416,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     r.read_bit().map_err(|_| e("temporal_id_nesting"))?;
     parse_ptl(&mut r, max_sub_layers_minus1)?;
 
-    let _sps_id = r.read_ue().map_err(|_| e("sps_id"))?;
+    let sps_id = r.read_ue().map_err(|_| e("sps_id"))?;
     let chroma_idc = r.read_ue().map_err(|_| e("chroma_idc"))? as u8;
     let separate_color_plane = if chroma_idc == 3 {
         r.read_flag().map_err(|_| e("separate_color_plane"))?
@@ -618,6 +625,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let crop_bottom = crop_bottom.saturating_mul(crop_unit_y);
 
     Ok(Sps {
+        id: sps_id,
         chroma_idc,
         chroma,
         separate_color_plane,
@@ -663,8 +671,8 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
 pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps, DecodeError> {
     let mut r = BitReader::new(rbsp);
-    let _pps_id = r.read_ue().map_err(|_| e("pps_id"))?;
-    let _sps_id = r.read_ue().map_err(|_| e("pps_sps_id"))?;
+    let pps_id = r.read_ue().map_err(|_| e("pps_id"))?;
+    let pps_sps_id = r.read_ue().map_err(|_| e("pps_sps_id"))?;
     let dependent_slice_segments_enabled = r.read_flag().map_err(|_| e("dep_slices"))?;
     let output_flag_present = r.read_flag().map_err(|_| e("output_flag_present"))?;
     let num_extra_slice_header_bits = r.read_bits(3).map_err(|_| e("extra_hdr_bits"))?;
@@ -752,6 +760,8 @@ pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps,
     let slice_segment_header_extension_present = r.read_flag().map_err(|_| e("slice_hdr_ext"))?;
 
     Ok(Pps {
+        id: pps_id,
+        sps_id: pps_sps_id,
         dependent_slice_segments_enabled,
         output_flag_present,
         num_extra_slice_header_bits,

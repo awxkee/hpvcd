@@ -43,8 +43,8 @@ use crate::error::DecodeError;
 #[derive(Clone, Copy)]
 pub(crate) struct Nal<'a> {
     pub(crate) nal_type: u8,
-    pub(crate) _temporal_id: u8,
-    /// Full NAL bytes including the 2-byte NAL header.
+    /// Full NAL bytes including the 2-byte NAL header. TemporalId, when needed,
+    /// is read directly from bytes[1] by the caller.
     pub(crate) bytes: &'a [u8],
 }
 
@@ -56,12 +56,7 @@ impl<'a> Nal<'a> {
         }
         // forbidden_zero_bit(1) type(6) layer_id(6) tid_plus1(3)
         let nal_type = (bytes[0] >> 1) & 0x3f;
-        let temporal_id = (bytes[1] & 0x07).wrapping_sub(1);
-        Some(Nal {
-            nal_type,
-            _temporal_id: temporal_id,
-            bytes,
-        })
+        Some(Nal { nal_type, bytes })
     }
 }
 
@@ -174,10 +169,15 @@ fn trim_trailing_zeros(b: &[u8]) -> &[u8] {
 
 /// HEVC NAL unit type constants (Table 7-1).
 pub(crate) mod nal {
+    pub(crate) const RASL_N: u8 = 8;
+    pub(crate) const RASL_R: u8 = 9;
+    pub(crate) const RADL_N: u8 = 6;
+    pub(crate) const RADL_R: u8 = 7;
     pub(crate) const BLA_W_LP: u8 = 16;
     pub(crate) const BLA_N_LP: u8 = 18;
     pub(crate) const IDR_W_RADL: u8 = 19;
     pub(crate) const IDR_N_LP: u8 = 20;
+    pub(crate) const CRA_NUT: u8 = 21;
     pub(crate) const SPS: u8 = 33;
     pub(crate) const PPS: u8 = 34;
 
@@ -197,14 +197,33 @@ pub(crate) mod nal {
     pub(crate) fn is_bla(t: u8) -> bool {
         (BLA_W_LP..=BLA_N_LP).contains(&t)
     }
+    #[inline]
+    pub(crate) fn is_cra(t: u8) -> bool {
+        t == CRA_NUT
+    }
+    /// RASL (random-access-skipped-leading) picture — decoded after an IRAP but
+    /// output before it; discarded when the IRAP's NoRaslOutputFlag is 1.
+    #[inline]
+    pub(crate) fn is_rasl(t: u8) -> bool {
+        t == RASL_N || t == RASL_R
+    }
+    /// RADL (random-access-decodable-leading) picture.
+    #[inline]
+    pub(crate) fn is_radl(t: u8) -> bool {
+        t == RADL_N || t == RADL_R
+    }
+    /// Sub-layer non-reference (`_N`) VCL types are the even values 0..=14.
+    #[inline]
+    pub(crate) fn is_sub_layer_non_ref(t: u8) -> bool {
+        t <= 14 && t.is_multiple_of(2)
+    }
     /// Reference picture flag: `_R` VCL types and all IRAP are reference.
     #[inline]
     pub(crate) fn is_reference(t: u8) -> bool {
         if t > 31 {
             return false;
         }
-        // Sub-layer non-reference types are the even values 0..=14.
-        !(t <= 14 && t.is_multiple_of(2))
+        !is_sub_layer_non_ref(t)
     }
 }
 

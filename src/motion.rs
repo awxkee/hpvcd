@@ -100,9 +100,8 @@ pub(crate) struct PuGeom {
     pub(crate) is_b: bool,
     /// Part index and mode for the second-PU redundancy checks (§8.5.3.2.1).
     pub(crate) part_idx: usize,
-    /// Top-left of the CU (for redundancy of 2nd PU).
-    pub(crate) cu_x: usize,
-    pub(crate) cu_y: usize,
+    /// CU dimensions, used to classify the 2nd-PU split direction (vertical vs
+    /// horizontal) for the A1/B1 redundancy exclusion.
     pub(crate) cu_w: usize,
     pub(crate) cu_h: usize,
     /// log2 of the parallel merge estimation region size (§7.4.3.3.1). A
@@ -171,7 +170,7 @@ pub(crate) fn derive_merge<N: Neighbors>(
 
     // Combined bi-predictive candidates (B slices).
     if pu.is_b {
-        derive_combined(&mut cands, max_cand);
+        derive_combined(&mut cands, max_cand, list0, list1);
     }
 
     // Zero motion candidates.
@@ -199,10 +198,21 @@ fn spatial<N: Neighbors>(
     pu: &PuGeom,
     pos: SpatialPos,
 ) -> Option<MergeCand> {
-    // Second-PU redundancy: a neighbor inside the same CU's first PU is
-    // unavailable (§8.5.3.2.2). Simplified for common partition shapes.
-    if pu.part_idx == 1 && inside_first_pu(px, py, pu, pos) {
-        return None;
+    // Second-PU redundancy (§8.5.3.2.2, Note 1). Only the A1 and B1 candidates
+    // are dropped, and only for the second PU of a directional split:
+    //   A1 unavailable when partIdx==1 and the CU is split vertically
+    //       (Nx2N / nLx2N / nRx2N: PU narrower than the CU),
+    //   B1 unavailable when partIdx==1 and the CU is split horizontally
+    //       (2NxN / 2NxnU / 2NxnD: PU shorter than the CU).
+    // A0/B0/B2 are never excluded on this ground.
+    if pu.part_idx == 1 {
+        let vertical_split = pu.w < pu.cu_w && pu.h == pu.cu_h;
+        let horizontal_split = pu.h < pu.cu_h && pu.w == pu.cu_w;
+        match pos {
+            SpatialPos::A1 if vertical_split => return None,
+            SpatialPos::B1 if horizontal_split => return None,
+            _ => {}
+        }
     }
     // Parallel merge estimation region (§8.5.3.2.2): a spatial neighbor that
     // falls in the same merge-estimation region as the PU is unavailable, so
@@ -225,16 +235,6 @@ fn spatial<N: Neighbors>(
         return None;
     }
     Some(MergeCand::from_motion(&m))
-}
-
-fn inside_first_pu(px: isize, py: isize, pu: &PuGeom, _pos: SpatialPos) -> bool {
-    // If the neighbor position lies within the CU but before this PU's start,
-    // it belongs to the first PU. Covers Nx2N/2NxN second-PU exclusion.
-    let within_cu = px >= pu.cu_x as isize
-        && px < (pu.cu_x + pu.cu_w) as isize
-        && py >= pu.cu_y as isize
-        && py < (pu.cu_y + pu.cu_h) as isize;
-    within_cu && !(px >= pu.x as isize && py >= pu.y as isize)
 }
 
 fn temporal_merge<N: Neighbors>(
@@ -281,7 +281,12 @@ fn temporal_merge<N: Neighbors>(
 }
 
 /// Combined bi-predictive merge candidates (§8.5.3.2.4).
-fn derive_combined(cands: &mut Vec<MergeCand>, max_cand: usize) {
+fn derive_combined(
+    cands: &mut Vec<MergeCand>,
+    max_cand: usize,
+    list0: &[RefEntry],
+    list1: &[RefEntry],
+) {
     if cands.len() < 2 || cands.len() >= max_cand {
         return;
     }
@@ -299,8 +304,14 @@ fn derive_combined(cands: &mut Vec<MergeCand>, max_cand: usize) {
         let a = cands[i0];
         let b = cands[i1];
         if a.pred.l0 && b.pred.l1 {
-            // Distinct references required.
-            if a.ref_idx[0] != b.ref_idx[1] || a.mv[0] != b.mv[1] {
+            // A combined candidate is added when the two sides reference
+            // different pictures OR have different motion (§8.5.3.2.4). The
+            // comparison is on the referenced *picture* (POC), not the ref
+            // index — the same index in L0 and L1 can point to different
+            // pictures.
+            let poc0 = list0.get(a.ref_idx[0].max(0) as usize).map(|r| r.poc);
+            let poc1 = list1.get(b.ref_idx[1].max(0) as usize).map(|r| r.poc);
+            if poc0 != poc1 || a.mv[0] != b.mv[1] {
                 cands.push(MergeCand {
                     pred: PredFlags { l0: true, l1: true },
                     mv: [a.mv[0], b.mv[1]],
@@ -365,24 +376,30 @@ pub(crate) fn derive_amvp<N: Neighbors>(
     let a_pos = [(x - 1, y + h), (x - 1, y + h - 1)];
     let b_pos = [(x + w, y - 1), (x + w - 1, y - 1), (x - 1, y - 1)];
 
-    // isScaledFlagLX (§8.5.3.2.7 step 5): set when either A block is available
-    // as a *block* — including intra neighbors. It gates whether the B group
-    // may produce a scaled candidate.
-    let is_scaled_flag =
-        nb.available(a_pos[0].0, a_pos[0].1) || nb.available(a_pos[1].0, a_pos[1].1);
+    // isScaledFlagLX (§8.5.3.2.7): set when either A block is available for
+    // motion — an available, non-intra neighbour. An intra A neighbour does not
+    // set the flag (de265 available_pred_blk returns false for intra), which is
+    // what lets the B group produce a *scaled* candidate when A is intra/absent.
+    let a_inter = |px: isize, py: isize| -> bool {
+        nb.available(px, py) && nb.motion_at(px, py).is_some_and(|m| !m.is_intra)
+    };
+    let is_scaled_flag = a_inter(a_pos[0].0, a_pos[0].1) || a_inter(a_pos[1].0, a_pos[1].1);
 
-    // A candidate: same-ref pass over A0/A1, then scaled pass (always allowed).
-    let mut a = amvp_spatial(nb, &a_pos, list, ref_poc, cur_poc, true);
-    // B candidate: same-ref pass only.
-    let mut b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, false);
+    // A candidate: same-POC pass over A0/A1, then same-type (scaled) pass.
+    let mut a = amvp_spatial(nb, &a_pos, list, ref_poc, cur_poc, true, true);
+    // B candidate: same-POC pass only (scaling gated on isScaledFlag below).
+    let mut b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, false, true);
 
     if !is_scaled_flag {
-        // No A blocks: the unscaled B result stands in as the A candidate, and
-        // B is re-derived with scaling permitted.
+        // No motion-available A block: the unscaled same-POC B result stands in
+        // as the A candidate, and B is re-derived taking the first available
+        // neighbour of matching reference type and scaling it (§8.5.3.2.7 step 5).
+        // This re-derivation does NOT repeat the same-POC pass, so a later
+        // same-POC neighbour does not pre-empt an earlier scalable one.
         if a.is_none() {
             a = b;
         }
-        b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, true);
+        b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, true, false);
     }
 
     if let Some(mv) = a {
@@ -426,19 +443,22 @@ fn amvp_spatial<N: Neighbors>(
     ref_poc: i32,
     cur_poc: i32,
     allow_scaled: bool,
+    do_same_ref: bool,
 ) -> Option<Mv> {
-    // First pass: exact ref match (no scaling).
-    for &(px, py) in positions {
-        if !nb.available(px, py) {
-            continue;
-        }
-        if let Some(m) = nb.motion_at(px, py) {
-            if m.is_intra {
+    // First pass: exact ref (same-POC) match, no scaling.
+    if do_same_ref {
+        for &(px, py) in positions {
+            if !nb.available(px, py) {
                 continue;
             }
-            for l in [list, 1 - list] {
-                if m.pred_uses(l) && m.ref_poc[l] == ref_poc {
-                    return Some(m.mv[l]);
+            if let Some(m) = nb.motion_at(px, py) {
+                if m.is_intra {
+                    continue;
+                }
+                for l in [list, 1 - list] {
+                    if m.pred_uses(l) && m.ref_poc[l] == ref_poc {
+                        return Some(m.mv[l]);
+                    }
                 }
             }
         }

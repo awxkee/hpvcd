@@ -29,7 +29,7 @@
 
 use crate::color::Cicp;
 use crate::config::{Pps, Sps, parse_pps, parse_sps};
-use crate::decode::{FullDecoder, parse_slice_header_full};
+use crate::decode::{FullDecoder, SliceHeader, parse_slice_header_full};
 use crate::demux::{Framing, Nal, detect_framing, for_each_nal, nal};
 use crate::dpb::{Dpb, Frame};
 use crate::error::DecodeError;
@@ -369,10 +369,23 @@ pub fn decode_hevc_frame_at(data: &[u8], seconds: f64) -> Result<Option<VideoFra
 /// The struct form lets you reuse one decoder across calls or feed data
 /// incrementally.
 pub struct VideoDecoder {
-    sps: Option<Sps>,
-    pps: Option<Pps>,
+    /// Parameter sets keyed by id. A stream may carry several distinct sets and
+    /// switch between them per picture via slice_pic_parameter_set_id (§7.4.2.4).
+    sps_map: std::collections::HashMap<u32, Sps>,
+    pps_map: std::collections::HashMap<u32, Pps>,
+    /// Most recently parsed SPS id, used to refresh display metadata.
+    last_sps_id: Option<u32>,
     dpb: Dpb,
-    prev_poc: i32,
+    /// POC of the previous picture in decode order with TemporalId 0 that is not
+    /// a RASL/RADL/sub-layer-non-reference picture — the anchor for POC
+    /// derivation (§8.3.1, `prevTid0Pic`).
+    prev_tid0_poc: i32,
+    /// True until the first coded picture of the stream is seen. The first IRAP
+    /// (and any IRAP after an end-of-sequence) has NoRaslOutputFlag = 1.
+    first_picture: bool,
+    /// Set when the previous access unit was an end-of-sequence NAL, so the next
+    /// IRAP is treated as a fresh random-access point.
+    after_eos: bool,
     /// Frames ready for output, in decode order (caller sorts/consumes).
     outputs: Vec<VideoFrame>,
     /// First picture seen (POC anchor).
@@ -411,10 +424,13 @@ impl VideoDecoder {
     /// parallelism. Use [`VideoDecoder::with_threads`] to pin the worker count.
     pub fn new() -> Self {
         VideoDecoder {
-            sps: None,
-            pps: None,
+            sps_map: std::collections::HashMap::new(),
+            pps_map: std::collections::HashMap::new(),
+            last_sps_id: None,
             dpb: Dpb::new(16),
-            prev_poc: 0,
+            prev_tid0_poc: 0,
+            first_picture: true,
+            after_eos: false,
             outputs: Vec::new(),
             seen_first: false,
             cur_meta: FrameMeta::default(),
@@ -428,10 +444,13 @@ impl VideoDecoder {
     /// Output is bit-identical regardless of thread count.
     pub fn with_threads(threads: usize) -> Self {
         VideoDecoder {
-            sps: None,
-            pps: None,
+            sps_map: std::collections::HashMap::new(),
+            pps_map: std::collections::HashMap::new(),
+            last_sps_id: None,
             dpb: Dpb::new(16),
-            prev_poc: 0,
+            prev_tid0_poc: 0,
+            first_picture: true,
+            after_eos: false,
             outputs: Vec::new(),
             seen_first: false,
             cur_meta: FrameMeta::default(),
@@ -620,7 +639,9 @@ impl VideoDecoder {
     /// Reset mutable decode state so a fresh (re)decode can start at an IRAP.
     fn reset_decode_state(&mut self) {
         self.dpb = Dpb::new(16);
-        self.prev_poc = 0;
+        self.prev_tid0_poc = 0;
+        self.first_picture = true;
+        self.after_eos = false;
         self.outputs.clear();
         self.seen_first = false;
     }
@@ -668,12 +689,11 @@ impl VideoDecoder {
     /// whose POC is <= the target. Derives POC cheaply by parsing slice headers
     /// only (no pixel reconstruction).
     fn irap_at_or_before_target(&self, aus: &[Vec<(u8, Vec<u8>)>], target_poc: i32) -> usize {
-        let (sps, pps) = match (self.sps.as_ref(), self.pps.as_ref()) {
-            (Some(s), Some(p)) => (s, p),
-            _ => return 0,
-        };
-        let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
-        let mut prev_poc = 0i32;
+        if self.sps_map.is_empty() || self.pps_map.is_empty() {
+            return 0;
+        }
+        let mut prev_tid0 = 0i32;
+        let mut first_pic = true;
         let mut best = 0usize;
         let mut have_best = false;
         for (i, au) in aus.iter().enumerate() {
@@ -681,19 +701,38 @@ impl VideoDecoder {
             let Some((nal_type, bytes)) = au.iter().find(|(t, _)| nal::is_vcl(*t)) else {
                 continue;
             };
+            let nt = *nal_type;
             let rbsp = crate::bitreader::unescape_rbsp(bytes);
-            let poc = match parse_slice_header_full(&rbsp, sps, pps, *nal_type) {
+            // Resolve the parameter-set chain this slice activates.
+            let Some((sps, pps)) = crate::decode::peek_slice_pps_id(&rbsp, nt)
+                .and_then(|pid| self.pps_map.get(&pid))
+                .and_then(|pps| self.sps_map.get(&pps.sps_id).map(|sps| (sps, pps)))
+            else {
+                continue;
+            };
+            let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
+            let tid = bytes
+                .get(1)
+                .map(|b| (b & 0x07).wrapping_sub(1))
+                .unwrap_or(0);
+            // NoRaslOutputFlag: IDR/BLA always; CRA only as the first picture.
+            let no_rasl = nal::is_idr(nt) || nal::is_bla(nt) || (nal::is_cra(nt) && first_pic);
+            let poc = match parse_slice_header_full(&rbsp, sps, pps, nt) {
                 Ok(h) => {
-                    if nal::is_idr(*nal_type) {
-                        0
+                    if nal::is_irap(nt) && no_rasl {
+                        if nal::is_idr(nt) { 0 } else { h.poc_lsb }
                     } else {
-                        derive_poc(h.poc_lsb, prev_poc, max_poc_lsb, nal::is_irap(*nal_type))
+                        derive_poc(h.poc_lsb, prev_tid0, max_poc_lsb, false)
                     }
                 }
-                Err(_) => prev_poc,
+                Err(_) => prev_tid0,
             };
-            prev_poc = poc;
-            if nal::is_irap(*nal_type) {
+            if tid == 0 && !nal::is_rasl(nt) && !nal::is_radl(nt) && !nal::is_sub_layer_non_ref(nt)
+            {
+                prev_tid0 = poc;
+            }
+            first_pic = false;
+            if nal::is_irap(nt) {
                 if poc <= target_poc {
                     best = i;
                     have_best = true;
@@ -745,17 +784,30 @@ impl VideoDecoder {
         Ok(())
     }
 
-    /// Peek whether a VCL NAL begins a new picture (first_slice_in_pic).
-    fn is_first_slice(&self, nal_type: u8, bytes: &[u8]) -> bool {
-        let (sps, pps) = match (self.sps.as_ref(), self.pps.as_ref()) {
-            (Some(s), Some(p)) => (s, p),
-            _ => return true,
-        };
+    /// Peek whether a VCL NAL begins a new picture (first_slice_in_pic). This is
+    /// the first bit after the 2-byte NAL header, so no parameter set is needed.
+    fn is_first_slice(&self, _nal_type: u8, bytes: &[u8]) -> bool {
         let rbsp = crate::bitreader::unescape_rbsp(bytes);
-        match parse_slice_header_full(&rbsp, sps, pps, nal_type) {
-            Ok(h) => h.first_slice_in_pic,
-            Err(_) => true,
+        let mut r = crate::bitreader::BitReader::new(&rbsp);
+        if r.read_bits(16).is_err() {
+            return true;
         }
+        r.read_flag().unwrap_or(true)
+    }
+
+    /// Resolve the SPS/PPS chain a slice activates. Peeks the slice's
+    /// pic_parameter_set_id, finds that PPS, then the SPS it references. Also
+    /// refreshes display metadata from the activated SPS. Returns clones so the
+    /// picture decode owns stable copies even if new sets arrive mid-stream.
+    fn activate_params(&mut self, rbsp: &[u8], nal_type: u8) -> Option<(Sps, Pps)> {
+        let pps_id = crate::decode::peek_slice_pps_id(rbsp, nal_type)?;
+        let pps = self.pps_map.get(&pps_id)?.clone();
+        let sps = self.sps_map.get(&pps.sps_id)?.clone();
+        if self.last_sps_id != Some(sps.id) {
+            self.cur_meta = frame_meta_from_sps(&sps);
+            self.last_sps_id = Some(sps.id);
+        }
+        Some((sps, pps))
     }
 
     fn process_non_vcl(&mut self, nal_type: u8, bytes: &[u8]) -> Result<(), DecodeError> {
@@ -764,23 +816,26 @@ impl VideoDecoder {
                 let rbsp = crate::bitreader::unescape_rbsp(&bytes[2..]);
                 if let Ok(sps) = parse_sps(&rbsp) {
                     self.cur_meta = frame_meta_from_sps(&sps);
-                    self.sps = Some(sps);
+                    self.last_sps_id = Some(sps.id);
+                    self.sps_map.insert(sps.id, sps);
                 }
                 Ok(())
             }
             nal::PPS => {
                 let rbsp = crate::bitreader::unescape_rbsp(&bytes[2..]);
-                let sl = self
-                    .sps
-                    .as_ref()
-                    .map(|s| s.scaling_list_enabled)
-                    .unwrap_or(false);
-                if let Ok(pps) = parse_pps(&rbsp, sl) {
-                    self.pps = Some(pps);
+                if let Ok(pps) = parse_pps(&rbsp, false) {
+                    self.pps_map.insert(pps.id, pps);
                 }
                 Ok(())
             }
-            _ => Ok(()), // VPS/SEI/AUD/etc.
+            _ => {
+                // End-of-sequence (36) / end-of-bitstream (37): the next IRAP
+                // begins a fresh random-access period (NoRaslOutputFlag = 1).
+                if nal_type == 36 || nal_type == 37 {
+                    self.after_eos = true;
+                }
+                Ok(())
+            } // VPS/SEI/AUD/etc.
         }
     }
 
@@ -814,9 +869,12 @@ impl VideoDecoder {
         if segs.is_empty() {
             return Ok(());
         }
-        let (sps, pps) = match (self.sps.clone(), self.pps.clone()) {
-            (Some(s), Some(p)) => (s, p),
-            _ => return Ok(()), // no parameter sets yet
+        // Activate the parameter-set chain referenced by this picture's first
+        // slice: slice_pic_parameter_set_id -> PPS -> its seq_parameter_set_id
+        // -> SPS (§7.4.2.4). This lets a stream switch PPS/SPS per picture.
+        let (sps, pps) = match self.activate_params(&segs[0].1, segs[0].0) {
+            Some(pair) => pair,
+            None => return Ok(()), // no matching parameter sets yet
         };
 
         // Parse the first segment's header to set up picture-level state.
@@ -830,25 +888,77 @@ impl VideoDecoder {
             return Ok(());
         }
 
-        // POC derivation (from the first slice of the picture).
+        // --- Picture lifecycle (§8.3.1, Annex C) --------------------------------
         let is_irap = nal::is_irap(first_nal);
         let is_idr = nal::is_idr(first_nal);
-        let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
-        let poc = if is_idr {
-            0
+        let is_bla = nal::is_bla(first_nal);
+        let is_cra = nal::is_cra(first_nal);
+        // TemporalId of this picture (nuh_temporal_id_plus1 - 1).
+        let temporal_id = first_bytes
+            .get(1)
+            .map(|b| (b & 0x07).wrapping_sub(1))
+            .unwrap_or(0);
+
+        // NoRaslOutputFlag: the leading (RASL) pictures of this IRAP cannot be
+        // correctly decoded, so they are discarded. It is 1 for IDR/BLA, and for
+        // a CRA only when it is the first picture of the stream or follows an
+        // end-of-sequence.
+        let no_rasl_output = if is_idr || is_bla {
+            true
+        } else if is_cra {
+            self.first_picture || self.after_eos
         } else {
-            derive_poc(hdr0.poc_lsb, self.prev_poc, max_poc_lsb, is_irap)
+            false
         };
-        if is_idr || nal::is_bla(first_nal) {
-            self.dpb.clear_refs();
+
+        // Skip RASL pictures attached to an IRAP with NoRaslOutputFlag == 1:
+        // their references precede the IRAP and are unavailable (random access).
+        if nal::is_rasl(first_nal) && self.dpb.pending_no_rasl_output() {
+            return Ok(());
         }
+
+        let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
+        // POC (§8.3.1): reset to the LSB at an IRAP with NoRaslOutputFlag == 1
+        // (IDR forces 0); otherwise derive the MSB from the previous Tid0 anchor.
+        let poc = if is_irap && no_rasl_output {
+            if is_idr { 0 } else { hdr0.poc_lsb }
+        } else {
+            derive_poc(hdr0.poc_lsb, self.prev_tid0_poc, max_poc_lsb, false)
+        };
+
+        // At an IRAP that starts a new random-access period (IDR/BLA, or a CRA
+        // with NoRaslOutputFlag == 1), references from the previous period are no
+        // longer usable. The NoRaslOutputFlag is recorded for *every* IRAP so a
+        // mid-stream CRA (NoRaslOutputFlag == 0) does not inherit the previous
+        // period's suppression and its RASL pictures are still output.
+        if is_irap {
+            if (is_idr || is_bla) || (is_cra && no_rasl_output) {
+                self.dpb.clear_refs();
+            }
+            self.dpb.set_no_rasl_output(no_rasl_output);
+        }
+        self.after_eos = false;
+
+        // Apply the RPS reference marking for every non-IDR picture — including
+        // I slices (§8.3.2). A non-IDR I picture still carries an RPS that can
+        // mark older DPB pictures as unused for reference; skipping it would
+        // leave stale references in the DPB. IDR pictures have no RPS (the DPB
+        // was already cleared above).
+        let rps_pocs = if !is_idr {
+            Some(
+                self.dpb
+                    .apply_rps_lt(poc, &hdr0.cur_rps, &hdr0.lt_refs, max_poc_lsb),
+            )
+        } else {
+            None
+        };
 
         // Reference lists (built once per picture from the first slice's RPS).
         let (ref_list0, ref_list1, ref_frames) = if hdr0.slice_type != crate::inter::SLICE_I {
-            let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
-            let pocs = self
-                .dpb
-                .apply_rps_lt(poc, &hdr0.cur_rps, &hdr0.lt_refs, max_poc_lsb);
+            let pocs = rps_pocs.clone().unwrap_or_else(|| {
+                self.dpb
+                    .apply_rps_lt(poc, &hdr0.cur_rps, &hdr0.lt_refs, max_poc_lsb)
+            });
             let is_b = hdr0.slice_type == crate::inter::SLICE_B;
             let (l0, l1) = self.dpb.build_ref_lists(
                 &pocs,
@@ -857,7 +967,7 @@ impl VideoDecoder {
                 is_b,
                 &hdr0.list_mod_l0,
                 &hdr0.list_mod_l1,
-            );
+            )?;
             let frames = self.collect_ref_frames(&l0, &l1);
             (l0, l1, frames)
         } else {
@@ -903,16 +1013,29 @@ impl VideoDecoder {
             d.decode_slice_ctx(hdr0.slice_segment_address, starts0)?;
         }
 
+        // Track the most recent *independent* segment header. A dependent slice
+        // segment carries no reconstruction state of its own — it inherits the
+        // preceding independent segment's slice type, weighted-prediction table,
+        // reference lists, temporal-MVP / collocated settings, chroma QP
+        // offsets, SAO and deblock parameters (§7.4.7.1). Merge those in before
+        // decoding so a dependent P/B segment is not silently treated as an
+        // I segment with no weights.
+        let mut last_indep = hdr0.clone();
         // Decode any remaining segments of the same picture into the same
         // decoder (accumulating the reconstructed planes and motion field).
         for (seg_nal, seg_rbsp, seg_bytes) in segs.iter().skip(1) {
-            let hdr = match parse_slice_header_full(seg_rbsp, &sps, &pps, *seg_nal) {
+            let mut hdr = match parse_slice_header_full(seg_rbsp, &sps, &pps, *seg_nal) {
                 Ok(h) => h,
                 Err(_) => continue,
             };
             if hdr.first_slice_in_pic {
                 // Shouldn't happen (grouping guarantees it), but be safe.
                 continue;
+            }
+            if hdr.dependent_slice_segment {
+                merge_dependent_header(&mut hdr, &last_indep);
+            } else {
+                last_indep = hdr.clone();
             }
             // Rebuild ref lists for independent segments (dependent segments
             // inherit them); reuse the picture's reference frame views.
@@ -929,8 +1052,13 @@ impl VideoDecoder {
                     is_b,
                     &hdr.list_mod_l0,
                     &hdr.list_mod_l1,
+                )?;
+                d.set_inter_state(
+                    poc,
+                    l0.clone(),
+                    l1.clone(),
+                    self.collect_ref_frames(&l0, &l1),
                 );
-                d.set_inter_state(poc, l0, l1, ref_frames.clone());
             }
             let sub: Vec<usize> = if hdr.entry_points.is_empty() {
                 Vec::new()
@@ -944,7 +1072,7 @@ impl VideoDecoder {
                 )
             };
             let cabac = &seg_rbsp[hdr.cabac_offset.min(seg_rbsp.len())..];
-            let _ = d.decode_segment(cabac, &hdr, &sub);
+            d.decode_segment(cabac, &hdr, &sub)?;
         }
 
         // Deblock/SAO once the whole picture is reconstructed, then store it.
@@ -962,10 +1090,19 @@ impl VideoDecoder {
             height4,
             short_term: is_ref,
             long_term: false,
-            needed_for_output: true,
+            needed_for_output: hdr0.pic_output_flag,
         };
         self.dpb.push(frame);
-        self.prev_poc = poc;
+        // Update prevTid0Pic (§8.3.1): only pictures with TemporalId 0 that are
+        // not RASL/RADL/sub-layer-non-reference serve as the POC anchor.
+        if temporal_id == 0
+            && !nal::is_rasl(first_nal)
+            && !nal::is_radl(first_nal)
+            && !nal::is_sub_layer_non_ref(first_nal)
+        {
+            self.prev_tid0_poc = poc;
+        }
+        self.first_picture = false;
         self.seen_first = true;
 
         for f in self.dpb.bump(false) {
@@ -1014,6 +1151,40 @@ impl VideoDecoder {
 }
 
 /// Chroma plane (width, height) for a stored picture, from its chroma format.
+/// Fill a dependent slice segment's header with the reconstruction state it
+/// inherits from the preceding independent segment (§7.4.7.1). The parser leaves
+/// these as placeholders for a dependent segment because they are not coded in
+/// its header; without this a dependent P/B segment would decode as an I segment
+/// with no weighted prediction and no temporal-MVP / collocated state.
+fn merge_dependent_header(dep: &mut SliceHeader, indep: &SliceHeader) {
+    dep.slice_type = indep.slice_type;
+    dep.slice_qp = indep.slice_qp;
+    dep.sao_luma = indep.sao_luma;
+    dep.sao_chroma = indep.sao_chroma;
+    dep.cb_qp_offset = indep.cb_qp_offset;
+    dep.cr_qp_offset = indep.cr_qp_offset;
+    dep.deblocking_disabled = indep.deblocking_disabled;
+    dep.beta_offset_div2 = indep.beta_offset_div2;
+    dep.tc_offset_div2 = indep.tc_offset_div2;
+    dep.cur_rps = indep.cur_rps.clone();
+    dep.lt_refs = indep.lt_refs.clone();
+    dep.num_ref_idx_l0 = indep.num_ref_idx_l0;
+    dep.num_ref_idx_l1 = indep.num_ref_idx_l1;
+    dep.list_mod_l0 = indep.list_mod_l0.clone();
+    dep.list_mod_l1 = indep.list_mod_l1.clone();
+    dep.mvd_l1_zero = indep.mvd_l1_zero;
+    dep.cabac_init = indep.cabac_init;
+    dep.temporal_mvp = indep.temporal_mvp;
+    dep.collocated_from_l0 = indep.collocated_from_l0;
+    dep.collocated_ref_idx = indep.collocated_ref_idx;
+    dep.max_num_merge_cand = indep.max_num_merge_cand;
+    dep.pred_weights = indep.pred_weights.clone();
+    dep.slice_loop_filter_across_slices = indep.slice_loop_filter_across_slices;
+    dep.pic_output_flag = indep.pic_output_flag;
+    // slice_segment_address, cabac_offset, dependent_slice_segment,
+    // first_slice_in_pic and entry_points remain the dependent segment's own.
+}
+
 fn chroma_dims(planes: &YuvPlanes) -> (usize, usize) {
     use crate::fmt::ChromaFormat::*;
     match planes.chroma {

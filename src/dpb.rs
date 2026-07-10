@@ -31,6 +31,7 @@
 //! RefPicList0/RefPicList1 for the current slice, and emits frames in output
 //! (POC) order. Rewritten in safe Rust following de265's `decctx`/`dpb` flow.
 
+use crate::error::DecodeError;
 use crate::inter::MotionInfo;
 use crate::rps::ShortTermRps;
 use crate::yuv::YuvPlanes;
@@ -71,6 +72,9 @@ pub(crate) struct Dpb {
     pub(crate) frames: Vec<Frame>,
     /// Max frames retained before forcing output (from SPS max_dec_pic_buffering).
     max_frames: usize,
+    /// NoRaslOutputFlag of the current random-access period: when true, RASL
+    /// pictures attached to the period's IRAP are discarded.
+    no_rasl_output: bool,
 }
 
 impl Dpb {
@@ -78,7 +82,18 @@ impl Dpb {
         Dpb {
             frames: Vec::new(),
             max_frames: max_frames.max(1),
+            no_rasl_output: false,
         }
+    }
+
+    /// Whether RASL pictures in the current random-access period are suppressed.
+    pub(crate) fn pending_no_rasl_output(&self) -> bool {
+        self.no_rasl_output
+    }
+
+    /// Record the NoRaslOutputFlag for the random-access period just started.
+    pub(crate) fn set_no_rasl_output(&mut self, v: bool) {
+        self.no_rasl_output = v;
     }
 
     /// Clear all references (IDR): frames stay only if still needed for output.
@@ -110,7 +125,7 @@ impl Dpb {
         &mut self,
         cur_poc: i32,
         rps: &ShortTermRps,
-        lt_refs: &[(i32, bool, bool)],
+        lt_refs: &[(i32, bool, bool, i32)],
         max_poc_lsb: i32,
     ) -> RpsPocs {
         let mut before = Vec::new(); // negative delta (used_by_curr)
@@ -136,11 +151,16 @@ impl Dpb {
             }
         }
 
-        // Long-term references: resolve each to a DPB picture's POC (by full POC
-        // when the MSB was signalled, otherwise by POC LSB match).
-        for &(val, used, has_msb) in lt_refs {
-            let matched = if has_msb {
-                self.frames.iter().find(|f| f.poc == val).map(|f| f.poc)
+        // Long-term references: resolve each to a DPB picture's POC. When the
+        // MSB cycle was signalled we can reconstruct the full POC (§8.3.2):
+        //   pocLt = cur_poc - deltaMsbCycle*MaxPocLsb - (cur_poc_lsb - pocLsbLt)
+        // and match by full POC; otherwise only the LSB is known and we match by
+        // LSB. `val` holds poc_lsb_lt and `delta_cycle` the MSB cycle.
+        for &(val, used, has_msb, delta_cycle) in lt_refs {
+            let matched = if has_msb && max_poc_lsb > 0 {
+                let cur_lsb = cur_poc.rem_euclid(max_poc_lsb);
+                let poc_lt = cur_poc - delta_cycle * max_poc_lsb - (cur_lsb - val);
+                self.frames.iter().find(|f| f.poc == poc_lt).map(|f| f.poc)
             } else if max_poc_lsb > 0 {
                 self.frames
                     .iter()
@@ -189,7 +209,7 @@ impl Dpb {
         is_b: bool,
         list_mod_l0: &[u32],
         list_mod_l1: &[u32],
-    ) -> (Vec<RefEntry>, Vec<RefEntry>) {
+    ) -> Result<(Vec<RefEntry>, Vec<RefEntry>), DecodeError> {
         // Temp list0: before (near→far), then after, then long-term.
         let mut temp0: Vec<RefEntry> = Vec::new();
         for &poc in &pocs.before {
@@ -246,13 +266,13 @@ impl Dpb {
             }
         }
 
-        let list0 = finalize_list(&temp0, num_l0, list_mod_l0);
+        let list0 = finalize_list(&temp0, num_l0, list_mod_l0)?;
         let list1 = if is_b {
-            finalize_list(&temp1, num_l1, list_mod_l1)
+            finalize_list(&temp1, num_l1, list_mod_l1)?
         } else {
             Vec::new()
         };
-        (list0, list1)
+        Ok((list0, list1))
     }
 
     /// Emit frames that are no longer needed for reference and are due for output
@@ -311,6 +331,7 @@ impl Frame {
 }
 
 /// POC-sorted RPS partitions for the current picture.
+#[derive(Clone)]
 pub(crate) struct RpsPocs {
     /// used_by_curr negative-delta POCs, nearest first.
     pub(crate) before: Vec<i32>,
@@ -321,15 +342,24 @@ pub(crate) struct RpsPocs {
 }
 
 /// Repeat the temp list to `num` entries, then apply explicit reordering.
-fn finalize_list(temp: &[RefEntry], num: usize, list_mod: &[u32]) -> Vec<RefEntry> {
+fn finalize_list(
+    temp: &[RefEntry],
+    num: usize,
+    list_mod: &[u32],
+) -> Result<Vec<RefEntry>, DecodeError> {
     if temp.is_empty() || num == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    // RefPicListTemp is cyclically extended to at least `num` entries.
-    let mut extended: Vec<RefEntry> = Vec::with_capacity(num.max(temp.len()));
-    while extended.len() < num {
+    // RefPicListTempX is cyclically extended to NumRpsCurrTempListX =
+    // Max(num_ref_idx_active, NumPicTotalCurr) entries (§8.3.4). `temp` already
+    // holds exactly NumPicTotalCurr entries, so extend to Max(num, temp.len());
+    // reference-list-modification indices may address any entry in this full
+    // list, not just the first `num`.
+    let temp_len = num.max(temp.len());
+    let mut extended: Vec<RefEntry> = Vec::with_capacity(temp_len);
+    while extended.len() < temp_len {
         for &e in temp {
-            if extended.len() >= num {
+            if extended.len() >= temp_len {
                 break;
             }
             extended.push(e);
@@ -337,12 +367,19 @@ fn finalize_list(temp: &[RefEntry], num: usize, list_mod: &[u32]) -> Vec<RefEntr
     }
     if list_mod.is_empty() {
         extended.truncate(num);
-        extended
+        Ok(extended)
     } else {
+        // Each list_entry_lX indexes into the full temp list; an out-of-range
+        // index is a bitstream/conformance error rather than something to clamp.
         list_mod
             .iter()
             .take(num)
-            .map(|&idx| extended[(idx as usize).min(extended.len() - 1)])
+            .map(|&idx| {
+                extended
+                    .get(idx as usize)
+                    .copied()
+                    .ok_or_else(|| DecodeError::Bitstream("ref list_entry out of range".into()))
+            })
             .collect()
     }
 }

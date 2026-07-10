@@ -138,6 +138,13 @@ pub(crate) fn parse_short_term_rps(
 
 /// Derive an RPS predicted from `src` (§7.4.8, inter-RPS). Produces S0/S1 lists
 /// ordered as required (S0 descending magnitude of negative deltas, S1 ascending).
+///
+/// The `used_by_curr_pic_flag[j]` / `use_delta_flag[j]` arrays are indexed over
+/// the source set's `NumDeltaPocs + 1` candidates in the order: all source S0
+/// (negative) entries `[0..nNeg)`, all source S1 (positive) entries
+/// `[nNeg..nNeg+nPos)`, then the "frame 0" anchor at the terminal index
+/// `[NumDeltaPocs]`. An entry is included when `use_delta_flag` is set and marked
+/// used-by-curr from `used_by_curr_pic_flag`.
 fn derive_inter_rps(
     src: &ShortTermRps,
     delta_rps: i32,
@@ -147,80 +154,53 @@ fn derive_inter_rps(
     let mut out = ShortTermRps::default();
     let n_neg = src.num_negative();
     let n_pos = src.num_positive();
-    let total = src.num_delta_pocs();
+    let total = src.num_delta_pocs(); // terminal index = anchor ("frame 0")
 
-    // S0 (negative) of the new set: iterate src S1 (reversed) then src's "0" then src S0.
-    // Follows the reference construction: for each candidate combined delta, keep
-    // those that are < 0.
-    // Build combined src delta list in the reference order used by the spec:
-    //   index j in 0..=total maps to: j<n_pos -> src.S1[n_pos-1-j]; j==?; else src.S0
-    // We implement the standard two-pass approach.
-
-    // Pass for S0 (negative results).
-    // j over src positive deltas (reverse), then the implicit "current" (delta 0),
-    // then src negative deltas.
-    // Simpler: enumerate all src deltas plus the zero anchor, compute dPoc.
-    let src_deltas = combined_src_deltas(src);
-    // Negative list.
-    // First, contributions from src S1 reversed (these can become negative when delta_rps<0).
-    for i in (0..n_pos).rev() {
-        let dpoc = src.delta_poc_s1[i] + delta_rps;
-        let uidx = n_neg + 1 + i; // mapping of S1 entries in used[]/use_delta[]
-        if dpoc < 0 && used_or_use(used, use_delta, uidx) {
+    // --- S0 (negative) of the new set, in decreasing POC order:
+    // source S1 reversed, then anchor, then source S0.
+    for j in (0..n_pos).rev() {
+        let dpoc = src.delta_poc_s1[j] + delta_rps;
+        let idx = n_neg + j; // S1 entries live at [nNeg + j]
+        if dpoc < 0 && use_delta.get(idx).copied().unwrap_or(false) {
             out.delta_poc_s0.push(dpoc);
-            out.used_s0.push(used.get(uidx).copied().unwrap_or(false));
+            out.used_s0.push(used.get(idx).copied().unwrap_or(false));
         }
     }
-    // Anchor (delta 0) contributes delta_rps if negative.
-    if delta_rps < 0 && used_or_use(used, use_delta, n_neg) {
+    if delta_rps < 0 && use_delta.get(total).copied().unwrap_or(false) {
         out.delta_poc_s0.push(delta_rps);
-        out.used_s0.push(used.get(n_neg).copied().unwrap_or(false));
+        out.used_s0.push(used.get(total).copied().unwrap_or(false));
     }
-    // src S0 entries.
-    for i in 0..n_neg {
-        let dpoc = src.delta_poc_s0[i] + delta_rps;
-        let uidx = i;
-        if dpoc < 0 && used_or_use(used, use_delta, uidx) {
+    for j in 0..n_neg {
+        let dpoc = src.delta_poc_s0[j] + delta_rps;
+        if dpoc < 0 && use_delta.get(j).copied().unwrap_or(false) {
             out.delta_poc_s0.push(dpoc);
-            out.used_s0.push(used.get(uidx).copied().unwrap_or(false));
+            out.used_s0.push(used.get(j).copied().unwrap_or(false));
         }
     }
 
-    // Positive list (S1).
-    for i in (0..n_neg).rev() {
-        let dpoc = src.delta_poc_s0[i] + delta_rps;
-        let uidx = i;
-        if dpoc > 0 && used_or_use(used, use_delta, uidx) {
+    // --- S1 (positive) of the new set, in increasing POC order:
+    // source S0 reversed, then anchor, then source S1.
+    for j in (0..n_neg).rev() {
+        let dpoc = src.delta_poc_s0[j] + delta_rps;
+        if dpoc > 0 && use_delta.get(j).copied().unwrap_or(false) {
             out.delta_poc_s1.push(dpoc);
-            out.used_s1.push(used.get(uidx).copied().unwrap_or(false));
+            out.used_s1.push(used.get(j).copied().unwrap_or(false));
         }
     }
-    if delta_rps > 0 && used_or_use(used, use_delta, n_neg) {
+    if delta_rps > 0 && use_delta.get(total).copied().unwrap_or(false) {
         out.delta_poc_s1.push(delta_rps);
-        out.used_s1.push(used.get(n_neg).copied().unwrap_or(false));
+        out.used_s1.push(used.get(total).copied().unwrap_or(false));
     }
-    for i in 0..n_pos {
-        let dpoc = src.delta_poc_s1[i] + delta_rps;
-        let uidx = n_neg + 1 + i;
-        if dpoc > 0 && used_or_use(used, use_delta, uidx) {
+    for j in 0..n_pos {
+        let dpoc = src.delta_poc_s1[j] + delta_rps;
+        let idx = n_neg + j;
+        if dpoc > 0 && use_delta.get(idx).copied().unwrap_or(false) {
             out.delta_poc_s1.push(dpoc);
-            out.used_s1.push(used.get(uidx).copied().unwrap_or(false));
+            out.used_s1.push(used.get(idx).copied().unwrap_or(false));
         }
     }
-    let _ = (total, &src_deltas);
+
     out
-}
-
-#[inline]
-fn used_or_use(used: &[bool], use_delta: &[bool], idx: usize) -> bool {
-    used.get(idx).copied().unwrap_or(false) || use_delta.get(idx).copied().unwrap_or(false)
-}
-
-fn combined_src_deltas(src: &ShortTermRps) -> Vec<i32> {
-    let mut v = Vec::with_capacity(src.num_delta_pocs());
-    v.extend_from_slice(&src.delta_poc_s0);
-    v.extend_from_slice(&src.delta_poc_s1);
-    v
 }
 
 /// Derive the picture-order-count of a slice from its `poc_lsb` and the previous
@@ -277,5 +257,60 @@ mod tests {
         assert_eq!(p, 258);
         // irap resets
         assert_eq!(derive_poc(0, 999, max, true), 0);
+    }
+
+    fn src_rps(s0: &[i32], s1: &[i32]) -> ShortTermRps {
+        ShortTermRps {
+            delta_poc_s0: s0.to_vec(),
+            used_s0: vec![true; s0.len()],
+            delta_poc_s1: s1.to_vec(),
+            used_s1: vec![true; s1.len()],
+        }
+    }
+
+    // Inter-RPS prediction (§7.4.8). Flags are indexed over the source set's
+    // NumDeltaPocs+1 candidates: [source S0.. , source S1.. , anchor]. These
+    // expectations follow the HM/de265 reference construction.
+    #[test]
+    fn inter_rps_negative_delta() {
+        // src: S0=[-1,-2], S1=[4]; indices 0->-1,1->-2,2->4,3->anchor.
+        let src = src_rps(&[-1, -2], &[4]);
+        let used = [true, true, true, true];
+        let use_delta = [true, true, true, true];
+        let out = derive_inter_rps(&src, -1, &used, &use_delta);
+        // S0: anchor(-1), then -1-1=-2, -2-1=-3  (S1 reversed 4-1=3 is >0 so not S0)
+        assert_eq!(out.delta_poc_s0, vec![-1, -2, -3]);
+        // S1: only 4-1=3
+        assert_eq!(out.delta_poc_s1, vec![3]);
+    }
+
+    #[test]
+    fn inter_rps_positive_delta() {
+        // src: S0=[-2], S1=[3]; indices 0->-2, 1->3, 2->anchor.
+        let src = src_rps(&[-2], &[3]);
+        let used = [true, true, true];
+        let use_delta = [true, true, true];
+        let out = derive_inter_rps(&src, 2, &used, &use_delta);
+        // S0 (dPoc<0): S1 reversed 3+2=5 (>0, no); anchor 2 (>0, no);
+        //             S0 fwd -2+2=0 (not <0). => empty
+        assert!(out.delta_poc_s0.is_empty());
+        // S1 (dPoc>0): S0 reversed -2+2=0 (no); anchor 2 (>0, yes);
+        //              S1 fwd 3+2=5 (yes). => [2,5]
+        assert_eq!(out.delta_poc_s1, vec![2, 5]);
+    }
+
+    #[test]
+    fn inter_rps_use_delta_excludes_entry() {
+        // With use_delta_flag false for the source S1 entry (index n_neg+0 = 1),
+        // that candidate is dropped from the predicted set.
+        let src = src_rps(&[-1], &[3]);
+        // indices: 0->S0[-1], 1->S1[3], 2->anchor
+        let used = [true, false, true];
+        let use_delta = [true, false, true]; // exclude the S1 entry (idx 1)
+        let out = derive_inter_rps(&src, 1, &used, &use_delta);
+        // S1: S0 reversed -1+1=0 (no); anchor 1 (>0 yes); S1 fwd 3+1=4 but idx1
+        //     use_delta=false -> excluded. => [1]
+        assert_eq!(out.delta_poc_s1, vec![1]);
+        assert!(out.delta_poc_s0.is_empty());
     }
 }
