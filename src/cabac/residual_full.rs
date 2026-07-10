@@ -379,8 +379,7 @@ pub(crate) fn residual_coding(
     let mut c1_carry = 1i32; // greater1 ctx carried across sub-blocks
     let mut first_subblock = true;
 
-    for i in (0..=last_sb).rev() {
-        let (sbx, sby) = sb_scan[i];
+    for (i, &(sbx, sby)) in sb_scan[..=last_sb].iter().enumerate().rev() {
         let sb_grid = sbx + sby * sb_w;
         let right = if sbx + 1 < sb_w {
             ((csbf >> (sb_grid + 1)) & 1) as u8
@@ -425,8 +424,7 @@ pub(crate) fn residual_coding(
             Some(scan_top)
         };
         if let Some(start) = start {
-            for k in (0..=start).rev() {
-                let (px, py) = pos_scan[k];
+            for (k, &(px, py)) in pos_scan[..=start].iter().enumerate().rev() {
                 let xc = (sbx << 2) + px;
                 let yc = (sby << 2) + py;
                 let significant = if k == 0 && infer_dc && sig_len == 0 {

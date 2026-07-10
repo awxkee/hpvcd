@@ -22,7 +22,7 @@ fn main() {
     // .unwrap();
     // iamge.save("./out_v.jpg").unwrap();
 
-    let bytes = fs::read("./assets/IMG_0073.HEIC").unwrap();
+    let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
