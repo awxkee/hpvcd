@@ -187,6 +187,7 @@ fn edge_offset4_sse41(
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
 fn edge_offset8_masked_sse41(
     dst: &[u16; 8],
     samples: &[u16; 8],

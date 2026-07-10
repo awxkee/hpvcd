@@ -473,7 +473,8 @@ impl VideoDecoder {
     }
 
     /// Group the stream into access units, prepending the parameter-set NALs
-    /// that configure each AU so a decode can start at any returned index.
+    /// that configure each AU so a decoded can start at any returned index.
+    #[allow(clippy::type_complexity)]
     fn collect_access_units(
         &mut self,
         data: &[u8],
@@ -532,12 +533,7 @@ impl VideoDecoder {
                     if nal::is_idr(*nal_type) {
                         0
                     } else {
-                        crate::rps::derive_poc(
-                            h.poc_lsb,
-                            prev_poc,
-                            max_poc_lsb,
-                            nal::is_irap(*nal_type),
-                        )
+                        derive_poc(h.poc_lsb, prev_poc, max_poc_lsb, nal::is_irap(*nal_type))
                     }
                 }
                 Err(_) => prev_poc,

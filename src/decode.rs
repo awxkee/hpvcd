@@ -223,6 +223,12 @@ pub(crate) struct FullDecoder<'cab> {
     /// Reference frame planes (cloned Y/Cb/Cr) indexed by DPB index used in
     /// ref lists, supplied by the driver before decoding the slice.
     ref_frames: Vec<crate::inter::RefFramePlanes>,
+    /// Motion-compensation scratch reused for L0/L1 intermediates and separable
+    /// interpolation temporaries. Capacity grows to the largest PU seen and then
+    /// stays hot for subsequent inter blocks.
+    mc_pred0: Vec<i16>,
+    mc_pred1: Vec<i16>,
+    mc_tmp: Vec<i32>,
     chroma_scratch: Box<[u16; 1024]>,
 }
 
@@ -379,7 +385,7 @@ impl FullDecoder<'static> {
             slice_type: hdr.slice_type,
             cabac_init: hdr.cabac_init,
             pred_weights: hdr.pred_weights.clone(),
-            motion: vec![crate::inter::MotionInfo::intra(); grid_w * grid_h],
+            motion: vec![MotionInfo::intra(); grid_w * grid_h],
             ref_list0: Vec::new(),
             ref_list1: Vec::new(),
             cur_poc: 0,
@@ -392,6 +398,9 @@ impl FullDecoder<'static> {
             collocated_from_l0: hdr.collocated_from_l0,
             collocated_ref_idx: hdr.collocated_ref_idx,
             ref_frames: Vec::new(),
+            mc_pred0: Vec::new(),
+            mc_pred1: Vec::new(),
+            mc_tmp: Vec::new(),
             sps,
             pps,
             chroma_scratch: Box::new([0; 1024]),
@@ -3647,6 +3656,9 @@ impl RowFactory {
             collocated_from_l0: true,
             collocated_ref_idx: 0,
             ref_frames: Vec::new(),
+            mc_pred0: Vec::new(),
+            mc_pred1: Vec::new(),
+            mc_tmp: Vec::new(),
             chroma_scratch: Box::new([0; 1024]),
         })
     }
@@ -3787,8 +3799,6 @@ fn dequantize_transform_skip_scaled_into_i16(
     }
 }
 
-// ===================== Inter prediction (video) =====================
-
 /// Inter CU partition modes (§7.4.9.5).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InterPartMode {
@@ -3825,10 +3835,10 @@ impl InterPartMode {
     }
 }
 
-/// Neighbour-motion accessor bridging the FullDecoder's per-4x4 motion field and
+/// Neighbor-motion accessor bridging the FullDecoder's per-4x4 motion field and
 /// reference frames to the `motion` derivation module.
-struct DecoderNeighbours<'a> {
-    motion: &'a [crate::inter::MotionInfo],
+struct DecoderNeighbors<'a> {
+    motion: &'a [MotionInfo],
     decoded: &'a crate::plane::Plane<bool>,
     slice_idx: &'a crate::plane::Plane<u16>,
     cur_slice: u16,
@@ -3843,7 +3853,7 @@ struct DecoderNeighbours<'a> {
     collocated_ref_idx: usize,
 }
 
-impl<'a> DecoderNeighbours<'a> {
+impl<'a> DecoderNeighbors<'a> {
     #[inline]
     fn grid(&self, x: usize, y: usize) -> Option<usize> {
         if x >= self.w || y >= self.h {
@@ -3853,7 +3863,7 @@ impl<'a> DecoderNeighbours<'a> {
     }
 }
 
-impl<'a> crate::motion::Neighbors for DecoderNeighbours<'a> {
+impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
     fn available(&self, x: isize, y: isize) -> bool {
         if x < 0 || y < 0 {
             return false;
@@ -3869,7 +3879,7 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbours<'a> {
         }
     }
 
-    fn motion_at(&self, x: isize, y: isize) -> Option<crate::inter::MotionInfo> {
+    fn motion_at(&self, x: isize, y: isize) -> Option<MotionInfo> {
         if !self.available(x, y) {
             return None;
         }
@@ -4028,7 +4038,7 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// Whether stored motion at grid `g` differs from `mi` enough for BS=1.
-    fn motion_differs(&self, g: usize, mi: &crate::inter::MotionInfo) -> bool {
+    fn motion_differs(&self, g: usize, mi: &MotionInfo) -> bool {
         let n = match self.motion.get(g) {
             Some(m) => *m,
             None => return false,
@@ -4238,7 +4248,7 @@ impl<'cab> FullDecoder<'cab> {
         cuh: usize,
         part_idx: usize,
         merge_idx: usize,
-    ) -> crate::inter::MotionInfo {
+    ) -> MotionInfo {
         let nb = self.neighbors();
         let par_mrg_level = self.pps.log2_parallel_merge_level;
         // singleMCLFlag (§8.5.3.2.1): for 8×8 CUs with a parallel merge level > 2
@@ -4274,7 +4284,7 @@ impl<'cab> FullDecoder<'cab> {
         self.cand_to_motion(&cand)
     }
 
-    fn cand_to_motion(&self, c: &crate::motion::MergeCand) -> crate::inter::MotionInfo {
+    fn cand_to_motion(&self, c: &crate::motion::MergeCand) -> MotionInfo {
         let mut mi = MotionInfo {
             pred: c.pred,
             mv: c.mv,
@@ -4290,8 +4300,8 @@ impl<'cab> FullDecoder<'cab> {
         mi
     }
 
-    fn neighbors(&self) -> DecoderNeighbours<'_> {
-        DecoderNeighbours {
+    fn neighbors(&self) -> DecoderNeighbors<'_> {
+        DecoderNeighbors {
             motion: &self.motion,
             decoded: &self.decoded,
             slice_idx: &self.slice_idx,
@@ -4322,7 +4332,7 @@ impl<'cab> FullDecoder<'cab> {
         cuw: usize,
         cuh: usize,
         part_idx: usize,
-    ) -> crate::inter::MotionInfo {
+    ) -> MotionInfo {
         let merge = self.cab.decode_bin(&mut self.ctx.merge_flag) != 0;
         self.last_pu_merge = merge;
         if merge {
@@ -4546,252 +4556,341 @@ impl<'cab> FullDecoder<'cab> {
     fn motion_compensate(&mut self, x0: usize, y0: usize, w: usize, h: usize, mi: &MotionInfo) {
         let bd = self.bd;
         let bd_c = self.bd_c;
-        // Gather up to two predictions per plane, then combine.
-        let luma0 = if mi.pred.l0 {
-            self.predict_luma_from_ref(x0, y0, w, h, mi.mv[0], mi.ref_idx[0], 0)
-        } else {
-            None
-        };
-        let luma1 = if mi.pred.l1 {
-            self.predict_luma_from_ref(x0, y0, w, h, mi.mv[1], mi.ref_idx[1], 1)
-        } else {
-            None
-        };
-        let stride = self.w;
         let weighted = self.luma_weighted().cloned();
-        match (luma0, luma1) {
-            (Some(a), Some(b)) => {
-                let mut out = vec![0u16; w * h];
-                if let Some(wt) = &weighted {
-                    let (w0, o0) = wt.luma(0, mi.ref_idx[0]);
-                    let (w1, o1) = wt.luma(1, mi.ref_idx[1]);
-                    crate::mc::bi_pred_weighted(
-                        &a,
-                        &b,
+
+        let len = w.saturating_mul(h);
+        if len != 0 {
+            self.mc_pred0.resize(len, 0);
+            self.mc_pred1.resize(len, 0);
+
+            let luma0 = if mi.pred.l0 {
+                if let Some(frame) = ref_frame_for_lists(
+                    &self.ref_frames,
+                    &self.ref_list0,
+                    &self.ref_list1,
+                    mi.ref_idx[0],
+                    0,
+                ) {
+                    let rp = crate::mc::RefPlane {
+                        data: &frame.y,
+                        stride: frame.w,
+                        width: frame.w,
+                        height: frame.h,
+                    };
+                    let ix = x0 as isize + (mi.mv[0].x >> 2) as isize;
+                    let iy = y0 as isize + (mi.mv[0].y >> 2) as isize;
+                    let fx = (mi.mv[0].x & 3) as usize;
+                    let fy = (mi.mv[0].y & 3) as usize;
+                    (self.exec.motion_luma_interp)(
+                        &rp,
+                        ix,
+                        iy,
+                        fx,
+                        fy,
                         w,
                         h,
                         bd,
-                        w0,
-                        o0,
-                        w1,
-                        o1,
-                        wt.luma_log2_denom,
-                        &mut out,
-                        w,
+                        &mut self.mc_pred0[..len],
+                        &mut self.mc_tmp,
                     );
+                    true
                 } else {
-                    crate::mc::bi_pred(&a, &b, w, h, bd, &mut out, w);
+                    false
                 }
-                self.blit_luma(x0, y0, w, h, &out);
-            }
-            (Some(a), None) | (None, Some(a)) => {
-                let mut out = vec![0u16; w * h];
-                // Which list produced this uni-prediction.
-                let list = if mi.pred.l0 { 0 } else { 1 };
-                let ridx = mi.ref_idx[list];
-                if let Some(wt) = &weighted {
-                    let (wgt, off) = wt.luma(list, ridx);
-                    crate::mc::uni_pred_weighted(
-                        &a,
+            } else {
+                false
+            };
+
+            let luma1 = if mi.pred.l1 {
+                if let Some(frame) = ref_frame_for_lists(
+                    &self.ref_frames,
+                    &self.ref_list0,
+                    &self.ref_list1,
+                    mi.ref_idx[1],
+                    1,
+                ) {
+                    let rp = crate::mc::RefPlane {
+                        data: &frame.y,
+                        stride: frame.w,
+                        width: frame.w,
+                        height: frame.h,
+                    };
+                    let ix = x0 as isize + (mi.mv[1].x >> 2) as isize;
+                    let iy = y0 as isize + (mi.mv[1].y >> 2) as isize;
+                    let fx = (mi.mv[1].x & 3) as usize;
+                    let fy = (mi.mv[1].y & 3) as usize;
+                    (self.exec.motion_luma_interp)(
+                        &rp,
+                        ix,
+                        iy,
+                        fx,
+                        fy,
                         w,
                         h,
                         bd,
-                        wgt,
-                        off,
-                        wt.luma_log2_denom,
-                        &mut out,
-                        w,
+                        &mut self.mc_pred1[..len],
+                        &mut self.mc_tmp,
                     );
+                    true
                 } else {
-                    crate::mc::uni_pred(&a, w, h, bd, &mut out, w);
+                    false
                 }
-                self.blit_luma(x0, y0, w, h, &out);
+            } else {
+                false
+            };
+
+            if x0 < self.w && y0 < self.h {
+                let valid_w = w.min(self.w - x0);
+                let valid_h = h.min(self.h - y0);
+                let dst_off = y0 * self.w + x0;
+                let dst_stride = self.w;
+                let uni_mc = self.exec.motion_uni_mc;
+                let bi_mc = self.exec.motion_bi_mc;
+                let uni_mc_weighted = self.exec.motion_uni_mc_weighted;
+                let bi_mc_weighted = self.exec.motion_bi_mc_weighted;
+                let dst = &mut self.y[dst_off..];
+
+                match (luma0, luma1) {
+                    (true, true) => {
+                        if let Some(wt) = &weighted {
+                            let (w0, o0) = wt.luma(0, mi.ref_idx[0]);
+                            let (w1, o1) = wt.luma(1, mi.ref_idx[1]);
+                            bi_mc_weighted(
+                                &self.mc_pred0[..len],
+                                &self.mc_pred1[..len],
+                                w,
+                                h,
+                                valid_w,
+                                valid_h,
+                                bd,
+                                w0,
+                                o0,
+                                w1,
+                                o1,
+                                wt.luma_log2_denom,
+                                dst,
+                                dst_stride,
+                            );
+                        } else {
+                            bi_mc(
+                                &self.mc_pred0[..len],
+                                &self.mc_pred1[..len],
+                                w,
+                                h,
+                                valid_w,
+                                valid_h,
+                                bd,
+                                dst,
+                                dst_stride,
+                            );
+                        }
+                    }
+                    (true, false) | (false, true) => {
+                        let (list, ridx, src) = if luma0 {
+                            (0, mi.ref_idx[0], &self.mc_pred0[..len])
+                        } else {
+                            (1, mi.ref_idx[1], &self.mc_pred1[..len])
+                        };
+                        if let Some(wt) = &weighted {
+                            let (wgt, off) = wt.luma(list, ridx);
+                            uni_mc_weighted(
+                                src,
+                                w,
+                                h,
+                                valid_w,
+                                valid_h,
+                                bd,
+                                wgt,
+                                off,
+                                wt.luma_log2_denom,
+                                dst,
+                                dst_stride,
+                            );
+                        } else {
+                            uni_mc(src, w, h, valid_w, valid_h, bd, dst, dst_stride);
+                        }
+                    }
+                    (false, false) => {}
+                }
             }
-            (None, None) => {}
         }
-        let _ = stride;
+
         // Chroma motion compensation (chroma MV derived per SubWidthC/SubHeightC).
         if !self.sps.chroma.is_monochrome() {
             let cw = w / self.sub_w;
             let ch = h / self.sub_h;
+            let clen = cw.saturating_mul(ch);
+            if clen == 0 {
+                return;
+            }
             let cx = x0 / self.sub_w;
             let cy = y0 / self.sub_h;
+            self.mc_pred0.resize(clen, 0);
+            self.mc_pred1.resize(clen, 0);
+
             for plane in 0..2 {
                 let c0 = if mi.pred.l0 {
-                    self.predict_chroma_from_ref(cx, cy, cw, ch, mi.mv[0], mi.ref_idx[0], 0, plane)
+                    if let Some(frame) = ref_frame_for_lists(
+                        &self.ref_frames,
+                        &self.ref_list0,
+                        &self.ref_list1,
+                        mi.ref_idx[0],
+                        0,
+                    ) {
+                        let data = if plane == 0 { &frame.cb } else { &frame.cr };
+                        let rp = crate::mc::RefPlane {
+                            data,
+                            stride: frame.cw,
+                            width: frame.cw,
+                            height: frame.ch,
+                        };
+                        let mvcx = mi.mv[0].x as isize * 2 / self.sub_w as isize;
+                        let mvcy = mi.mv[0].y as isize * 2 / self.sub_h as isize;
+                        let ix = cx as isize + (mvcx >> 3);
+                        let iy = cy as isize + (mvcy >> 3);
+                        let fx = (mvcx & 7) as usize;
+                        let fy = (mvcy & 7) as usize;
+                        (self.exec.motion_chroma_interp)(
+                            &rp,
+                            ix,
+                            iy,
+                            fx,
+                            fy,
+                            cw,
+                            ch,
+                            bd_c,
+                            &mut self.mc_pred0[..clen],
+                            &mut self.mc_tmp,
+                        );
+                        true
+                    } else {
+                        false
+                    }
                 } else {
-                    None
+                    false
                 };
+
                 let c1 = if mi.pred.l1 {
-                    self.predict_chroma_from_ref(cx, cy, cw, ch, mi.mv[1], mi.ref_idx[1], 1, plane)
+                    if let Some(frame) = ref_frame_for_lists(
+                        &self.ref_frames,
+                        &self.ref_list0,
+                        &self.ref_list1,
+                        mi.ref_idx[1],
+                        1,
+                    ) {
+                        let data = if plane == 0 { &frame.cb } else { &frame.cr };
+                        let rp = crate::mc::RefPlane {
+                            data,
+                            stride: frame.cw,
+                            width: frame.cw,
+                            height: frame.ch,
+                        };
+                        let mvcx = mi.mv[1].x as isize * 2 / self.sub_w as isize;
+                        let mvcy = mi.mv[1].y as isize * 2 / self.sub_h as isize;
+                        let ix = cx as isize + (mvcx >> 3);
+                        let iy = cy as isize + (mvcy >> 3);
+                        let fx = (mvcx & 7) as usize;
+                        let fy = (mvcy & 7) as usize;
+                        (self.exec.motion_chroma_interp)(
+                            &rp,
+                            ix,
+                            iy,
+                            fx,
+                            fy,
+                            cw,
+                            ch,
+                            bd_c,
+                            &mut self.mc_pred1[..clen],
+                            &mut self.mc_tmp,
+                        );
+                        true
+                    } else {
+                        false
+                    }
                 } else {
-                    None
+                    false
                 };
-                let mut out = vec![0u16; cw * ch];
+
+                if cx >= self.cw || cy >= self.ch {
+                    continue;
+                }
+                let valid_w = cw.min(self.cw - cx);
+                let valid_h = ch.min(self.ch - cy);
+                let c_stride = self.cw;
+                let dst_off = cy * c_stride + cx;
+                let uni_mc = self.exec.motion_uni_mc;
+                let bi_mc = self.exec.motion_bi_mc;
+                let uni_mc_weighted = self.exec.motion_uni_mc_weighted;
+                let bi_mc_weighted = self.exec.motion_bi_mc_weighted;
+                let dst = if plane == 0 {
+                    &mut self.cb[dst_off..]
+                } else {
+                    &mut self.cr[dst_off..]
+                };
+
                 match (c0, c1) {
-                    (Some(a), Some(b)) => {
+                    (true, true) => {
                         if let Some(wt) = &weighted {
                             let (w0, o0) = wt.chroma(0, mi.ref_idx[0], plane);
                             let (w1, o1) = wt.chroma(1, mi.ref_idx[1], plane);
-                            crate::mc::bi_pred_weighted(
-                                &a,
-                                &b,
+                            bi_mc_weighted(
+                                &self.mc_pred0[..clen],
+                                &self.mc_pred1[..clen],
                                 cw,
                                 ch,
+                                valid_w,
+                                valid_h,
                                 bd_c,
                                 w0,
                                 o0,
                                 w1,
                                 o1,
                                 wt.chroma_log2_denom,
-                                &mut out,
-                                cw,
+                                dst,
+                                c_stride,
                             );
                         } else {
-                            crate::mc::bi_pred(&a, &b, cw, ch, bd_c, &mut out, cw);
-                        }
-                    }
-                    (Some(a), None) | (None, Some(a)) => {
-                        let list = if mi.pred.l0 { 0 } else { 1 };
-                        let ridx = mi.ref_idx[list];
-                        if let Some(wt) = &weighted {
-                            let (wgt, off) = wt.chroma(list, ridx, plane);
-                            crate::mc::uni_pred_weighted(
-                                &a,
+                            bi_mc(
+                                &self.mc_pred0[..clen],
+                                &self.mc_pred1[..clen],
                                 cw,
                                 ch,
+                                valid_w,
+                                valid_h,
+                                bd_c,
+                                dst,
+                                c_stride,
+                            );
+                        }
+                    }
+                    (true, false) | (false, true) => {
+                        let (list, ridx, src) = if c0 {
+                            (0, mi.ref_idx[0], &self.mc_pred0[..clen])
+                        } else {
+                            (1, mi.ref_idx[1], &self.mc_pred1[..clen])
+                        };
+                        if let Some(wt) = &weighted {
+                            let (wgt, off) = wt.chroma(list, ridx, plane);
+                            uni_mc_weighted(
+                                src,
+                                cw,
+                                ch,
+                                valid_w,
+                                valid_h,
                                 bd_c,
                                 wgt,
                                 off,
                                 wt.chroma_log2_denom,
-                                &mut out,
-                                cw,
+                                dst,
+                                c_stride,
                             );
                         } else {
-                            crate::mc::uni_pred(&a, cw, ch, bd_c, &mut out, cw);
+                            uni_mc(src, cw, ch, valid_w, valid_h, bd_c, dst, c_stride);
                         }
                     }
-                    (None, None) => continue,
+                    (false, false) => {}
                 }
-                self.blit_chroma(cx, cy, cw, ch, &out, plane);
             }
-        }
-    }
-
-    fn ref_frame_for(&self, ref_idx: i8, list: usize) -> Option<&crate::inter::RefFramePlanes> {
-        if ref_idx < 0 {
-            return None;
-        }
-        let entry = if list == 0 {
-            self.ref_list0.get(ref_idx as usize)
-        } else {
-            self.ref_list1.get(ref_idx as usize)
-        }?;
-        self.ref_frames.iter().find(|f| f.poc == entry.poc)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn predict_luma_from_ref(
-        &self,
-        x0: usize,
-        y0: usize,
-        w: usize,
-        h: usize,
-        mv: crate::inter::Mv,
-        ref_idx: i8,
-        list: usize,
-    ) -> Option<Vec<i16>> {
-        let frame = self.ref_frame_for(ref_idx, list)?;
-        let rp = crate::mc::RefPlane {
-            data: &frame.y,
-            stride: frame.w,
-            width: frame.w,
-            height: frame.h,
-        };
-        let ix = x0 as isize + (mv.x >> 2) as isize;
-        let iy = y0 as isize + (mv.y >> 2) as isize;
-        let fx = (mv.x & 3) as usize;
-        let fy = (mv.y & 3) as usize;
-        let mut dst = vec![0i16; w * h];
-        crate::mc::luma_interp(&rp, ix, iy, fx, fy, w, h, self.bd, &mut dst);
-        Some(dst)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn predict_chroma_from_ref(
-        &self,
-        cx: usize,
-        cy: usize,
-        cw: usize,
-        ch: usize,
-        mv: crate::inter::Mv,
-        ref_idx: i8,
-        list: usize,
-        plane: usize,
-    ) -> Option<Vec<i16>> {
-        let frame = self.ref_frame_for(ref_idx, list)?;
-        let data = if plane == 0 { &frame.cb } else { &frame.cr };
-        let rp = crate::mc::RefPlane {
-            data,
-            stride: frame.cw,
-            width: frame.cw,
-            height: frame.ch,
-        };
-        // Chroma MV derivation (§8.5.3.3.3.2): the 1/8-pel chroma motion vector
-        // is the luma 1/4-pel MV scaled by 2/SubWidthC and 2/SubHeightC. For
-        // 4:2:0 (SubW=SubH=2) this is the identity; 4:2:2 doubles the vertical
-        // component and 4:4:4 doubles both.
-        let mvcx = mv.x as isize * 2 / self.sub_w as isize;
-        let mvcy = mv.y as isize * 2 / self.sub_h as isize;
-        let ix = cx as isize + (mvcx >> 3);
-        let iy = cy as isize + (mvcy >> 3);
-        let fx = (mvcx & 7) as usize;
-        let fy = (mvcy & 7) as usize;
-        let mut dst = vec![0i16; cw * ch];
-        crate::mc::chroma_interp(&rp, ix, iy, fx, fy, cw, ch, self.bd_c, &mut dst);
-        Some(dst)
-    }
-
-    fn blit_luma(&mut self, x0: usize, y0: usize, w: usize, h: usize, src: &[u16]) {
-        if x0 >= self.w || y0 >= self.h || w == 0 || h == 0 {
-            return;
-        }
-
-        let stride = self.w;
-        let copy_w = w.min(self.w - x0);
-        let copy_h = h.min(self.h - y0);
-        let dst_rows = self.y[y0 * stride..].chunks_exact_mut(stride).take(copy_h);
-
-        for (src_row, dst_row) in src.chunks_exact(w).take(copy_h).zip(dst_rows) {
-            dst_row[x0..x0 + copy_w].copy_from_slice(&src_row[..copy_w]);
-        }
-    }
-
-    fn blit_chroma(
-        &mut self,
-        cx: usize,
-        cy: usize,
-        cw: usize,
-        ch: usize,
-        src: &[u16],
-        plane: usize,
-    ) {
-        if cx >= self.cw || cy >= self.ch || cw == 0 || ch == 0 {
-            return;
-        }
-
-        let stride = self.cw;
-        let copy_w = cw.min(self.cw - cx);
-        let copy_h = ch.min(self.ch - cy);
-        let dst = if plane == 0 {
-            &mut self.cb
-        } else {
-            &mut self.cr
-        };
-        let dst_rows = dst[cy * stride..].chunks_exact_mut(stride).take(copy_h);
-
-        for (src_row, dst_row) in src.chunks_exact(cw).take(copy_h).zip(dst_rows) {
-            dst_row[cx..cx + copy_w].copy_from_slice(&src_row[..copy_w]);
         }
     }
 
@@ -4815,6 +4914,25 @@ impl<'cab> FullDecoder<'cab> {
     pub(crate) fn take_motion(&mut self) -> (Vec<MotionInfo>, usize, usize) {
         (std::mem::take(&mut self.motion), self.grid_w, self.grid_h)
     }
+}
+
+#[inline]
+fn ref_frame_for_lists<'a>(
+    ref_frames: &'a [crate::inter::RefFramePlanes],
+    ref_list0: &[crate::dpb::RefEntry],
+    ref_list1: &[crate::dpb::RefEntry],
+    ref_idx: i8,
+    list: usize,
+) -> Option<&'a crate::inter::RefFramePlanes> {
+    if ref_idx < 0 {
+        return None;
+    }
+    let entry = if list == 0 {
+        ref_list0.get(ref_idx as usize)
+    } else {
+        ref_list1.get(ref_idx as usize)
+    }?;
+    ref_frames.iter().find(|f| f.poc == entry.poc)
 }
 
 #[allow(clippy::too_many_arguments)]

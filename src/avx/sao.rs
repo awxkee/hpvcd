@@ -191,6 +191,7 @@ fn edge_offset8_avx2(
 
 #[inline]
 #[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
 fn edge_offset16_masked_avx2(
     dst: &[u16; 16],
     samples: &[u16; 16],

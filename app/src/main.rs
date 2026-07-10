@@ -1,4 +1,4 @@
-use hpvcd::ImageBuffer;
+use hpvcd::{ImageBuffer, VideoDecoder};
 use image::{DynamicImage, RgbImage};
 use std::fs;
 use std::time::Instant;
