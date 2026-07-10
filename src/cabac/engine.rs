@@ -32,7 +32,7 @@ pub(crate) use crate::cabac::contexts::CtxModel;
 use std::borrow::Cow;
 
 #[rustfmt::skip]
-pub(crate) static RANGE_TAB_LPS: [[u8; 4]; 64] = [
+static RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128,176,208,240],[128,167,197,227],[128,158,187,216],[123,150,178,205],
     [116,142,169,195],[111,135,160,185],[105,128,152,175],[100,122,144,166],
     [95,116,137,158],[90,110,130,150],[85,104,123,142],[81,99,117,135],
@@ -52,7 +52,7 @@ pub(crate) static RANGE_TAB_LPS: [[u8; 4]; 64] = [
 ];
 
 #[rustfmt::skip]
-pub(crate) static TRANS_IDX_MPS: [u8; 64] = [
+static TRANS_IDX_MPS: [u8; 64] = [
      1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,
     17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
     33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
@@ -60,15 +60,42 @@ pub(crate) static TRANS_IDX_MPS: [u8; 64] = [
 ];
 
 #[rustfmt::skip]
-pub(crate) static TRANS_IDX_LPS: [u8; 64] = [
+static TRANS_IDX_LPS: [u8; 64] = [
      0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9,11,11,12,
     13,13,15,15,16,16,18,18,19,19,21,21,22,22,23,24,
     24,25,26,26,27,27,28,29,29,30,30,30,31,32,32,33,
     33,33,34,34,35,35,35,36,36,36,37,37,37,38,38,63,
 ];
 
+// One load supplies rangeLPS and both next packed context states.  The table is
+// indexed by the complete packed context byte (pStateIdx + valMPS) and the
+// current range class.  Keeping this generated from the normative tables makes
+// the hot decision path smaller without duplicating hand-maintained constants.
+const fn build_decision_table() -> [[u32; 4]; 128] {
+    let mut table = [[0u32; 4]; 128];
+    let mut packed_state = 0usize;
+    while packed_state < table.len() {
+        let state = packed_state & 63;
+        let mps = ((packed_state >> 6) & 1) as u8;
+        let next_mps = TRANS_IDX_MPS[state] | (mps << 6);
+        let lps_mps = if state == 0 { mps ^ 1 } else { mps };
+        let next_lps = TRANS_IDX_LPS[state] | (lps_mps << 6);
+
+        let mut range_class = 0usize;
+        while range_class < 4 {
+            table[packed_state][range_class] = RANGE_TAB_LPS[state][range_class] as u32
+                | ((next_mps as u32) << 8)
+                | ((next_lps as u32) << 16);
+            range_class += 1;
+        }
+        packed_state += 1;
+    }
+    table
+}
+
+static DECISION_TABLE: [[u32; 4]; 128] = build_decision_table();
+
 /// CABAC decoder. Feed it EBSP-unescaped slice payload bytes.
-/// Initialises by consuming 9 seed bits.
 pub(crate) struct CabacDecoder<'a> {
     pub(crate) range: u32,
     pub(crate) offset: u32,
@@ -188,30 +215,31 @@ impl<'a> CabacDecoder<'a> {
     }
 
     /// Decode one context-coded bin (HEVC Table 9-15 DecodeDecision).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn decode_bin(&mut self, ctx: &mut CtxModel) -> u8 {
-        let ctx_state = ctx.state;
-        let state = (ctx_state & 63) as usize;
-        let mps = ctx_state >> 6;
-        let lps = RANGE_TAB_LPS[state][(self.range >> 6) as usize & 3] as u32;
+        let packed_state = ctx.state;
+        let mps = packed_state >> 6;
+        let decision = DECISION_TABLE[packed_state as usize][(self.range >> 6) as usize & 3];
+        let lps = decision & 0xff;
+        let next_mps = (decision >> 8) as u8;
+        let next_lps = (decision >> 16) as u8;
+
         self.range -= lps;
         if self.offset >= self.range {
-            let bin_val = mps ^ 1;
             self.offset -= self.range;
             self.range = lps;
-            let next_mps = if state == 0 { mps ^ 1 } else { mps };
-            ctx.state = TRANS_IDX_LPS[state] | (next_mps << 6);
+            ctx.state = next_lps;
             self.renorm();
-            bin_val
+            mps ^ 1
         } else {
-            ctx.state = TRANS_IDX_MPS[state] | (mps << 6);
+            ctx.state = next_mps;
             self.renorm();
             mps
         }
     }
 
     /// Decode one bypass bin (HEVC §9.3.4.2 DecodeBypass).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn decode_bypass(&mut self) -> u8 {
         self.offset = (self.offset << 1) | self.next_bit();
         if self.offset >= self.range {
@@ -220,6 +248,33 @@ impl<'a> CabacDecoder<'a> {
         } else {
             0
         }
+    }
+
+    /// Decode `count` consecutive bypass bins and return them MSB-first.
+    ///
+    /// The arithmetic dependency remains serial, but the raw input bits are
+    /// fetched in one reservoir operation and `offset` is kept local throughout
+    /// the run.  This is particularly useful for coefficient signs and fixed
+    /// Rice/last-position suffixes.
+    #[inline(always)]
+    pub(crate) fn decode_bypass_bits(&mut self, count: u32) -> u32 {
+        debug_assert!(count <= 32);
+        if count == 0 {
+            return 0;
+        }
+
+        let raw = self.read_bits(count);
+        let range = self.range;
+        let mut offset = self.offset;
+        let mut bins = 0u32;
+        for shift in (0..count).rev() {
+            offset = (offset << 1) | ((raw >> shift) & 1);
+            let bin = (offset >= range) as u32;
+            offset -= range * bin;
+            bins = (bins << 1) | bin;
+        }
+        self.offset = offset;
+        bins
     }
 
     /// Decode terminate bin (end_of_slice / end_of_sub_stream).
@@ -263,5 +318,73 @@ impl<'a> CabacDecoder<'a> {
             return 0;
         }
         self.read_bits(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_decision_table_matches_normative_tables() {
+        for packed_state in 0u8..128 {
+            let state = usize::from(packed_state & 63);
+            let mps = packed_state >> 6;
+            let expected_mps = TRANS_IDX_MPS[state] | (mps << 6);
+            let lps_mps = if state == 0 { mps ^ 1 } else { mps };
+            let expected_lps = TRANS_IDX_LPS[state] | (lps_mps << 6);
+
+            for range_class in 0..4 {
+                let decision = DECISION_TABLE[usize::from(packed_state)][range_class];
+                assert_eq!(
+                    decision & 0xff,
+                    u32::from(RANGE_TAB_LPS[state][range_class])
+                );
+                assert_eq!((decision >> 8) as u8, expected_mps);
+                assert_eq!((decision >> 16) as u8, expected_lps);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_bypass_matches_single_bin_decoding() {
+        let data = [
+            0x55, 0xaa, 0x13, 0x7c, 0xe1, 0x09, 0xb6, 0x42, 0xfd, 0x18, 0x83, 0x6d, 0x24, 0xc7,
+            0x5a, 0x91,
+        ];
+
+        for warmup in 0..16 {
+            for count in 0..=32 {
+                let mut scalar = CabacDecoder::new_borrowed(&data).unwrap();
+                let mut batched = CabacDecoder::new_borrowed(&data).unwrap();
+
+                for _ in 0..warmup {
+                    assert_eq!(scalar.decode_bypass(), batched.decode_bypass());
+                }
+
+                let mut expected = 0u32;
+                for _ in 0..count {
+                    expected = (expected << 1) | u32::from(scalar.decode_bypass());
+                }
+                assert_eq!(batched.decode_bypass_bits(count), expected);
+                assert_eq!(batched.range, scalar.range);
+                assert_eq!(batched.offset, scalar.offset);
+                assert_eq!(
+                    batched.byte_pos * 8 - batched.bitcnt as usize,
+                    scalar.byte_pos * 8 - scalar.bitcnt as usize
+                );
+
+                // Batched reading may prefetch a different number of whole
+                // bytes, but subsequent arithmetic bins and byte alignment
+                // must remain identical.
+                for _ in 0..64 {
+                    assert_eq!(batched.decode_bypass(), scalar.decode_bypass());
+                }
+                assert_eq!(batched.offset, scalar.offset);
+                batched.byte_align();
+                scalar.byte_align();
+                assert_eq!(batched.byte_pos, scalar.byte_pos);
+            }
+        }
     }
 }

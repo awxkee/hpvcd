@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use super::contexts::ContextSet;
+use super::contexts::{ContextSet, CtxModel};
 use super::engine::CabacDecoder;
 
 pub(crate) const SCAN_DIAG: u8 = 0;
@@ -262,9 +262,10 @@ fn calc_sig_ctx(
     if is_luma { s as usize } else { 27 + s as usize }
 }
 
+#[inline(always)]
 fn decode_last_prefix(
     dec: &mut CabacDecoder<'_>,
-    ctx: &mut [super::contexts::CtxModel],
+    ctx: &mut [CtxModel; 18],
     log2_ts: u32,
     is_luma: bool,
 ) -> u32 {
@@ -279,10 +280,9 @@ fn decode_last_prefix(
     ];
     let size = 1u32 << log2_ts;
     let max_group = GROUP_IDX[(size - 1) as usize];
-    let n = ctx.len();
     let mut group = 0u32;
     while group < max_group {
-        let ci = ((ctx_offset + (group >> ctx_shift)) as usize).min(n - 1);
+        let ci = (ctx_offset + (group >> ctx_shift)) as usize;
         let b = dec.decode_bin(&mut ctx[ci]);
         if b == 0 {
             break;
@@ -292,6 +292,7 @@ fn decode_last_prefix(
     group
 }
 
+#[inline(always)]
 fn decode_remaining(dec: &mut CabacDecoder<'_>, rice: u32) -> u32 {
     let mut prefix = 0u32;
     while dec.decode_bypass() != 0 {
@@ -301,18 +302,11 @@ fn decode_remaining(dec: &mut CabacDecoder<'_>, rice: u32) -> u32 {
         }
     }
     if prefix <= 3 {
-        let mut suf = 0u32;
-        for _ in 0..rice {
-            suf = (suf << 1) | dec.decode_bypass() as u32;
-        }
-        (prefix << rice) + suf
+        (prefix << rice) + dec.decode_bypass_bits(rice)
     } else {
         // prefix is ≤ 32, rice ≤ 4 — cap suffix_bits so we never read > 32 bypass bins
         let suffix_bits = (prefix - 3 + rice).min(32);
-        let mut cw = 0u32;
-        for _ in 0..suffix_bits {
-            cw = (cw << 1) | dec.decode_bypass() as u32;
-        }
+        let cw = dec.decode_bypass_bits(suffix_bits);
         // Saturate the base calculation: (1<<(p-3)+2)<<rice can overflow u32 when p≈32
         let base = 1u32
             .checked_shl(prefix - 3)
@@ -356,15 +350,8 @@ pub(crate) fn residual_coding(
     let xp = decode_last_prefix(dec, &mut ctx.last_sig_coeff_x_prefix, log2_ts, is_luma);
     let yp = decode_last_prefix(dec, &mut ctx.last_sig_coeff_y_prefix, log2_ts, is_luma);
     let read_suffix = |dec: &mut CabacDecoder<'_>, g: u32| -> u32 {
-        if g <= 3 {
-            return 0;
-        }
-        let bits = (g - 2) / 2;
-        let mut v = 0;
-        for _ in 0..bits {
-            v = (v << 1) | dec.decode_bypass() as u32;
-        }
-        v
+        let bits = g.saturating_sub(2) / 2;
+        dec.decode_bypass_bits(bits)
     };
     let xs = read_suffix(dec, xp);
     let ys = read_suffix(dec, yp);
@@ -387,69 +374,50 @@ pub(crate) fn residual_coding(
     let last_sb = sb_table.index(last_sbx, last_sby);
     let last_in_sb = pos_table.index(last_x & 3, last_y & 3);
 
-    // csbf neighbor tracking
-    let mut csbf = [0u8; 64];
-    let csbf = &mut csbf[..sb_w * sb_w];
+    // Coded-sub-block flags fit in one u64 (the grid is at most 8×8).
+    let mut csbf = 0u64;
     let mut c1_carry = 1i32; // greater1 ctx carried across sub-blocks
     let mut first_subblock = true;
 
     for i in (0..=last_sb).rev() {
         let (sbx, sby) = sb_scan[i];
         let sb_grid = sbx + sby * sb_w;
+        let right = if sbx + 1 < sb_w {
+            ((csbf >> (sb_grid + 1)) & 1) as u8
+        } else {
+            0
+        };
+        let below = if sby + 1 < sb_w {
+            ((csbf >> (sb_grid + sb_w)) & 1) as u8
+        } else {
+            0
+        };
+        let prev_csbf = (right & 1) | ((below & 1) << 1);
 
         // coded_sub_block_flag
-        let mut infer_dc = false;
-        let coded;
-        if i < last_sb && i > 0 {
-            // neighbor-based context
-            let right = if sbx + 1 < sb_w {
-                csbf[(sbx + 1) + sby * sb_w]
-            } else {
-                0
-            };
-            let below = if sby + 1 < sb_w {
-                csbf[sbx + (sby + 1) * sb_w]
-            } else {
-                0
-            };
+        let infer_dc = i < last_sb && i > 0;
+        let coded = if infer_dc {
             let ctx_inc = ((right | below) & 1) as usize;
             let cg = if is_luma { ctx_inc } else { 2 + ctx_inc };
-            coded = dec.decode_bin(&mut ctx.coded_sub_block_flag[cg]) != 0;
-            infer_dc = true;
+            dec.decode_bin(&mut ctx.coded_sub_block_flag[cg]) != 0
         } else {
-            coded = i == 0 || i == last_sb;
-        }
-        csbf[sb_grid] = coded as u8;
+            i == 0 || i == last_sb
+        };
+        csbf |= (coded as u64) << sb_grid;
         if !coded {
             continue;
         }
 
-        let prev_csbf = {
-            let right = if sbx + 1 < sb_w {
-                csbf[(sbx + 1) + sby * sb_w]
-            } else {
-                0
-            };
-            let below = if sby + 1 < sb_w {
-                csbf[sbx + (sby + 1) * sb_w]
-            } else {
-                0
-            };
-            (right & 1) | ((below & 1) << 1)
-        };
-
         let scan_top = if i == last_sb { last_in_sb } else { 15 };
 
-        // sig_coeff_flag for positions scan_top-1 .. 0 (last is implicit at i==last_sb).
-        // Collect significant scan positions directly in high→low order; this avoids
-        // materialising a 16-entry bool map and scanning it again.
-        let mut sig_scan = [0usize; 16];
+        // Store both the coefficient destination and the 4×4 scan position in
+        // one compact entry.  Entries remain in high→low scan order.
+        let mut sig_entries = [0u16; 16];
         let mut sig_len = 0usize;
-        let mut any_sig = false;
         if i == last_sb {
-            sig_scan[0] = last_in_sb;
+            let coeff_index = last_y * n + last_x;
+            sig_entries[0] = ((coeff_index as u16) << 4) | last_in_sb as u16;
             sig_len = 1;
-            any_sig = true;
         }
         let start = if i == last_sb {
             last_in_sb.checked_sub(1)
@@ -461,25 +429,27 @@ pub(crate) fn residual_coding(
                 let (px, py) = pos_scan[k];
                 let xc = (sbx << 2) + px;
                 let yc = (sby << 2) + py;
-                let s = if k == 0 && infer_dc && !any_sig {
+                let significant = if k == 0 && infer_dc && sig_len == 0 {
                     true
                 } else {
                     let ci = sig_ctx_table.ctx(xc, yc, prev_csbf);
                     dec.decode_bin(&mut ctx.sig_coeff_flag[ci]) != 0
                 };
-                if s {
-                    sig_scan[sig_len] = k;
-                    sig_len += 1;
-                    any_sig = true;
-                }
+
+                // This write is always in-bounds: before each of the at most 16
+                // candidates, sig_len is at most 15.  Advancing conditionally
+                // avoids the unpredictable append branch from the old loop.
+                let coeff_index = yc * n + xc;
+                sig_entries[sig_len] = ((coeff_index as u16) << 4) | k as u16;
+                sig_len += significant as usize;
             }
         }
         if sig_len == 0 {
             continue;
         }
-        let sig_scan = &sig_scan[..sig_len];
-        let last_sig_pos = sig_scan[0]; // highest k
-        let first_sig_pos = sig_scan[sig_len - 1]; // lowest k
+        let sig_entries = &sig_entries[..sig_len];
+        let last_sig_pos = usize::from(sig_entries[0] & 15); // highest k
+        let first_sig_pos = usize::from(sig_entries[sig_len - 1] & 15); // lowest k
 
         // ── greater1 ──
         let mut ctx_set: i32 = if i == 0 || !is_luma { 0 } else { 2 };
@@ -489,18 +459,17 @@ pub(crate) fn residual_coding(
         first_subblock = false;
         let mut c1 = 1i32;
         let chroma_off = if is_luma { 0 } else { 16 };
-        let mut gr1 = [false; 16];
-        let mut last_gr1_idx: Option<usize> = None;
+        let mut gr1_mask = 0u16;
+        let mut first_gr1_idx = 16usize;
         let n_gr1 = sig_len.min(8);
-        for (j, dst) in gr1[..n_gr1].iter_mut().enumerate() {
-            let g1ctx = c1.min(3);
-            let ci = (ctx_set * 4 + g1ctx) as usize + chroma_off;
-            let f = dec.decode_bin(&mut ctx.coeff_abs_level_greater1[ci]) != 0;
-            *dst = f;
-            if f {
+        for j in 0..n_gr1 {
+            let ci = (ctx_set * 4 + c1.min(3)) as usize + chroma_off;
+            let greater1 = dec.decode_bin(&mut ctx.coeff_abs_level_greater1[ci]) != 0;
+            gr1_mask |= (greater1 as u16) << j;
+            if greater1 {
                 c1 = 0;
-                if last_gr1_idx.is_none() {
-                    last_gr1_idx = Some(j);
+                if first_gr1_idx == 16 {
+                    first_gr1_idx = j;
                 }
             } else if c1 > 0 && c1 < 3 {
                 c1 += 1;
@@ -509,43 +478,39 @@ pub(crate) fn residual_coding(
         c1_carry = c1;
 
         // ── greater2 (only on first greater1 coeff) ──
-        let mut gr2 = false;
-        if let Some(j) = last_gr1_idx {
+        let gr2 = if first_gr1_idx < 16 {
             let ci = ctx_set as usize + if is_luma { 0 } else { 4 };
-            gr2 = dec.decode_bin(&mut ctx.coeff_abs_level_greater2[ci]) != 0;
-            let _ = j;
-        }
+            dec.decode_bin(&mut ctx.coeff_abs_level_greater2[ci]) != 0
+        } else {
+            false
+        };
 
         // ── sign hiding decision ──
         let sign_hidden = sign_data_hiding
             && (last_sig_pos as i32 - first_sig_pos as i32) > 3
             && !transquant_bypass;
 
-        // ── signs (bypass) ──
-        let mut signs = [0i32; 16];
-        for (j, &k) in sig_scan.iter().enumerate() {
-            if sign_hidden && k == first_sig_pos {
-                signs[j] = 0; // inferred later
-            } else {
-                signs[j] = if dec.decode_bypass() != 0 { 1 } else { 0 }; // 1 = negative
-            }
-        }
+        // The hidden sign is always the final (lowest-scan-position) entry, so
+        // all coded signs form one contiguous bypass run.  Reverse once to make
+        // bit j correspond directly to significant entry j.
+        let sign_count = sig_len - sign_hidden as usize;
+        let coded_signs = dec.decode_bypass_bits(sign_count as u32) as u16;
+        let sign_mask = if sign_count == 0 {
+            0
+        } else {
+            coded_signs.reverse_bits() >> (u16::BITS as usize - sign_count)
+        };
 
         // ── coeff_abs_level_remaining + assemble ──
         let mut rice = 0u32;
-        let mut sum_abs = 0i64;
-        let mut first_sig_j = 0usize;
-        for (j, &k) in sig_scan.iter().enumerate() {
-            let g1 = if j < n_gr1 { gr1[j] as i32 } else { 0 };
-            let g2 = if Some(j) == last_gr1_idx {
-                gr2 as i32
-            } else {
-                0
-            };
-            let base = 1 + g1 + g2;
+        let mut abs_parity = 0i32;
+        for (j, &entry) in sig_entries.iter().enumerate() {
+            let g1 = ((gr1_mask >> j) & 1) as i32;
+            let has_gr2 = j == first_gr1_idx;
+            let base = 1 + g1 + (has_gr2 && gr2) as i32;
             // baseLevel == threshold → read remaining
             let threshold = if j < 8 {
-                if Some(j) == last_gr1_idx { 3 } else { 2 }
+                if has_gr2 { 3 } else { 2 }
             } else {
                 1
             };
@@ -560,32 +525,23 @@ pub(crate) fn residual_coding(
                 rice = (rice + 1).min(4);
             }
 
-            let (px, py) = pos_scan[k];
-            let xc = (sbx << 2) + px;
-            let yc = (sby << 2) + py;
-            let mut val = level;
-            if signs[j] == 1 {
-                val = -val;
-            }
-            coeffs[yc * n + xc] = val;
+            let coeff_index = usize::from(entry >> 4);
+            let xc = coeff_index & (n - 1);
+            let negative = ((sign_mask >> j) & 1) != 0;
+            coeffs[coeff_index] = if negative { -level } else { level };
             max_x = max_x.max(xc);
-            sum_abs += level as i64;
-            if k == first_sig_pos {
-                first_sig_j = j;
-            }
+            abs_parity ^= level & 1;
         }
+
         // Resolve hidden sign by parity.
         if sign_hidden {
-            let k = first_sig_pos;
-            let (px, py) = pos_scan[k];
-            let xc = (sbx << 2) + px;
-            let yc = (sby << 2) + py;
-            if sum_abs % 2 == 1 {
-                coeffs[yc * n + xc] = -coeffs[yc * n + xc].abs();
+            let coeff_index = usize::from(sig_entries[sig_len - 1] >> 4);
+            let coeff = &mut coeffs[coeff_index];
+            *coeff = if abs_parity != 0 {
+                -coeff.abs()
             } else {
-                coeffs[yc * n + xc] = coeffs[yc * n + xc].abs();
-            }
-            let _ = first_sig_j;
+                coeff.abs()
+            };
         }
     }
 

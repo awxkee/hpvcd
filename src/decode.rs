@@ -507,6 +507,7 @@ fn inter_motion_differs(p: &MotionInfo, q: &MotionInfo) -> bool {
 /// Fill slice ownership for a pixel-aligned rectangle on the decoder's 4x4
 /// metadata grid. Slice boundaries are CTB-aligned, but the helper also serves
 /// CU/PU bookkeeping and therefore accepts any 4-sample-aligned rectangle.
+#[allow(clippy::too_many_arguments)]
 fn fill_slice_owner_rect(
     owners: &mut [u16],
     grid_w: usize,
@@ -3120,6 +3121,7 @@ fn copy_pred_block_clipped(
 /// outside the visible plane. The common fully in-frame case is only one
 /// `copy_from_slice` per row.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn load_plane_block_clipped(
     plane: &[u16],
     stride: usize,
