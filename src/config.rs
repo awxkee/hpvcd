@@ -661,7 +661,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     })
 }
 
-pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, DecodeError> {
+pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps, DecodeError> {
     let mut r = BitReader::new(rbsp);
     let _pps_id = r.read_ue().map_err(|_| e("pps_id"))?;
     let _sps_id = r.read_ue().map_err(|_| e("pps_sps_id"))?;
@@ -739,12 +739,14 @@ pub(crate) fn parse_pps(rbsp: &[u8], scaling_list_enabled: bool) -> Result<Pps, 
             tc_offset_div2 = r.read_se().map_err(|_| e("tc_offset"))?;
         }
     }
-    let scaling_list =
-        if scaling_list_enabled && r.read_flag().map_err(|_| e("pps_scaling_list_present"))? {
-            Some(parse_scaling_list_data(&mut r)?)
-        } else {
-            None
-        };
+    // pps_scaling_list_data_present_flag is always present (1 bit), regardless
+    // of the SPS scaling_list_enabled flag. Reading it conditionally desyncs the
+    // rest of the PPS by one bit.
+    let scaling_list = if r.read_flag().map_err(|_| e("pps_scaling_list_present"))? {
+        Some(parse_scaling_list_data(&mut r)?)
+    } else {
+        None
+    };
     let lists_modification_present = r.read_flag().map_err(|_| e("lists_modification"))?;
     let log2_parallel_merge_level = r.read_ue().map_err(|_| e("log2_parallel_merge"))? + 2;
     let slice_segment_header_extension_present = r.read_flag().map_err(|_| e("slice_hdr_ext"))?;

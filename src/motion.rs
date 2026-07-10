@@ -64,6 +64,9 @@ pub(crate) trait Neighbors {
     /// Collocated temporal motion for target position, scaled to `ref_poc`.
     fn temporal(&self, x: usize, y: usize, list: usize, ref_poc: i32, cur_poc: i32) -> Option<Mv>;
     fn cur_poc(&self) -> i32;
+    /// log2 of the CTB size, for the bottom-right temporal candidate's CTB-row
+    /// availability check (§8.5.3.2.8).
+    fn ctb_log2(&self) -> u32;
 }
 
 /// A merge candidate (full bidirectional motion).
@@ -158,7 +161,7 @@ pub(crate) fn derive_merge<N: Neighbors>(
         }
     }
 
-    // Temporal candidate (§8.5.3.2.7): collocated bottom-right then centre.
+    // Temporal candidate (§8.5.3.2.7): collocated bottom-right then center.
     if temporal_enabled
         && cands.len() < max_cand
         && let Some(tc) = temporal_merge(nb, pu, list0, list1)
@@ -241,12 +244,19 @@ fn temporal_merge<N: Neighbors>(
     list1: &[RefEntry],
 ) -> Option<MergeCand> {
     let cur_poc = nb.cur_poc();
-    // Bottom-right collocated, fallback to centre.
-    let br = (pu.x + pu.w, pu.y + pu.h);
+    // Bottom-right collocated, fallback to center. The BR candidate is only
+    // available when it stays in the current PU's CTB row (§8.5.3.2.8).
+    let ctb_log2 = nb.ctb_log2();
+    let br_y = pu.y + pu.h;
+    let br: Option<(usize, usize)> = if (br_y >> ctb_log2) == (pu.y >> ctb_log2) {
+        Some((pu.x + pu.w, br_y))
+    } else {
+        None
+    };
     let ctr = (pu.x + pu.w / 2, pu.y + pu.h / 2);
     let ref0_poc = list0.first().map(|r| r.poc).unwrap_or(cur_poc);
-    let mv0 = nb
-        .temporal(br.0, br.1, 0, ref0_poc, cur_poc)
+    let mv0 = br
+        .and_then(|b| nb.temporal(b.0, b.1, 0, ref0_poc, cur_poc))
         .or_else(|| nb.temporal(ctr.0, ctr.1, 0, ref0_poc, cur_poc))?;
     let mut cand = MergeCand {
         pred: PredFlags {
@@ -258,8 +268,8 @@ fn temporal_merge<N: Neighbors>(
     };
     if pu.is_b {
         let ref1_poc = list1.first().map(|r| r.poc).unwrap_or(cur_poc);
-        if let Some(mv1) = nb
-            .temporal(br.0, br.1, 1, ref1_poc, cur_poc)
+        if let Some(mv1) = br
+            .and_then(|b| nb.temporal(b.0, b.1, 1, ref1_poc, cur_poc))
             .or_else(|| nb.temporal(ctr.0, ctr.1, 1, ref1_poc, cur_poc))
         {
             cand.pred.l1 = true;
@@ -386,11 +396,17 @@ pub(crate) fn derive_amvp<N: Neighbors>(
 
     // Temporal predictor.
     if preds.len() < 2 && temporal_enabled {
-        let br = (pu.x + pu.w, pu.y + pu.h);
+        let ctb_log2 = nb.ctb_log2();
+        let br_y = pu.y + pu.h;
+        let br: Option<(usize, usize)> = if (br_y >> ctb_log2) == (pu.y >> ctb_log2) {
+            Some((pu.x + pu.w, br_y))
+        } else {
+            None
+        };
         let ctr = (pu.x + pu.w / 2, pu.y + pu.h / 2);
         let _ = (col_list0, col_list1);
-        if let Some(mv) = nb
-            .temporal(br.0, br.1, list, ref_poc, cur_poc)
+        if let Some(mv) = br
+            .and_then(|b| nb.temporal(b.0, b.1, list, ref_poc, cur_poc))
             .or_else(|| nb.temporal(ctr.0, ctr.1, list, ref_poc, cur_poc))
         {
             preds.push(mv);

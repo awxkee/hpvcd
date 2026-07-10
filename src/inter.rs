@@ -83,6 +83,12 @@ impl MotionInfo {
             ..Default::default()
         }
     }
+
+    /// Whether list `l` (0 or 1) contributes a motion vector for this block.
+    #[inline]
+    pub(crate) fn pred_used(&self, l: usize) -> bool {
+        if l == 0 { self.pred.l0 } else { self.pred.l1 }
+    }
 }
 
 /// Weighted prediction parameters (§7.4.7.3). Weights are applied as

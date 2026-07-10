@@ -1,17 +1,31 @@
 /*
  * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
- * // BSD-3-Clause OR Apache-2.0
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-//! Top-level HEVC *video* decode driver. Consumes an elementary stream (Annex-B
-//! or length-prefixed), demuxes NAL units, tracks parameter sets, derives POC,
-//! maintains the DPB, constructs reference lists, decodes each slice (intra or
-//! inter) through [`crate::decode::FullDecoder`], and emits frames in output
-//! (POC) order.
-//!
-//! This is the prototype integration: single-slice-per-picture common path,
-//! serial (non-WPP) reconstruction. Multi-segment pictures and the parallel
-//! wavefront path for inter are wired incrementally on top of this.
 
 use crate::color::Cicp;
 use crate::config::{Pps, Sps, parse_pps, parse_sps};
@@ -60,12 +74,7 @@ impl Default for FrameMeta {
 }
 
 /// One decoded, displayable video frame.
-///
-/// The simplest thing to do with a frame is call [`VideoFrame::to_rgb8`], which
-/// always returns tightly-packed 8-bit RGB at the display size — regardless of
-/// the stream's bit depth or chroma format. For the raw planes (cropped to the
-/// visible picture) use [`VideoFrame::to_yuv`]. Presentation order is given by
-/// [`VideoFrame::poc`]; `decode`/`decode_all` already return frames in order.
+#[derive(Clone)]
 pub struct VideoFrame {
     /// Coded planes (padded to the coding grid). Prefer the accessor methods —
     /// this is exposed only for zero-copy advanced use.
@@ -84,7 +93,7 @@ impl VideoFrame {
     pub fn height(&self) -> usize {
         self.meta.disp_h
     }
-    /// Bit depth of the luma/chroma samples (8, 10, or 12).
+    /// A bit depth of the luma/chroma samples (8, 10, or 12).
     pub fn bit_depth(&self) -> u8 {
         self.meta.bit_depth.bits()
     }
@@ -93,10 +102,7 @@ impl VideoFrame {
         self.meta.chroma
     }
 
-    /// Frame rate in frames per second from the stream's VUI timing info, if it
-    /// signalled any (`time_scale / num_units_in_tick`). Returns `None` when the
-    /// elementary stream carries no timing — in that case the container is the
-    /// authority and you should supply the rate yourself.
+    /// Frame rate in frames per second from the stream's VUI timing info.
     pub fn frame_rate(&self) -> Option<f64> {
         if self.meta.time_scale > 0 && self.meta.num_units_in_tick > 0 {
             Some(self.meta.time_scale as f64 / self.meta.num_units_in_tick as f64)
@@ -106,9 +112,7 @@ impl VideoFrame {
     }
 
     /// Presentation timestamp in seconds, derived from the picture order count
-    /// and the VUI frame rate. `None` when the stream carries no timing info
-    /// (use `poc` plus your own frame rate instead). POC counts pictures in
-    /// presentation order, so this is `poc / frame_rate`.
+    /// and the VUI frame rate.
     pub fn timestamp(&self) -> Option<f64> {
         self.frame_rate().map(|fps| self.poc as f64 / fps)
     }
@@ -254,27 +258,72 @@ fn crop_plane(
     dh: usize,
     eight: bool,
 ) -> SampleBuf {
-    let x0 = x0.min(src_w.saturating_sub(1));
-    let y0 = y0.min(src_h.saturating_sub(1));
+    if dw == 0 || dh == 0 {
+        return if eight {
+            SampleBuf::U8(Vec::new())
+        } else {
+            SampleBuf::U16(Vec::new())
+        };
+    }
+
+    assert!(
+        src_w != 0 && src_h != 0 && src.len() >= src_w * src_h,
+        "invalid coded plane dimensions"
+    );
+
+    let x0 = x0.min(src_w - 1);
+    let y0 = y0.min(src_h - 1);
+
+    let copy_w = dw.min(src_w - x0);
+    let copy_h = dh.min(src_h - y0);
+    let right_pad = dw - copy_w;
+    let len = dw
+        .checked_mul(dh)
+        .expect("cropped plane dimensions overflow");
+
     if eight {
-        let mut out = Vec::with_capacity(dw * dh);
-        for row in 0..dh {
-            let sy = (y0 + row).min(src_h - 1);
-            for col in 0..dw {
-                let sx = (x0 + col).min(src_w - 1);
-                out.push(src[sy * src_w + sx] as u8);
+        let mut out = Vec::with_capacity(len);
+
+        for sy in y0..y0 + copy_h {
+            let src_row = &src[sy * src_w + x0..sy * src_w + x0 + copy_w];
+
+            out.extend(src_row.iter().map(|&sample| sample as u8));
+
+            if right_pad != 0 {
+                let edge = src_row[copy_w - 1] as u8;
+                out.resize(out.len() + right_pad, edge);
             }
         }
+
+        if copy_h < dh {
+            let last_row = out.len() - dw;
+            for _ in copy_h..dh {
+                out.extend_from_within(last_row..last_row + dw);
+            }
+        }
+
         SampleBuf::U8(out)
     } else {
-        let mut out = Vec::with_capacity(dw * dh);
-        for row in 0..dh {
-            let sy = (y0 + row).min(src_h - 1);
-            for col in 0..dw {
-                let sx = (x0 + col).min(src_w - 1);
-                out.push(src[sy * src_w + sx]);
+        let mut out = Vec::with_capacity(len);
+
+        for sy in y0..y0 + copy_h {
+            let src_row = &src[sy * src_w + x0..sy * src_w + x0 + copy_w];
+
+            out.extend_from_slice(src_row);
+
+            if right_pad != 0 {
+                let edge = src_row[copy_w - 1];
+                out.resize(out.len() + right_pad, edge);
             }
         }
+
+        if copy_h < dh {
+            let last_row = out.len() - dw;
+            for _ in copy_h..dh {
+                out.extend_from_within(last_row..last_row + dw);
+            }
+        }
+
         SampleBuf::U16(out)
     }
 }
@@ -328,8 +377,27 @@ pub struct VideoDecoder {
     outputs: Vec<VideoFrame>,
     /// First picture seen (POC anchor).
     seen_first: bool,
-    /// Display metadata (crop/chroma/depth/colour) from the active SPS.
+    /// Display metadata (crop/chroma/depth/color) from the active SPS.
     cur_meta: FrameMeta,
+    /// Work-stealing pool for in-picture parallelism (WPP wavefront CABAC +
+    /// reconstruction, and parallel deblock/SAO). A single-thread pool takes
+    /// the serial path and is byte-identical.
+    pool: crate::threadpool::ThreadPool,
+    seek_cache: SeekCache,
+}
+
+/// Per-stream seek cache (see [`VideoDecoder::seek_cache`]).
+#[derive(Default)]
+struct SeekCache {
+    key: Option<(usize, usize)>,
+    /// The stream's access units, split once and reused across calls.
+    aus: std::rc::Rc<Vec<Vec<(u8, Vec<u8>)>>>,
+    /// Index into `aus` of the random-access point the cached GOP starts at.
+    gop_start: Option<usize>,
+    /// Next access unit to decode when resuming the cached GOP forward.
+    next_au: usize,
+    /// Decoded frames of the cached GOP, keyed by POC.
+    gop_frames: std::collections::HashMap<i32, VideoFrame>,
 }
 
 impl Default for VideoDecoder {
@@ -339,6 +407,8 @@ impl Default for VideoDecoder {
 }
 
 impl VideoDecoder {
+    /// Create a decoder with a pool sized to the machine's available
+    /// parallelism. Use [`VideoDecoder::with_threads`] to pin the worker count.
     pub fn new() -> Self {
         VideoDecoder {
             sps: None,
@@ -348,12 +418,35 @@ impl VideoDecoder {
             outputs: Vec::new(),
             seen_first: false,
             cur_meta: FrameMeta::default(),
+            pool: crate::threadpool::ThreadPool::with_available_parallelism(),
+            seek_cache: SeekCache::default(),
         }
     }
 
+    /// Create a decoder with a fixed number of worker threads. `1` forces the
+    /// serial decode path (no pool dispatch); values are clamped to at least 1.
+    /// Output is bit-identical regardless of thread count.
+    pub fn with_threads(threads: usize) -> Self {
+        VideoDecoder {
+            sps: None,
+            pps: None,
+            dpb: Dpb::new(16),
+            prev_poc: 0,
+            outputs: Vec::new(),
+            seen_first: false,
+            cur_meta: FrameMeta::default(),
+            pool: crate::threadpool::ThreadPool::new(threads.max(1)),
+            seek_cache: SeekCache::default(),
+        }
+    }
+
+    /// Number of worker threads in this decoder's pool.
+    pub fn threads(&self) -> usize {
+        self.pool.threads()
+    }
+
     /// Decode an entire elementary stream, returning frames in presentation
-    /// (POC) order. Framing (Annex-B vs length-prefixed) is auto-detected. This
-    /// is the recommended entry point; [`decode_hevc`] wraps it for one-shot use.
+    /// (POC) order.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<VideoFrame>, DecodeError> {
         self.decode_all(data)
     }
@@ -421,27 +514,87 @@ impl VideoDecoder {
         data: &[u8],
         target_poc: i32,
     ) -> Result<Option<VideoFrame>, DecodeError> {
-        let framing = detect_framing(data);
-        let aus = self.collect_access_units(data, framing)?;
+        let key = (data.as_ptr() as usize, data.len());
+        if self.seek_cache.key != Some(key) {
+            self.seek_cache = SeekCache {
+                key: Some(key),
+                ..SeekCache::default()
+            };
+        }
+
+        // Access-unit split: parse once per buffer, reuse afterward.
+        if self.seek_cache.aus.is_empty() {
+            let framing = detect_framing(data);
+            let aus = self.collect_access_units(data, framing)?;
+            self.seek_cache.aus = std::rc::Rc::new(aus);
+        }
+        let aus = std::rc::Rc::clone(&self.seek_cache.aus);
         if aus.is_empty() {
             return Ok(None);
         }
+
         let start = self.irap_at_or_before_target(&aus, target_poc);
-        self.reset_decode_state();
-        for au in &aus[start..] {
+
+        // Fast path: the target's GOP is (partly) decoded and the frame is
+        // already cached — scrubbing within a GOP costs nothing after the first
+        // frame that reaches this far.
+        if self.seek_cache.gop_start == Some(start)
+            && let Some(f) = self.seek_cache.gop_frames.get(&target_poc)
+        {
+            return Ok(Some(f.clone()));
+        }
+
+        // If we're entering a *different* GOP than the cached one, restart the
+        // decode state at its random-access point and drop the old GOP's frames.
+        // If it's the *same* GOP, keep the decoder state so we resume forward
+        // from where the previous call stopped rather than re-decoding from the
+        // IRAP.
+        let resuming = self.seek_cache.gop_start == Some(start);
+        let first_au = if resuming {
+            self.seek_cache.next_au
+        } else {
+            self.reset_decode_state();
+            self.seek_cache.gop_start = Some(start);
+            self.seek_cache.gop_frames.clear();
+            start
+        };
+
+        for (i, au) in aus.iter().enumerate().skip(first_au) {
             self.decode_access_unit(au)?;
+            self.seek_cache.next_au = i + 1;
+            // Cache every freshly available frame (from `outputs` or the DPB),
+            // so later calls into this GOP are served from the map.
+            for f in self.outputs.drain(..) {
+                self.seek_cache.gop_frames.entry(f.poc).or_insert(f);
+            }
+            for f in &self.dpb.frames {
+                self.seek_cache
+                    .gop_frames
+                    .entry(f.poc)
+                    .or_insert_with(|| VideoFrame {
+                        planes: f.planes.clone(),
+                        poc: f.poc,
+                        meta: self.cur_meta.clone(),
+                    });
+            }
+            if let Some(f) = self.seek_cache.gop_frames.get(&target_poc) {
+                return Ok(Some(f.clone()));
+            }
         }
-        // Flush the reorder buffer exactly like decode_all so every decoded
-        // picture (including the target, wherever it sits in the DPB) is emitted.
+
+        // Reached the end of the GOP (or stream) without the target: flush the
+        // reorder buffer and cache whatever comes out, then look again.
         for f in self.dpb.bump(true) {
-            self.outputs.push(VideoFrame {
-                planes: f.planes,
-                poc: f.poc,
-                meta: self.cur_meta.clone(),
-            });
+            self.seek_cache
+                .gop_frames
+                .entry(f.poc)
+                .or_insert(VideoFrame {
+                    planes: f.planes,
+                    poc: f.poc,
+                    meta: self.cur_meta.clone(),
+                });
         }
-        let frame = self.outputs.drain(..).find(|f| f.poc == target_poc);
-        Ok(frame)
+        Ok(self.seek_cache.gop_frames.get(&target_poc).cloned())
     }
 
     /// The stream's VUI frame rate, if it signals one. Parses only far enough to
@@ -522,6 +675,7 @@ impl VideoDecoder {
         let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
         let mut prev_poc = 0i32;
         let mut best = 0usize;
+        let mut have_best = false;
         for (i, au) in aus.iter().enumerate() {
             // The AU's first VCL NAL carries the picture's POC LSB.
             let Some((nal_type, bytes)) = au.iter().find(|(t, _)| nal::is_vcl(*t)) else {
@@ -539,8 +693,19 @@ impl VideoDecoder {
                 Err(_) => prev_poc,
             };
             prev_poc = poc;
-            if nal::is_irap(*nal_type) && poc <= target_poc {
-                best = i;
+            if nal::is_irap(*nal_type) {
+                if poc <= target_poc {
+                    best = i;
+                    have_best = true;
+                } else if have_best {
+                    // A later IRAP already sits past the target. POC only rises
+                    // within a coded video sequence, so no further IRAP can be a
+                    // closer preceding random-access point — stop scanning
+                    // instead of parsing every remaining slice header. (An IDR
+                    // resets POC to 0, which is <= any non-negative target and so
+                    // never reaches this branch.)
+                    break;
+                }
             }
         }
         best
@@ -724,7 +889,19 @@ impl VideoDecoder {
         } else {
             Some((cabac0, sub0.as_slice()))
         };
-        d.decode_slice_ctx(hdr0.slice_segment_address, starts0)?;
+        // Try the parallel WPP wavefront first; it decodes the whole picture
+        // when eligible. It threads intra decode; P/B slices decode their CABAC
+        // serially but still get parallel deblock/SAO from `finish` below. (The
+        // RowFactory carries interstate so inter-WPP can be enabled once its
+        // cross-row motion hand-off is validated.)
+        let ran_wavefront = if segs.len() == 1 && hdr0.slice_type == crate::inter::SLICE_I {
+            d.try_decode_wavefront(first_rbsp, first_bytes, &hdr0, &self.pool)?
+        } else {
+            false
+        };
+        if !ran_wavefront {
+            d.decode_slice_ctx(hdr0.slice_segment_address, starts0)?;
+        }
 
         // Decode any remaining segments of the same picture into the same
         // decoder (accumulating the reconstructed planes and motion field).
@@ -771,7 +948,9 @@ impl VideoDecoder {
         }
 
         // Deblock/SAO once the whole picture is reconstructed, then store it.
-        let planes = d.finish(None);
+        // Deblock runs serially (its parallel chroma kernel is not yet bit-exact
+        // vs the serial reference); SAO runs on the pool.
+        let planes = d.finish_with(None, Some(&self.pool));
         let (motion, width4, height4) = d.take_motion();
 
         let is_ref = nal::is_reference(first_nal);

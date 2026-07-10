@@ -179,12 +179,12 @@ pub(crate) struct FullDecoder<'cab> {
     /// heap allocations on the hot path (~4–6 allocs per TU eliminated).
     scratch: intra::IntraScratch,
     /// Dequantised coefficient scratch (max 32×32 = 1024 values, clamped to ±32768 → i32)
-    deq_scratch: Vec<i32>,
+    deq_scratch: Box<[i32; 1024]>,
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
-    res_scratch: Vec<i32>,
+    res_scratch: Box<[i32; 1024]>,
     /// i16 dequant/residual scratch, used on the 8-bit-depth path (half the width).
-    deq_scratch16: Vec<i16>,
-    res_scratch16: Vec<i16>,
+    deq_scratch16: Box<[i16; 1024]>,
+    res_scratch16: Box<[i16; 1024]>,
     /// Parsed residual levels scratch (max 32×32), reused across TUs.
     coeff_scratch: Vec<i32>,
     /// Cached strong_intra_smoothing (avoids env-var lookup per TU)
@@ -199,7 +199,7 @@ pub(crate) struct FullDecoder<'cab> {
     /// prediction is enabled by the PPS for this slice type (§7.4.7.3).
     pred_weights: Option<crate::inter::PredWeightTable>,
     /// Per-4×4-luma motion field for the current picture.
-    motion: Vec<MotionInfo>,
+    motion: crate::plane::Plane<MotionInfo>,
     /// Reference picture lists for the current slice (planes + POC).
     ref_list0: Vec<crate::dpb::RefEntry>,
     ref_list1: Vec<crate::dpb::RefEntry>,
@@ -375,17 +375,17 @@ impl FullDecoder<'static> {
             wpp_ctx_snap: vec![None; ctb_rows],
             wpp_ictx_snap: vec![None; ctb_rows],
             scratch: intra::IntraScratch::new(),
-            deq_scratch: vec![0i32; 1024],
-            res_scratch: vec![0i32; 1024],
-            deq_scratch16: vec![0i16; 1024],
-            res_scratch16: vec![0i16; 1024],
+            deq_scratch: Box::new([0i32; 1024]),
+            res_scratch: Box::new([0i32; 1024]),
+            deq_scratch16: Box::new([0i16; 1024]),
+            res_scratch16: Box::new([0i16; 1024]),
             coeff_scratch: vec![0i32; 1024],
             cur_tile_id: 0,
             strong_smoothing: true,
             slice_type: hdr.slice_type,
             cabac_init: hdr.cabac_init,
             pred_weights: hdr.pred_weights.clone(),
-            motion: vec![MotionInfo::intra(); grid_w * grid_h],
+            motion: crate::plane::Plane::owned(vec![MotionInfo::intra(); grid_w * grid_h]),
             ref_list0: Vec::new(),
             ref_list1: Vec::new(),
             cur_poc: 0,
@@ -572,9 +572,29 @@ impl<'cab> FullDecoder<'cab> {
     /// I-slice initial entropy contexts for seeding wavefront row 0.
     pub(crate) fn init_contexts_pub(&self) -> (ContextSet, IntraModeContexts) {
         let qp = self.slice_qp.clamp(0, 51) as u8;
+        // CABAC init type (§9.3.2.2): I=0; P=1/2 and B=2/1, swapped by
+        // cabac_init_flag. Must match the serial start-of-slice init so the
+        // wavefront row 0 seeds identical contexts.
+        let init_type = match self.slice_type {
+            crate::inter::SLICE_I => 0u8,
+            crate::inter::SLICE_P => {
+                if self.cabac_init {
+                    2
+                } else {
+                    1
+                }
+            }
+            _ => {
+                if self.cabac_init {
+                    1
+                } else {
+                    2
+                }
+            }
+        };
         (
-            ContextSet::init_islice(qp),
-            IntraModeContexts::init_islice(qp),
+            ContextSet::init(init_type, qp),
+            IntraModeContexts::init(init_type, qp),
         )
     }
 
@@ -640,6 +660,19 @@ impl<'cab> FullDecoder<'cab> {
             tc_offset_div2: self.tc_offset_div2,
             sign_hiding: self.sign_hiding,
             strong_smoothing: self.strong_smoothing,
+            motion: (self.motion.as_mut_ptr(), self.motion.len()),
+            slice_type: self.slice_type,
+            cabac_init: self.cabac_init,
+            cur_poc: self.cur_poc,
+            mvd_l1_zero: self.mvd_l1_zero,
+            temporal_mvp: self.temporal_mvp,
+            max_num_merge_cand: self.max_num_merge_cand,
+            collocated_from_l0: self.collocated_from_l0,
+            collocated_ref_idx: self.collocated_ref_idx,
+            ref_list0: self.ref_list0.clone(),
+            ref_list1: self.ref_list1.clone(),
+            ref_frames: self.ref_frames.clone(),
+            pred_weights: self.pred_weights.clone(),
         }
     }
 
@@ -856,6 +889,18 @@ impl<'cab> FullDecoder<'cab> {
     /// Apply in-loop filters (deblocking then SAO) over the fully-reconstructed
     /// picture and return the planes. Call once, after all slice segments.
     pub(crate) fn finish(&mut self, pool: Option<&crate::threadpool::ThreadPool>) -> YuvPlanes {
+        self.finish_with(pool, pool)
+    }
+
+    /// As [`Self::finish`], but with independent pools for deblocking and SAO so
+    /// a caller can keep one filter serial. The video path passes `None` for
+    /// `deblock_pool` because the parallel deblock's chroma kernel is not yet
+    /// bit-identical to the serial reference; SAO stays parallel.
+    pub(crate) fn finish_with(
+        &mut self,
+        deblock_pool: Option<&crate::threadpool::ThreadPool>,
+        sao_pool: Option<&crate::threadpool::ThreadPool>,
+    ) -> YuvPlanes {
         // In-loop filters run in HEVC order: deblocking first, then SAO. They
         // are independently gated: deblocking runs unless it is disabled (PPS or
         // a slice-level override), while SAO runs only when the SPS enables it.
@@ -864,7 +909,7 @@ impl<'cab> FullDecoder<'cab> {
         // no-op for all-intra pictures (their edges already hold BS 2).
         self.finalize_coeff_bs();
         if !self.deblocking_disabled {
-            match pool {
+            match deblock_pool {
                 Some(p) if p.threads() > 1 && self.ctb_rows > 1 => {
                     self.apply_deblocking_parallel(p)
                 }
@@ -879,7 +924,7 @@ impl<'cab> FullDecoder<'cab> {
             // slice/tile/PCM boundary maps, so a boundary-restricted picture
             // (§8.7.3.2) always takes the serial gated path.
             let restricted = self.sao_boundary_restricted();
-            match pool {
+            match sao_pool {
                 Some(p) if p.threads() > 1 && self.ctb_rows > 1 && !restricted => {
                     self.apply_sao_parallel(p)
                 }
@@ -1345,28 +1390,31 @@ impl<'cab> FullDecoder<'cab> {
                         continue;
                     }
                     // Chroma QP derivation (§8.7.2.5.5): average the co-located
-                    // luma QpY of the two sides, add the picture chroma QP offset,
-                    // then map through the chroma QP table (QpC).
-                    let qp_p_l = qp_at(
-                        &self.qp_y_map[..],
-                        lex.saturating_sub(1).min(w - 1),
-                        ley.min(h - 1),
-                    );
+                    // luma QpY of the two sides of the edge. The P sample is to
+                    // the left for a vertical edge and above for a horizontal
+                    // edge; Q is at the edge. Add the per-plane chroma QP offset
+                    // (Cb vs Cr differ), then map through QpC and derive tC.
+                    let (px_p, py_p) = if pass == 0 {
+                        (lex.saturating_sub(1).min(w - 1), ley.min(h - 1))
+                    } else {
+                        (lex.min(w - 1), ley.saturating_sub(1).min(h - 1))
+                    };
+                    let qp_p_l = qp_at(&self.qp_y_map[..], px_p, py_p);
                     let qp_q_l = qp_at(&self.qp_y_map[..], lex.min(w - 1), ley.min(h - 1));
                     let avg_qp_l = (qp_p_l + qp_q_l + 1) >> 1;
-                    let qp_c = qpc(
-                        avg_qp_l + self.pps.cb_qp_offset,
-                        self.sps.chroma_idc,
-                        self.bd_c,
-                    );
-                    let tc_prime_c = (qp_c + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
-                    let tc_c = TC[tc_prime_c as usize];
-                    if tc_c == 0 {
-                        scan += 4;
-                        continue;
-                    }
 
                     for plane in 0..2usize {
+                        let cqp_offset = if plane == 0 {
+                            self.pps.cb_qp_offset
+                        } else {
+                            self.pps.cr_qp_offset
+                        };
+                        let qp_c = qpc(avg_qp_l + cqp_offset, self.sps.chroma_idc, self.bd_c);
+                        let tc_prime_c = (qp_c + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
+                        let tc_c = TC[tc_prime_c as usize];
+                        if tc_c == 0 {
+                            continue;
+                        }
                         let pix = if plane == 0 {
                             &mut self.cb
                         } else {
@@ -2040,28 +2088,74 @@ impl<'cab> FullDecoder<'cab> {
         let gh = self.grid_h;
         let have_motion = self.motion.len() >= gw * gh;
         let is_intra = |m: &[crate::inter::MotionInfo], g: usize| have_motion && m[g].is_intra;
+        // Inter boundary strength (§8.7.2.4): bS = 1 between two inter blocks
+        // that use different reference pictures, a different number of MVs, or
+        // whose motion vectors differ by ≥ 4 quarter-samples in any component.
+        let inter_bs1 = |p: &crate::inter::MotionInfo, q: &crate::inter::MotionInfo| -> bool {
+            let rp = |m: &crate::inter::MotionInfo, l: usize| {
+                if m.pred_used(l) { m.ref_poc[l] } else { -1 }
+            };
+            let (rp0, rp1) = (rp(p, 0), rp(p, 1));
+            let (rq0, rq1) = (rp(q, 0), rp(q, 1));
+            let same_pics = (rp0 == rq0 && rp1 == rq1) || (rp0 == rq1 && rp1 == rq0);
+            if !same_pics {
+                return true;
+            }
+            let mv = |m: &crate::inter::MotionInfo, l: usize| {
+                if m.pred_used(l) {
+                    m.mv[l]
+                } else {
+                    crate::inter::Mv::default()
+                }
+            };
+            let (mp0, mp1, mq0, mq1) = (mv(p, 0), mv(p, 1), mv(q, 0), mv(q, 1));
+            let far = |a: crate::inter::Mv, b: crate::inter::Mv| {
+                (a.x - b.x).abs() >= 4 || (a.y - b.y).abs() >= 4
+            };
+            if rp0 != rp1 {
+                if rp0 == rq0 {
+                    far(mp0, mq0) || far(mp1, mq1)
+                } else {
+                    far(mp0, mq1) || far(mp1, mq0)
+                }
+            } else {
+                (far(mp0, mq0) || far(mp1, mq1)) && (far(mp0, mq1) || far(mp1, mq0))
+            }
+        };
         for gy in 0..gh {
             let row = gy * gw;
             for gx in 0..gw {
                 let g = row + gx;
                 if gx > 0 && self.tu_edge_v[g] {
                     if self.bs_v[g] < 2
-                        && (is_intra(&self.motion, g) || is_intra(&self.motion, g - 1))
+                        && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - 1))
                     {
                         self.bs_v[g] = 2;
                         self.edge_v[g] = true;
                     } else if self.bs_v[g] < 1 && (self.nz_coeff[g] || self.nz_coeff[g - 1]) {
                         self.bs_v[g] = 1;
                         self.edge_v[g] = true;
+                    } else if self.bs_v[g] < 1
+                        && have_motion
+                        && inter_bs1(&self.motion[g], &self.motion[g - 1])
+                    {
+                        self.bs_v[g] = 1;
+                        self.edge_v[g] = true;
                     }
                 }
                 if gy > 0 && self.tu_edge_h[g] {
                     if self.bs_h[g] < 2
-                        && (is_intra(&self.motion, g) || is_intra(&self.motion, g - gw))
+                        && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - gw))
                     {
                         self.bs_h[g] = 2;
                         self.edge_h[g] = true;
                     } else if self.bs_h[g] < 1 && (self.nz_coeff[g] || self.nz_coeff[g - gw]) {
+                        self.bs_h[g] = 1;
+                        self.edge_h[g] = true;
+                    } else if self.bs_h[g] < 1
+                        && have_motion
+                        && inter_bs1(&self.motion[g], &self.motion[g - gw])
+                    {
                         self.bs_h[g] = 1;
                         self.edge_h[g] = true;
                     }
@@ -2919,7 +3013,7 @@ impl<'cab> FullDecoder<'cab> {
                         scaling,
                         &mut self.deq_scratch16[..n * n],
                     );
-                    if n == 4 {
+                    if n == 4 && !self.cur_cu_inter {
                         (self.exec.inv_transform_dst4_16)(
                             &self.deq_scratch16[..n * n],
                             self.bd,
@@ -2984,7 +3078,7 @@ impl<'cab> FullDecoder<'cab> {
                     scaling,
                     &mut self.deq_scratch[..n * n],
                 );
-                if n == 4 {
+                if n == 4 && !self.cur_cu_inter {
                     (self.exec.inv_transform_dst4)(
                         &self.deq_scratch[..n * n],
                         self.bd,
@@ -3282,7 +3376,7 @@ impl<'cab> FullDecoder<'cab> {
             &mut left[..2 * n],
         );
         let neutral = 1u16
-            .checked_shl((self.bd_c.saturating_sub(1)) as u32)
+            .checked_shl(self.bd_c.saturating_sub(1) as u32)
             .unwrap_or(0);
         let sc = &mut self.scratch;
         intra::substitute_refs_into(
@@ -3537,6 +3631,22 @@ pub(crate) struct RowFactory {
     tc_offset_div2: i32,
     sign_hiding: bool,
     strong_smoothing: bool,
+    // ---- Inter-prediction state (shared across wavefront rows) --------------
+    /// Per-4×4 motion field, shared like the picture planes: the 2-CTB lag makes
+    /// the above row's motion visible before the current row reads it for MVP.
+    motion: (*mut MotionInfo, usize),
+    slice_type: u8,
+    cabac_init: bool,
+    cur_poc: i32,
+    mvd_l1_zero: bool,
+    temporal_mvp: bool,
+    max_num_merge_cand: usize,
+    collocated_from_l0: bool,
+    collocated_ref_idx: usize,
+    ref_list0: Vec<crate::dpb::RefEntry>,
+    ref_list1: Vec<crate::dpb::RefEntry>,
+    ref_frames: Vec<crate::inter::RefFramePlanes>,
+    pred_weights: Option<crate::inter::PredWeightTable>,
 }
 
 // SAFETY: the raw pointers address buffers kept alive by the template decoder
@@ -3634,28 +3744,28 @@ impl RowFactory {
             wpp_ctx_snap: Vec::new(),
             wpp_ictx_snap: Vec::new(),
             scratch: intra::IntraScratch::new(),
-            deq_scratch: vec![0i32; 1024],
-            res_scratch: vec![0i32; 1024],
-            deq_scratch16: vec![0i16; 1024],
-            res_scratch16: vec![0i16; 1024],
+            deq_scratch: Box::new([0i32; 1024]),
+            res_scratch: Box::new([0i32; 1024]),
+            deq_scratch16: Box::new([0i16; 1024]),
+            res_scratch16: Box::new([0i16; 1024]),
             coeff_scratch: vec![0i32; 1024],
             strong_smoothing: self.strong_smoothing,
-            slice_type: crate::inter::SLICE_I,
-            cabac_init: false,
-            pred_weights: None,
-            motion: Vec::new(),
-            ref_list0: Vec::new(),
-            ref_list1: Vec::new(),
-            cur_poc: 0,
-            mvd_l1_zero: false,
-            temporal_mvp: false,
-            max_num_merge_cand: 5,
+            slice_type: self.slice_type,
+            cabac_init: self.cabac_init,
+            pred_weights: self.pred_weights.clone(),
+            motion: unsafe { crate::plane::Plane::shared(self.motion.0, self.motion.1) },
+            ref_list0: self.ref_list0.clone(),
+            ref_list1: self.ref_list1.clone(),
+            cur_poc: self.cur_poc,
+            mvd_l1_zero: self.mvd_l1_zero,
+            temporal_mvp: self.temporal_mvp,
+            max_num_merge_cand: self.max_num_merge_cand,
             cur_cu_inter: false,
             last_pu_merge: false,
             cu_skip_map: Vec::new(),
-            collocated_from_l0: true,
-            collocated_ref_idx: 0,
-            ref_frames: Vec::new(),
+            collocated_from_l0: self.collocated_from_l0,
+            collocated_ref_idx: self.collocated_ref_idx,
+            ref_frames: self.ref_frames.clone(),
             mc_pred0: Vec::new(),
             mc_pred1: Vec::new(),
             mc_tmp: Vec::new(),
@@ -3851,6 +3961,7 @@ struct DecoderNeighbors<'a> {
     ref_list1: &'a [crate::dpb::RefEntry],
     collocated_from_l0: bool,
     collocated_ref_idx: usize,
+    log2_ctb: u32,
 }
 
 impl<'a> DecoderNeighbors<'a> {
@@ -3908,7 +4019,7 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
         // The collocated luma position is masked to a 16×16 grid (§8.5.3.2.8):
         // xColPb = (x >> 4) << 4, yColPb = (y >> 4) << 4. The bottom-right
         // candidate is only valid when it lies inside the picture and within the
-        // current CTB row; otherwise the caller must fall back to the centre. We
+        // current CTB row; otherwise the caller must fall back to the center. We
         // therefore reject (return None) instead of clamping to the edge.
         if x >= self.w || y >= self.h {
             return None;
@@ -3924,20 +4035,45 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
         if m.is_intra {
             return None;
         }
-        // Prefer the requested list, then the other.
-        for l in [list, 1 - list] {
-            let uses = (l == 0 && m.pred.l0) || (l == 1 && m.pred.l1);
-            if uses {
-                let col_dist = col.poc - m.ref_poc[l];
-                let cur_dist = cur_poc - ref_poc;
-                return Some(crate::motion::scale_mv(m.mv[l], col_dist, cur_dist));
-            }
+        // Collocated MV list selection (§8.5.3.2.9). Pick which of the
+        // collocated block's motion vectors to use:
+        //  - if it used only L1, take L1; only L0, take L0;
+        //  - if bi-predicted: when every active reference of the current slice
+        //    precedes the current picture, use the target list `list`;
+        //    otherwise use collocated_from_l0_flag.
+        let (mv_col, col_ref_poc) = if !m.pred.l0 {
+            (m.mv[1], m.ref_poc[1])
+        } else if !m.pred.l1 {
+            (m.mv[0], m.ref_poc[0])
+        } else {
+            let all_before = self.ref_list0.iter().all(|r| r.poc < cur_poc)
+                && self.ref_list1.iter().all(|r| r.poc < cur_poc);
+            // §8.5.3.2.9: bi-predicted collocated block. When every active
+            // reference precedes the current picture, use the target list;
+            // otherwise use collocated_from_l0_flag as the list index directly.
+            let sel = if all_before {
+                list
+            } else {
+                self.collocated_from_l0 as usize
+            };
+            (m.mv[sel], m.ref_poc[sel])
+        };
+        // §8.5.3.2.9: when the collocated and current reference distances are
+        // equal (or a long-term ref is involved), use the MV unscaled.
+        let col_dist = col.poc - col_ref_poc;
+        let cur_dist = cur_poc - ref_poc;
+        if col_dist == cur_dist {
+            return Some(mv_col);
         }
-        None
+        Some(crate::motion::scale_mv(mv_col, col_dist, cur_dist))
     }
 
     fn cur_poc(&self) -> i32 {
         self.cur_poc
+    }
+
+    fn ctb_log2(&self) -> u32 {
+        self.log2_ctb
     }
 }
 
@@ -4303,6 +4439,7 @@ impl<'cab> FullDecoder<'cab> {
     fn neighbors(&self) -> DecoderNeighbors<'_> {
         DecoderNeighbors {
             motion: &self.motion,
+            log2_ctb: self.log2_ctb,
             decoded: &self.decoded,
             slice_idx: &self.slice_idx,
             cur_slice: self.cur_slice_idx,
@@ -4912,7 +5049,8 @@ impl<'cab> FullDecoder<'cab> {
     /// Extract the coded picture's motion field and grid dimensions for storage
     /// in the DPB (temporal MV prediction of later pictures).
     pub(crate) fn take_motion(&mut self) -> (Vec<MotionInfo>, usize, usize) {
-        (std::mem::take(&mut self.motion), self.grid_w, self.grid_h)
+        let m = std::mem::take(&mut self.motion);
+        (m.to_vec(), self.grid_w, self.grid_h)
     }
 }
 
