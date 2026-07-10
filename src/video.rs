@@ -362,6 +362,86 @@ pub fn decode_hevc_frame_at(data: &[u8], seconds: f64) -> Result<Option<VideoFra
     VideoDecoder::new().decode_frame_at(data, seconds)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NalUnitType(u8);
+
+impl NalUnitType {
+    #[inline]
+    const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    const fn get(self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    fn is_vcl(self) -> bool {
+        nal::is_vcl(self.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OwnedNalUnit {
+    nal_type: NalUnitType,
+    bytes: Vec<u8>,
+}
+
+impl OwnedNalUnit {
+    #[inline]
+    fn new(nal_type: u8, bytes: Vec<u8>) -> Self {
+        Self {
+            nal_type: NalUnitType::new(nal_type),
+            bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AccessUnit {
+    nals: Vec<OwnedNalUnit>,
+}
+
+impl AccessUnit {
+    #[inline]
+    fn push(&mut self, nal: OwnedNalUnit) {
+        self.nals.push(nal);
+    }
+
+    #[inline]
+    fn append(&mut self, other: &mut Self) {
+        self.nals.append(&mut other.nals);
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.nals.is_empty()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.nals.clear();
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.nals.len()
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &OwnedNalUnit> {
+        self.nals.iter()
+    }
+}
+
+#[derive(Debug)]
+struct SliceSegmentNal {
+    nal_type: NalUnitType,
+    rbsp: Vec<u8>,
+    source: Vec<u8>,
+}
+
 /// Stateful HEVC video decoder.
 ///
 /// For most uses the free function [`decode_hevc`] (or [`VideoDecoder::decode`])
@@ -397,6 +477,10 @@ pub struct VideoDecoder {
     /// the serial path and is byte-identical.
     pool: crate::threadpool::ThreadPool,
     seek_cache: SeekCache,
+    /// Accumulator for the incremental [`process_nal`] API: VCL NALs of the
+    /// current access unit buffered until the next picture's first slice (or a
+    /// flush) arrives, so multi-slice pictures decode as one unit.
+    pending_au: AccessUnit,
 }
 
 /// Per-stream seek cache (see [`VideoDecoder::seek_cache`]).
@@ -404,7 +488,7 @@ pub struct VideoDecoder {
 struct SeekCache {
     key: Option<(usize, usize)>,
     /// The stream's access units, split once and reused across calls.
-    aus: std::rc::Rc<Vec<Vec<(u8, Vec<u8>)>>>,
+    aus: std::rc::Rc<Vec<AccessUnit>>,
     /// Index into `aus` of the random-access point the cached GOP starts at.
     gop_start: Option<usize>,
     /// Next access unit to decode when resuming the cached GOP forward.
@@ -436,6 +520,7 @@ impl VideoDecoder {
             cur_meta: FrameMeta::default(),
             pool: crate::threadpool::ThreadPool::with_available_parallelism(),
             seek_cache: SeekCache::default(),
+            pending_au: AccessUnit::default(),
         }
     }
 
@@ -456,6 +541,7 @@ impl VideoDecoder {
             cur_meta: FrameMeta::default(),
             pool: crate::threadpool::ThreadPool::new(threads.max(1)),
             seek_cache: SeekCache::default(),
+            pending_au: AccessUnit::default(),
         }
     }
 
@@ -482,9 +568,12 @@ impl VideoDecoder {
                 meta: self.cur_meta.clone(),
             });
         }
-        let mut out = std::mem::take(&mut self.outputs);
-        out.sort_by_key(|f| f.poc);
-        Ok(out)
+        // Pictures are already emitted in output order: the DPB bumps the
+        // lowest-POC pending picture per §C.5.2.2, and each IRAP that starts a
+        // new coded video sequence flushes the DPB first, so cross-CVS order is
+        // preserved. A global POC sort would be wrong here — POC restarts at
+        // each CVS, so it could interleave pictures from different sequences.
+        Ok(std::mem::take(&mut self.outputs))
     }
 
     /// Decode and return the single frame that should be shown at `seconds`.
@@ -648,34 +737,34 @@ impl VideoDecoder {
 
     /// Group the stream into access units, prepending the parameter-set NALs
     /// that configure each AU so a decoded can start at any returned index.
-    #[allow(clippy::type_complexity)]
     fn collect_access_units(
         &mut self,
         data: &[u8],
         framing: Framing,
-    ) -> Result<Vec<Vec<(u8, Vec<u8>)>>, DecodeError> {
-        let mut nals: Vec<(u8, Vec<u8>)> = Vec::new();
+    ) -> Result<Vec<AccessUnit>, DecodeError> {
+        let mut nals = Vec::new();
         for_each_nal(data, framing, |n: Nal| {
-            nals.push((n.nal_type, n.bytes.to_vec()));
+            nals.push(OwnedNalUnit::new(n.nal_type, n.bytes.to_vec()));
             Ok(())
         })?;
-        let mut aus: Vec<Vec<(u8, Vec<u8>)>> = Vec::new();
-        let mut pending_non_vcl: Vec<(u8, Vec<u8>)> = Vec::new();
-        let mut cur: Vec<(u8, Vec<u8>)> = Vec::new();
-        for (nal_type, bytes) in nals {
-            if nal::is_vcl(nal_type) {
-                if self.is_first_slice(nal_type, &bytes) && !cur.is_empty() {
+        let mut aus = Vec::new();
+        let mut pending_non_vcl = AccessUnit::default();
+        let mut cur = AccessUnit::default();
+        for nal_unit in nals {
+            let nal_type = nal_unit.nal_type.get();
+            if nal_unit.nal_type.is_vcl() {
+                if self.is_first_slice(nal_type, &nal_unit.bytes) && !cur.is_empty() {
                     aus.push(std::mem::take(&mut cur));
                 }
                 if cur.is_empty() {
                     cur.append(&mut pending_non_vcl);
                 }
-                cur.push((nal_type, bytes));
+                cur.push(nal_unit);
             } else {
                 // Apply params now (so slice-header parsing works) and remember
                 // them to prepend to the next AU for independent decodability.
-                self.process_non_vcl(nal_type, &bytes)?;
-                pending_non_vcl.push((nal_type, bytes));
+                self.process_non_vcl(nal_type, &nal_unit.bytes)?;
+                pending_non_vcl.push(nal_unit);
             }
         }
         if !cur.is_empty() {
@@ -688,7 +777,7 @@ impl VideoDecoder {
     /// references are all available: the last random-access point (IDR/IRAP)
     /// whose POC is <= the target. Derives POC cheaply by parsing slice headers
     /// only (no pixel reconstruction).
-    fn irap_at_or_before_target(&self, aus: &[Vec<(u8, Vec<u8>)>], target_poc: i32) -> usize {
+    fn irap_at_or_before_target(&self, aus: &[AccessUnit], target_poc: i32) -> usize {
         if self.sps_map.is_empty() || self.pps_map.is_empty() {
             return 0;
         }
@@ -698,10 +787,11 @@ impl VideoDecoder {
         let mut have_best = false;
         for (i, au) in aus.iter().enumerate() {
             // The AU's first VCL NAL carries the picture's POC LSB.
-            let Some((nal_type, bytes)) = au.iter().find(|(t, _)| nal::is_vcl(*t)) else {
+            let Some(nal_unit) = au.iter().find(|nal_unit| nal_unit.nal_type.is_vcl()) else {
                 continue;
             };
-            let nt = *nal_type;
+            let nt = nal_unit.nal_type.get();
+            let bytes = &nal_unit.bytes;
             let rbsp = crate::bitreader::unescape_rbsp(bytes);
             // Resolve the parameter-set chain this slice activates.
             let Some((sps, pps)) = crate::decode::peek_slice_pps_id(&rbsp, nt)
@@ -752,9 +842,9 @@ impl VideoDecoder {
 
     fn decode_stream(&mut self, data: &[u8], framing: Framing) -> Result<(), DecodeError> {
         // Collect NALs first (borrow-friendly), then process.
-        let mut nals: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut nals = Vec::new();
         for_each_nal(data, framing, |n: Nal| {
-            nals.push((n.nal_type, n.bytes.to_vec()));
+            nals.push(OwnedNalUnit::new(n.nal_type, n.bytes.to_vec()));
             Ok(())
         })?;
         // Group VCL NALs into access units. A new picture starts at a VCL NAL
@@ -762,20 +852,21 @@ impl VideoDecoder {
         // VCL NALs (dependent or independent segments) belong to the same
         // picture until the next such flag. Non-VCL NALs (SPS/PPS/VPS/SEI) are
         // applied immediately and flush any pending access unit first.
-        let mut au: Vec<(u8, Vec<u8>)> = Vec::new();
-        for (nal_type, bytes) in nals {
-            if nal::is_vcl(nal_type) {
-                if self.is_first_slice(nal_type, &bytes) && !au.is_empty() {
+        let mut au = AccessUnit::default();
+        for nal_unit in nals {
+            let nal_type = nal_unit.nal_type.get();
+            if nal_unit.nal_type.is_vcl() {
+                if self.is_first_slice(nal_type, &nal_unit.bytes) && !au.is_empty() {
                     self.decode_access_unit(&au)?;
                     au.clear();
                 }
-                au.push((nal_type, bytes));
+                au.push(nal_unit);
             } else {
                 if !au.is_empty() {
                     self.decode_access_unit(&au)?;
                     au.clear();
                 }
-                self.process_non_vcl(nal_type, &bytes)?;
+                self.process_non_vcl(nal_type, &nal_unit.bytes)?;
             }
         }
         if !au.is_empty() {
@@ -840,31 +931,84 @@ impl VideoDecoder {
     }
 
     pub fn process_nal(&mut self, nal_type: u8, bytes: &[u8]) -> Result<(), DecodeError> {
-        match nal_type {
-            nal::SPS | nal::PPS => self.process_non_vcl(nal_type, bytes),
-            t if nal::is_vcl(t) => self.decode_access_unit(&[(t, bytes.to_vec())]),
-            _ => Ok(()),
+        if nal::is_vcl(nal_type) {
+            // A VCL NAL whose first_slice_segment_in_pic_flag is set begins a new
+            // picture: flush the buffered slices of the previous picture first,
+            // then start accumulating this one. Later (non-first) slices append
+            // to the current picture so multi-slice pictures decode as a unit.
+            if self.is_first_slice(nal_type, bytes) && !self.pending_au.is_empty() {
+                self.flush_pending_au()?;
+            }
+            self.pending_au
+                .push(OwnedNalUnit::new(nal_type, bytes.to_vec()));
+            return Ok(());
         }
+        // A non-VCL NAL (parameter set, SEI, EOS/EOB) terminates the current
+        // access unit. Flush any buffered picture, then process the NAL so a
+        // parameter set that follows a picture is not applied to it.
+        if !self.pending_au.is_empty() {
+            self.flush_pending_au()?;
+        }
+        self.process_non_vcl(nal_type, bytes)
     }
 
-    fn decode_access_unit(&mut self, au: &[(u8, Vec<u8>)]) -> Result<(), DecodeError> {
+    /// Decode and clear the buffered access unit. Callers using the incremental
+    /// [`process_nal`] API must call [`flush`](Self::flush) after the last NAL to
+    /// emit the final picture.
+    fn flush_pending_au(&mut self) -> Result<(), DecodeError> {
+        if self.pending_au.is_empty() {
+            return Ok(());
+        }
+        let au = std::mem::take(&mut self.pending_au);
+        self.decode_access_unit(&au)
+    }
+
+    /// Flush the final buffered picture. Call once after the last
+    /// [`process_nal`] when using the incremental API.
+    pub fn flush(&mut self) -> Result<(), DecodeError> {
+        self.flush_pending_au()
+    }
+
+    /// Take the frames decoded so far by the incremental [`process_nal`] API and
+    /// (optionally) drain the DPB. Pass `drain_dpb = true` after the final
+    /// [`flush`] to emit reordered pictures still held for output; pass `false`
+    /// mid-stream to pull only pictures already released by the DPB. Returned
+    /// frames are sorted by POC within what has been emitted; the caller is
+    /// responsible for not mixing pictures across coded-video-sequence resets.
+    pub fn take_frames(&mut self, drain_dpb: bool) -> Vec<VideoFrame> {
+        if drain_dpb {
+            for f in self.dpb.bump(true) {
+                self.outputs.push(VideoFrame {
+                    planes: f.planes,
+                    poc: f.poc,
+                    meta: self.cur_meta.clone(),
+                });
+            }
+        }
+        let mut out = std::mem::take(&mut self.outputs);
+        out.sort_by_key(|f| f.poc);
+        out
+    }
+
+    fn decode_access_unit(&mut self, au: &AccessUnit) -> Result<(), DecodeError> {
         // Apply any parameter-set NALs carried at the head of this access unit
         // (they may precede the first VCL slice, e.g. before an IRAP), and keep
         // only the VCL slice segments for the picture decode. Pre-unescape each
         // slice's RBSP so the borrowed CABAC payloads live for the whole
         // picture decode; the original NAL bytes are kept for WPP/tile entry
         // point mapping.
-        let mut segs: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::with_capacity(au.len());
-        for (nal_type, bytes) in au {
-            if !nal::is_vcl(*nal_type) {
-                self.process_non_vcl(*nal_type, bytes)?;
+        let mut segs = Vec::with_capacity(au.len());
+        for nal_unit in au.iter() {
+            let nal_type = nal_unit.nal_type.get();
+            if !nal_unit.nal_type.is_vcl() {
+                self.process_non_vcl(nal_type, &nal_unit.bytes)?;
                 continue;
             }
-            segs.push((
-                *nal_type,
-                crate::bitreader::unescape_rbsp(bytes),
-                bytes.clone(),
-            ));
+            segs.push(SliceSegmentNal {
+                nal_type: nal_unit.nal_type,
+                rbsp: crate::bitreader::unescape_rbsp(&nal_unit.bytes),
+                source: nal_unit.bytes.clone(),
+            });
         }
         if segs.is_empty() {
             return Ok(());
@@ -872,18 +1016,23 @@ impl VideoDecoder {
         // Activate the parameter-set chain referenced by this picture's first
         // slice: slice_pic_parameter_set_id -> PPS -> its seq_parameter_set_id
         // -> SPS (§7.4.2.4). This lets a stream switch PPS/SPS per picture.
-        let (sps, pps) = match self.activate_params(&segs[0].1, segs[0].0) {
+        let (sps, pps) = match self.activate_params(&segs[0].rbsp, segs[0].nal_type.get()) {
             Some(pair) => pair,
             None => return Ok(()), // no matching parameter sets yet
         };
+        // Size the output DPB from the active SPS (§C.5.2.2) so reorder latency
+        // and buffering follow the stream rather than a fixed capacity.
+        self.dpb.configure(
+            sps.max_dec_pic_buffering as usize,
+            sps.max_num_reorder_pics as usize,
+        );
 
         // Parse the first segment's header to set up picture-level state.
-        let (first_nal, first_rbsp, first_bytes) = (&segs[0].0, &segs[0].1, &segs[0].2);
-        let first_nal = *first_nal;
-        let hdr0 = match parse_slice_header_full(first_rbsp, &sps, &pps, first_nal) {
-            Ok(h) => h,
-            Err(_) => return Ok(()),
-        };
+        let first = &segs[0];
+        let first_nal = first.nal_type.get();
+        let first_rbsp = &first.rbsp;
+        let first_bytes = &first.source;
+        let hdr0 = parse_slice_header_full(first_rbsp, &sps, &pps, first_nal)?;
         if !hdr0.first_slice_in_pic {
             return Ok(());
         }
@@ -932,6 +1081,29 @@ impl VideoDecoder {
         // mid-stream CRA (NoRaslOutputFlag == 0) does not inherit the previous
         // period's suppression and its RASL pictures are still output.
         if is_irap {
+            // §C.5.2.2: at an IRAP that starts a new CVS (NoRaslOutputFlag == 1),
+            // pictures still pending output are either discarded (when
+            // NoOutputOfPriorPicsFlag is 1 — always inferred so for a CRA that
+            // begins a random-access decode) or emitted first. For IDR/BLA the
+            // parsed flag applies directly.
+            if no_rasl_output {
+                let drop_prior = if is_cra {
+                    true
+                } else {
+                    hdr0.no_output_of_prior_pics
+                };
+                if drop_prior {
+                    self.dpb.discard_pending_output();
+                } else {
+                    for f in self.dpb.bump(true) {
+                        self.outputs.push(VideoFrame {
+                            planes: f.planes,
+                            poc: f.poc,
+                            meta: self.cur_meta.clone(),
+                        });
+                    }
+                }
+            }
             if (is_idr || is_bla) || (is_cra && no_rasl_output) {
                 self.dpb.clear_refs();
             }
@@ -1023,11 +1195,10 @@ impl VideoDecoder {
         let mut last_indep = hdr0.clone();
         // Decode any remaining segments of the same picture into the same
         // decoder (accumulating the reconstructed planes and motion field).
-        for (seg_nal, seg_rbsp, seg_bytes) in segs.iter().skip(1) {
-            let mut hdr = match parse_slice_header_full(seg_rbsp, &sps, &pps, *seg_nal) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
+        for segment in segs.iter().skip(1) {
+            let seg_rbsp = &segment.rbsp;
+            let seg_bytes = &segment.source;
+            let mut hdr = parse_slice_header_full(seg_rbsp, &sps, &pps, segment.nal_type.get())?;
             if hdr.first_slice_in_pic {
                 // Shouldn't happen (grouping guarantees it), but be safe.
                 continue;

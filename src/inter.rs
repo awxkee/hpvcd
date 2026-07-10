@@ -70,6 +70,10 @@ pub(crate) struct MotionInfo {
     pub(crate) ref_idx: [i8; 2],
     /// POC of the referenced pictures (for temporal scaling), valid where used.
     pub(crate) ref_poc: [i32; 2],
+    /// Long-term status of the referenced pictures (§8.5.3.2.9): a mismatch in
+    /// long-term status between a candidate's reference and the target reference
+    /// makes the candidate unavailable, and a long-term target is never scaled.
+    pub(crate) ref_lt: [bool; 2],
     /// True when the block is intra-coded (not a valid MV predictor).
     pub(crate) is_intra: bool,
 }

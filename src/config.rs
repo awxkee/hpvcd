@@ -55,6 +55,13 @@ pub(crate) struct Sps {
     pub(crate) max_transform_hierarchy_inter: u32,
     /// log2 of MaxPicOrderCntLsb (§7.4.3.2), 4..=16.
     pub(crate) log2_max_poc_lsb: u32,
+    /// sps_max_num_reorder_pics for the highest sub-layer (§7.4.3.2.1): the
+    /// maximum number of pictures that can precede any picture in decode order
+    /// and follow it in output order. Bounds output-reorder latency.
+    pub(crate) max_num_reorder_pics: u32,
+    /// sps_max_dec_pic_buffering_minus1 + 1 for the highest sub-layer: the DPB
+    /// size in pictures. Used to size the output-bumping threshold.
+    pub(crate) max_dec_pic_buffering: u32,
     /// Asymmetric motion partitions enabled (inter).
     pub(crate) amp_enabled: bool,
     /// SPS-level temporal motion vector prediction enabled.
@@ -461,9 +468,13 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     } else {
         max_sub_layers_minus1
     };
+    let mut max_dec_pic_buffering = 1u32;
+    let mut max_num_reorder_pics = 0u32;
     for _ in start..=max_sub_layers_minus1 {
-        r.read_ue().map_err(|_| e("max_dec_pic_buffering"))?;
-        r.read_ue().map_err(|_| e("num_reorder_pics"))?;
+        // Only the highest sub-layer's values are retained; they govern the
+        // output DPB size and reorder latency (§C.5.2.2).
+        max_dec_pic_buffering = r.read_ue().map_err(|_| e("max_dec_pic_buffering"))? + 1;
+        max_num_reorder_pics = r.read_ue().map_err(|_| e("num_reorder_pics"))?;
         r.read_ue().map_err(|_| e("max_latency"))?;
     }
 
@@ -644,6 +655,8 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         max_transform_hierarchy_intra,
         max_transform_hierarchy_inter,
         log2_max_poc_lsb,
+        max_num_reorder_pics,
+        max_dec_pic_buffering,
         amp_enabled,
         temporal_mvp_enabled,
         short_term_rps,

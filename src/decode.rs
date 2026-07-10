@@ -70,6 +70,18 @@ struct SaoCtb {
     eo_class: [u8; 3],
 }
 
+/// Per-slice deblocking parameters, captured for each independent slice so the
+/// single post-picture deblocking pass can apply the correct values per edge
+/// (§7.4.7.1, §8.7.2). Slice indices start at 1; a default fills index 0.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SliceDeblock {
+    disabled: bool,
+    beta_offset_div2: i32,
+    tc_offset_div2: i32,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+}
+
 pub(crate) struct FullDecoder<'cab> {
     cab: CabacDecoder<'cab>,
     ctx: ContextSet,
@@ -137,6 +149,12 @@ pub(crate) struct FullDecoder<'cab> {
     /// unused (slice indices start at 1); grows as slices are decoded so a
     /// boundary can consult the flag of the slice that owns it (§8.7.1).
     slice_lf_across: Vec<bool>,
+    /// Per-slice-index deblocking parameters (disabled flag, beta/tC offsets,
+    /// Cb/Cr QP offsets). Deblocking runs once over the whole picture after all
+    /// slices are decoded, but each edge must use the parameters of the slice
+    /// that owns the q-side sample (§8.7.2), not a single global copy. Indexed
+    /// by slice_idx like `slice_lf_across`; index 0 is unused.
+    slice_deblock: Vec<SliceDeblock>,
     cu_tqb: bool,  // current CU's cu_transquant_bypass_flag
     grid_w: usize, // ceil(w/4), one entry for every covered 4×4 luma grid cell
     #[allow(dead_code)]
@@ -269,6 +287,18 @@ impl FullDecoder<'static> {
                 w, h
             )));
         }
+        // Tiles combined with WPP (entropy_coding_sync) is not supported: the
+        // substream layout is one per CTB row *within* each tile, which neither
+        // the tiled nor the wavefront path handles. Reject explicitly rather
+        // than silently mis-positioning CABAC substreams and producing garbage.
+        if pps.tiles_enabled
+            && pps.entropy_coding_sync_enabled
+            && (pps.num_tile_columns > 1 || pps.num_tile_rows > 1)
+        {
+            return Err(DecodeError::Unsupported(
+                "tiles combined with entropy_coding_sync (WPP) is not supported".into(),
+            ));
+        }
         // The pixel/output paths are implemented for 8/10/12-bit streams only.
         // Reject malformed SPS values before they reach shifts like `1 << (bd - 1)`.
         sps.bit_depth()?;
@@ -365,6 +395,16 @@ impl FullDecoder<'static> {
                 hdr.slice_loop_filter_across_slices,
                 hdr.slice_loop_filter_across_slices,
             ],
+            slice_deblock: vec![
+                SliceDeblock::default(),
+                SliceDeblock {
+                    disabled: hdr.deblocking_disabled,
+                    beta_offset_div2: hdr.beta_offset_div2,
+                    tc_offset_div2: hdr.tc_offset_div2,
+                    cb_qp_offset: hdr.cb_qp_offset,
+                    cr_qp_offset: hdr.cr_qp_offset,
+                },
+            ],
             cu_tqb: false,
             ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
             grid_w,
@@ -446,6 +486,17 @@ impl<'cab> FullDecoder<'cab> {
                     .resize(idx + 1, hdr.slice_loop_filter_across_slices);
             }
             self.slice_lf_across[idx] = hdr.slice_loop_filter_across_slices;
+            let this_deblock = SliceDeblock {
+                disabled: hdr.deblocking_disabled,
+                beta_offset_div2: hdr.beta_offset_div2,
+                tc_offset_div2: hdr.tc_offset_div2,
+                cb_qp_offset: hdr.cb_qp_offset,
+                cr_qp_offset: hdr.cr_qp_offset,
+            };
+            if self.slice_deblock.len() <= idx {
+                self.slice_deblock.resize(idx + 1, this_deblock);
+            }
+            self.slice_deblock[idx] = this_deblock;
             let slice_qp = clamp_qpy(hdr.slice_qp, self.bd);
             self.slice_qp = slice_qp;
             self.qp_y_prev = slice_qp;
@@ -932,7 +983,17 @@ impl<'cab> FullDecoder<'cab> {
         // picture's transform edges and nonzero-coefficient flags are known. A
         // no-op for all-intra pictures (their edges already hold BS 2).
         self.finalize_coeff_bs();
-        if !self.deblocking_disabled {
+        // Deblocking runs if *any* slice in the picture enables it; each edge
+        // then consults the parameters of the slice that owns its q-side sample
+        // (§8.7.2), rather than a single global copy overwritten by the last
+        // slice. `slice_deblock[1..]` holds the per-slice records; index 0 is a
+        // placeholder. The single-slice fast path keeps the original behaviour.
+        let any_deblock = if self.slice_deblock.len() > 1 {
+            self.slice_deblock[1..].iter().any(|d| !d.disabled)
+        } else {
+            !self.deblocking_disabled
+        };
+        if any_deblock {
             match deblock_pool {
                 Some(p) if p.threads() > 1 && self.ctb_rows > 1 => {
                     self.apply_deblocking_parallel(p)
@@ -1223,6 +1284,21 @@ impl<'cab> FullDecoder<'cab> {
             .unwrap_or(0)
     }
 
+    #[inline]
+    fn slice_deblock_at(&self, px: usize, py: usize) -> SliceDeblock {
+        let idx = self.slice_idx_at(px, py) as usize;
+        self.slice_deblock
+            .get(idx)
+            .copied()
+            .unwrap_or(SliceDeblock {
+                disabled: self.deblocking_disabled,
+                beta_offset_div2: self.beta_offset_div2,
+                tc_offset_div2: self.tc_offset_div2,
+                cb_qp_offset: self.slice_cb_qp_offset,
+                cr_qp_offset: self.slice_cr_qp_offset,
+            })
+    }
+
     fn apply_deblocking(&mut self) {
         // HEVC §8.7.2.4 Tables 8-10 / 8-11 (beta, tC)
         #[rustfmt::skip]
@@ -1244,10 +1320,8 @@ impl<'cab> FullDecoder<'cab> {
             18,20,22,24,
         ];
 
-        // Slice-effective deblocking offsets (PPS values unless the slice
-        // header overrode them).
-        let beta_offset = self.beta_offset_div2 * 2;
-        let tc_offset = self.tc_offset_div2 * 2;
+        // Deblocking offsets and the disabled flag are per-slice; they are
+        // resolved per edge from the q-side sample's owning slice (§8.7.2).
         // HEVC §8.7.2.3: table indices use QP′ = QP + QpBdOffset where
         // QpBdOffset = 6*(BitDepth−8).  For 8-bit this is 0; for 10-bit it's 12.
         let qp_bd_offset_y = 6 * (self.bd as i32 - 8);
@@ -1314,6 +1388,14 @@ impl<'cab> FullDecoder<'cab> {
                             scan += 4;
                             continue;
                         }
+                        // Parameters come from the slice owning the q-side sample.
+                        let sd = self.slice_deblock_at(edge, mid);
+                        if sd.disabled {
+                            scan += 4;
+                            continue;
+                        }
+                        let beta_offset = sd.beta_offset_div2 * 2;
+                        let tc_offset = sd.tc_offset_div2 * 2;
                         let qp_p = qp_at(&self.qp_y_map[..], edge - 1, mid);
                         let qp_q = qp_at(&self.qp_y_map[..], edge, mid);
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
@@ -1354,6 +1436,13 @@ impl<'cab> FullDecoder<'cab> {
                             scan += 4;
                             continue;
                         }
+                        let sd = self.slice_deblock_at(mid, edge);
+                        if sd.disabled {
+                            scan += 4;
+                            continue;
+                        }
+                        let beta_offset = sd.beta_offset_div2 * 2;
+                        let tc_offset = sd.tc_offset_div2 * 2;
                         let qp_p = qp_at(&self.qp_y_map[..], mid, edge - 1);
                         let qp_q = qp_at(&self.qp_y_map[..], mid, edge);
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
@@ -1421,6 +1510,16 @@ impl<'cab> FullDecoder<'cab> {
                         scan += 4;
                         continue;
                     }
+                    // Parameters (tC offset and Cb/Cr QP offsets) come from the
+                    // slice owning the q-side luma sample (§8.7.2, §8.7.2.5.5).
+                    let lqx = lex.min(w - 1);
+                    let lqy = ley.min(h - 1);
+                    let sd = self.slice_deblock_at(lqx, lqy);
+                    if sd.disabled {
+                        scan += 4;
+                        continue;
+                    }
+                    let tc_offset = sd.tc_offset_div2 * 2;
                     // Chroma QP derivation (§8.7.2.5.5): average the co-located
                     // luma QpY of the two sides of the edge. The P sample is to
                     // the left for a vertical edge and above for a horizontal
@@ -1432,14 +1531,16 @@ impl<'cab> FullDecoder<'cab> {
                         (lex.min(w - 1), ley.saturating_sub(1).min(h - 1))
                     };
                     let qp_p_l = qp_at(&self.qp_y_map[..], px_p, py_p);
-                    let qp_q_l = qp_at(&self.qp_y_map[..], lex.min(w - 1), ley.min(h - 1));
+                    let qp_q_l = qp_at(&self.qp_y_map[..], lqx, lqy);
                     let avg_qp_l = (qp_p_l + qp_q_l + 1) >> 1;
 
                     for plane in 0..2usize {
+                        // PPS offset plus this slice's Cb/Cr offset (§8.6.1),
+                        // matching the reconstruction path.
                         let cqp_offset = if plane == 0 {
-                            self.pps.cb_qp_offset
+                            self.pps.cb_qp_offset + sd.cb_qp_offset
                         } else {
-                            self.pps.cr_qp_offset
+                            self.pps.cr_qp_offset + sd.cr_qp_offset
                         };
                         let qp_c = qpc(avg_qp_l + cqp_offset, self.sps.chroma_idc, self.bd_c);
                         let tc_prime_c = (qp_c + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
@@ -2224,6 +2325,7 @@ impl<'cab> FullDecoder<'cab> {
                 }
                 let h_edge = self.tu_edge_h[g] || self.pu_edge_h[g];
                 if gy > 0 && h_edge {
+                    #[allow(clippy::if_same_then_else)]
                     if self.bs_h[g] < 2
                         && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - gw))
                     {
@@ -3802,6 +3904,16 @@ impl RowFactory {
             // WPP rows belong to a single slice; cross-slice filtering is not
             // gated within a wavefront. Default both entries to "allow".
             slice_lf_across: vec![true, true],
+            slice_deblock: vec![
+                SliceDeblock::default(),
+                SliceDeblock {
+                    disabled: self.deblocking_disabled,
+                    beta_offset_div2: self.beta_offset_div2,
+                    tc_offset_div2: self.tc_offset_div2,
+                    cb_qp_offset: self.slice_cb_qp_offset,
+                    cr_qp_offset: self.slice_cr_qp_offset,
+                },
+            ],
             cu_tqb: false,
             grid_w: self.grid_w,
             grid_h: self.grid_h,
@@ -4051,6 +4163,11 @@ struct DecoderNeighbors<'a> {
     collocated_from_l0: bool,
     collocated_ref_idx: usize,
     log2_ctb: u32,
+    /// Tile grid and the current CTB's tile id, used so motion neighbor
+    /// availability rejects candidates from a different tile (§6.4.1). `None`
+    /// when the picture is a single tile.
+    tiles: Option<&'a crate::tiles::TileGrid>,
+    cur_tile_id: usize,
 }
 
 impl<'a> DecoderNeighbors<'a> {
@@ -4064,6 +4181,14 @@ impl<'a> DecoderNeighbors<'a> {
 }
 
 impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
+    fn motion_at(&self, x: isize, y: isize) -> Option<MotionInfo> {
+        if !self.available(x, y) {
+            return None;
+        }
+        let g = self.grid(x as usize, y as usize)?;
+        self.motion.get(g).copied()
+    }
+
     fn available(&self, x: isize, y: isize) -> bool {
         if x < 0 || y < 0 {
             return false;
@@ -4071,20 +4196,28 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
         let (x, y) = (x as usize, y as usize);
         match self.grid(x, y) {
             Some(g) => {
-                self.decoded.get(g).copied().unwrap_or(false)
-                    && (self.cur_slice <= 1
-                        || self.slice_idx.get(g).copied().unwrap_or(u16::MAX) == self.cur_slice)
+                let decoded = self.decoded.get(g).copied().unwrap_or(false);
+                if !decoded {
+                    return false;
+                }
+                if self.cur_slice > 1
+                    && self.slice_idx.get(g).copied().unwrap_or(u16::MAX) != self.cur_slice
+                {
+                    return false;
+                }
+                // A neighbor in a different tile is unavailable for motion
+                // derivation (§6.4.1); this also keeps CABAC context selection
+                // (skip/split) from reaching across a tile boundary.
+                if let Some(grid) = self.tiles {
+                    let ctb = self.log2_ctb;
+                    if grid.tile_id_at(x >> ctb, y >> ctb) != self.cur_tile_id {
+                        return false;
+                    }
+                }
+                true
             }
             None => false,
         }
-    }
-
-    fn motion_at(&self, x: isize, y: isize) -> Option<MotionInfo> {
-        if !self.available(x, y) {
-            return None;
-        }
-        let g = self.grid(x as usize, y as usize)?;
-        self.motion.get(g).copied()
     }
 
     fn temporal(
@@ -4130,10 +4263,10 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
         //  - if bi-predicted: when every active reference of the current slice
         //    precedes the current picture, use the target list `list`;
         //    otherwise use collocated_from_l0_flag.
-        let (mv_col, col_ref_poc) = if !m.pred.l0 {
-            (m.mv[1], m.ref_poc[1])
+        let (mv_col, col_ref_poc, col_ref_lt) = if !m.pred.l0 {
+            (m.mv[1], m.ref_poc[1], m.ref_lt[1])
         } else if !m.pred.l1 {
-            (m.mv[0], m.ref_poc[0])
+            (m.mv[0], m.ref_poc[0], m.ref_lt[0])
         } else {
             let all_before = self.ref_list0.iter().all(|r| r.poc < cur_poc)
                 && self.ref_list1.iter().all(|r| r.poc < cur_poc);
@@ -4145,13 +4278,31 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
             } else {
                 self.collocated_from_l0 as usize
             };
-            (m.mv[sel], m.ref_poc[sel])
+            (m.mv[sel], m.ref_poc[sel], m.ref_lt[sel])
         };
-        // §8.5.3.2.9: when the collocated and current reference distances are
-        // equal (or a long-term ref is involved), use the MV unscaled.
+        // §8.5.3.2.9 long-term handling. The current target reference's
+        // long-term status: match its POC in the target list.
+        let target_list = if list == 0 {
+            &self.ref_list0
+        } else {
+            &self.ref_list1
+        };
+        let cur_ref_lt = target_list
+            .iter()
+            .find(|r| r.poc == ref_poc)
+            .map(|r| r.long_term)
+            .unwrap_or(false);
+        // A mismatch in long-term status between the collocated block's
+        // reference and the current target reference makes the temporal
+        // candidate unavailable.
+        if cur_ref_lt != col_ref_lt {
+            return None;
+        }
+        // A long-term target reference is used unscaled; short-term references
+        // scale by POC distance unless the distances already match.
         let col_dist = col.poc - col_ref_poc;
         let cur_dist = cur_poc - ref_poc;
-        if col_dist == cur_dist {
+        if cur_ref_lt || col_dist == cur_dist {
             return Some(mv_col);
         }
         Some(crate::motion::scale_mv(mv_col, col_dist, cur_dist))
@@ -4169,8 +4320,13 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
 impl<'cab> FullDecoder<'cab> {
     /// cu_skip_flag with the neighbor-based context increment (§9.3.4.2.2).
     fn decode_cu_skip_flag(&mut self, x0: usize, y0: usize) -> bool {
+        // Neighbour availability for the skip-flag context (§9.3.4.2.2) uses the
+        // §6.4.1 process: a left/above neighbor in a different slice or tile is
+        // unavailable and must not contribute to the context increment.
         let mut inc = 0usize;
         if x0 >= 4
+            && self.same_tile(x0 - 1, y0)
+            && self.same_slice(x0 - 1, y0)
             && let Some(g) = self.grid_idx(x0 - 1, y0)
             && self.decoded[g]
             && self.motion_is_skip(g)
@@ -4178,6 +4334,8 @@ impl<'cab> FullDecoder<'cab> {
             inc += 1;
         }
         if y0 >= 4
+            && self.same_tile(x0, y0 - 1)
+            && self.same_slice(x0, y0 - 1)
             && let Some(g) = self.grid_idx(x0, y0 - 1)
             && self.decoded[g]
             && self.motion_is_skip(g)
@@ -4527,9 +4685,11 @@ impl<'cab> FullDecoder<'cab> {
         };
         if c.pred.l0 && (c.ref_idx[0] as usize) < self.ref_list0.len() {
             mi.ref_poc[0] = self.ref_list0[c.ref_idx[0] as usize].poc;
+            mi.ref_lt[0] = self.ref_list0[c.ref_idx[0] as usize].long_term;
         }
         if c.pred.l1 && (c.ref_idx[1] as usize) < self.ref_list1.len() {
             mi.ref_poc[1] = self.ref_list1[c.ref_idx[1] as usize].poc;
+            mi.ref_lt[1] = self.ref_list1[c.ref_idx[1] as usize].long_term;
         }
         mi
     }
@@ -4550,6 +4710,8 @@ impl<'cab> FullDecoder<'cab> {
             ref_list1: &self.ref_list1,
             collocated_from_l0: self.collocated_from_l0,
             collocated_ref_idx: self.collocated_ref_idx,
+            tiles: self.tiles.as_ref(),
+            cur_tile_id: self.cur_tile_id,
         }
     }
 
@@ -4596,6 +4758,11 @@ impl<'cab> FullDecoder<'cab> {
             mi.mv[0] = mv;
             mi.ref_idx[0] = ridx as i8;
             mi.ref_poc[0] = poc;
+            mi.ref_lt[0] = self
+                .ref_list0
+                .get(ridx)
+                .map(|r| r.long_term)
+                .unwrap_or(false);
         } else {
             mi.ref_idx[0] = -1;
         }
@@ -4605,6 +4772,11 @@ impl<'cab> FullDecoder<'cab> {
             mi.mv[1] = mv;
             mi.ref_idx[1] = ridx as i8;
             mi.ref_poc[1] = poc;
+            mi.ref_lt[1] = self
+                .ref_list1
+                .get(ridx)
+                .map(|r| r.long_term)
+                .unwrap_or(false);
         } else {
             mi.ref_idx[1] = -1;
         }
@@ -5277,6 +5449,9 @@ pub(crate) struct SliceHeader {
     pub(crate) slice_segment_address: usize,
     /// True when this is the first slice segment of the picture.
     pub(crate) first_slice_in_pic: bool,
+    /// no_output_of_prior_pics_flag (IRAP only): when set, pictures still pending
+    /// output in the DPB are discarded rather than emitted (§C.5.2.2).
+    pub(crate) no_output_of_prior_pics: bool,
     /// True for a dependent slice segment (inherits the previous segment's
     /// header state and CABAC contexts rather than re-initialising).
     pub(crate) dependent_slice_segment: bool,
@@ -5350,8 +5525,9 @@ pub(crate) fn parse_slice_header_full(
     r.read_bits(16).map_err(|_| e("NAL header"))?; // consume 2-byte NAL header
     let first_slice = r.read_flag().map_err(|_| e("first_slice"))?;
     let is_irap = (16..=23).contains(&nal_type);
+    let mut no_output_of_prior_pics = false;
     if is_irap {
-        r.read_flag().map_err(|_| e("no_prior_pics"))?;
+        no_output_of_prior_pics = r.read_flag().map_err(|_| e("no_prior_pics"))?;
     }
     let _pps_id = r.read_ue().map_err(|_| e("pps_id"))?;
 
@@ -5377,6 +5553,22 @@ pub(crate) fn parse_slice_header_full(
     // the byte-alignment. The reconstruction fields returned here are filled by
     // the caller from the retained independent-segment header.
     if dependent_slice_segment {
+        // Entry-point offsets are present for a dependent segment too whenever
+        // tiles or WPP are enabled (§7.3.6.1); they precede the header extension
+        // and byte alignment. Skipping them left CABAC substreams starting at
+        // the wrong byte for dependent segments combined with tiles/WPP.
+        let mut dep_entry_points: Vec<u32> = Vec::new();
+        if pps.tiles_enabled || pps.entropy_coding_sync_enabled {
+            let n = r.read_ue().map_err(|_| e("num_entry_points"))?;
+            if n > 0 {
+                let len = r.read_ue().map_err(|_| e("offset_len"))? + 1;
+                dep_entry_points.reserve(n as usize);
+                for _ in 0..n {
+                    let off = r.read_bits(len).map_err(|_| e("entry_point"))?;
+                    dep_entry_points.push(off + 1);
+                }
+            }
+        }
         if pps.slice_segment_header_extension_present {
             let l = r.read_ue().map_err(|_| e("ext_len"))?;
             for _ in 0..l {
@@ -5399,8 +5591,9 @@ pub(crate) fn parse_slice_header_full(
             tc_offset_div2: pps.tc_offset_div2,
             slice_segment_address,
             first_slice_in_pic: false,
+            no_output_of_prior_pics: false,
             dependent_slice_segment: true,
-            entry_points: Vec::new(),
+            entry_points: dep_entry_points,
             slice_type: crate::inter::SLICE_I,
             poc_lsb: 0,
             cur_rps: crate::rps::ShortTermRps::default(),
@@ -5678,6 +5871,7 @@ pub(crate) fn parse_slice_header_full(
         tc_offset_div2,
         slice_segment_address,
         first_slice_in_pic: first_slice,
+        no_output_of_prior_pics,
         dependent_slice_segment: false,
         entry_points,
         slice_type,

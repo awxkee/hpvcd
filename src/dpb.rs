@@ -65,13 +65,16 @@ impl Frame {
 pub(crate) struct RefEntry {
     pub(crate) _dpb_index: usize,
     pub(crate) poc: i32,
-    pub(crate) _long_term: bool,
+    pub(crate) long_term: bool,
 }
 
 pub(crate) struct Dpb {
     pub(crate) frames: Vec<Frame>,
     /// Max frames retained before forcing output (from SPS max_dec_pic_buffering).
     max_frames: usize,
+    /// sps_max_num_reorder_pics: at most this many output-pending pictures may be
+    /// held before the lowest-POC one is bumped for output (§C.5.2.2).
+    max_reorder: usize,
     /// NoRaslOutputFlag of the current random-access period: when true, RASL
     /// pictures attached to the period's IRAP are discarded.
     no_rasl_output: bool,
@@ -82,8 +85,17 @@ impl Dpb {
         Dpb {
             frames: Vec::new(),
             max_frames: max_frames.max(1),
+            max_reorder: max_frames.max(1),
             no_rasl_output: false,
         }
+    }
+
+    /// Configure the output DPB from the active SPS (§C.5.2.2). `buffering` is
+    /// sps_max_dec_pic_buffering (DPB size) and `reorder` is
+    /// sps_max_num_reorder_pics (reorder-latency bound).
+    pub(crate) fn configure(&mut self, buffering: usize, reorder: usize) {
+        self.max_frames = buffering.max(1);
+        self.max_reorder = reorder.min(self.max_frames);
     }
 
     /// Whether RASL pictures in the current random-access period are suppressed.
@@ -94,6 +106,17 @@ impl Dpb {
     /// Record the NoRaslOutputFlag for the random-access period just started.
     pub(crate) fn set_no_rasl_output(&mut self, v: bool) {
         self.no_rasl_output = v;
+    }
+
+    /// Discard pictures still pending output without emitting them, for an IRAP
+    /// with NoOutputOfPriorPicsFlag == 1 (§C.5.2.2). Clears the output flag and
+    /// drops frames no longer needed as references.
+    pub(crate) fn discard_pending_output(&mut self) {
+        for f in &mut self.frames {
+            f.needed_for_output = false;
+        }
+        self.frames
+            .retain(|f| f.is_reference() || f.needed_for_output);
     }
 
     /// Clear all references (IDR): frames stay only if still needed for output.
@@ -217,7 +240,7 @@ impl Dpb {
                 temp0.push(RefEntry {
                     _dpb_index: i,
                     poc,
-                    _long_term: false,
+                    long_term: false,
                 });
             }
         }
@@ -226,7 +249,7 @@ impl Dpb {
                 temp0.push(RefEntry {
                     _dpb_index: i,
                     poc,
-                    _long_term: false,
+                    long_term: false,
                 });
             }
         }
@@ -237,7 +260,7 @@ impl Dpb {
                 temp1.push(RefEntry {
                     _dpb_index: i,
                     poc,
-                    _long_term: false,
+                    long_term: false,
                 });
             }
         }
@@ -246,7 +269,7 @@ impl Dpb {
                 temp1.push(RefEntry {
                     _dpb_index: i,
                     poc,
-                    _long_term: false,
+                    long_term: false,
                 });
             }
         }
@@ -256,12 +279,12 @@ impl Dpb {
                 temp0.push(RefEntry {
                     _dpb_index: i,
                     poc,
-                    _long_term: true,
+                    long_term: true,
                 });
                 temp1.push(RefEntry {
                     _dpb_index: i,
                     poc,
-                    _long_term: true,
+                    long_term: true,
                 });
             }
         }
@@ -282,8 +305,12 @@ impl Dpb {
         let mut out = Vec::new();
         loop {
             let pending = self.frames.iter().filter(|f| f.needed_for_output).count();
-            let over = self.frames.len() > self.max_frames;
-            if !(flush && pending > 0) && !(over && pending > 0) {
+            // §C.5.2.2 bumping: output the lowest-POC pending picture when the
+            // number of output-pending pictures exceeds the reorder bound, or the
+            // DPB is full, or a flush was requested.
+            let over_reorder = pending > self.max_reorder;
+            let over_full = self.frames.len() > self.max_frames && pending > 0;
+            if !(flush && pending > 0) && !over_reorder && !over_full {
                 break;
             }
             // Output the lowest-POC frame still needing output.

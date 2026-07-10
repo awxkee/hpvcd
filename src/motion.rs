@@ -377,7 +377,7 @@ pub(crate) fn derive_amvp<N: Neighbors>(
     let b_pos = [(x + w, y - 1), (x + w - 1, y - 1), (x - 1, y - 1)];
 
     // isScaledFlagLX (§8.5.3.2.7): set when either A block is available for
-    // motion — an available, non-intra neighbour. An intra A neighbour does not
+    // motion — an available, non-intra neighbor. An intra A neighbor does not
     // set the flag (de265 available_pred_blk returns false for intra), which is
     // what lets the B group produce a *scaled* candidate when A is intra/absent.
     let a_inter = |px: isize, py: isize| -> bool {
@@ -385,21 +385,31 @@ pub(crate) fn derive_amvp<N: Neighbors>(
     };
     let is_scaled_flag = a_inter(a_pos[0].0, a_pos[0].1) || a_inter(a_pos[1].0, a_pos[1].1);
 
+    // Long-term status of the target reference (§8.5.3.2.7): a spatial candidate
+    // that references a picture of a different long-term/short-term type is not
+    // usable, and a long-term target is never scaled.
+    let target_lt = col_list0
+        .iter()
+        .chain(col_list1.iter())
+        .find(|r| r.poc == ref_poc)
+        .map(|r| r.long_term)
+        .unwrap_or(false);
+
     // A candidate: same-POC pass over A0/A1, then same-type (scaled) pass.
-    let mut a = amvp_spatial(nb, &a_pos, list, ref_poc, cur_poc, true, true);
+    let mut a = amvp_spatial(nb, &a_pos, list, ref_poc, cur_poc, true, true, target_lt);
     // B candidate: same-POC pass only (scaling gated on isScaledFlag below).
-    let mut b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, false, true);
+    let mut b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, false, true, target_lt);
 
     if !is_scaled_flag {
         // No motion-available A block: the unscaled same-POC B result stands in
         // as the A candidate, and B is re-derived taking the first available
-        // neighbour of matching reference type and scaling it (§8.5.3.2.7 step 5).
+        // neighbor of matching reference type and scaling it (§8.5.3.2.7 step 5).
         // This re-derivation does NOT repeat the same-POC pass, so a later
-        // same-POC neighbour does not pre-empt an earlier scalable one.
+        // same-POC neighbor does not pre-empt an earlier scalable one.
         if a.is_none() {
             a = b;
         }
-        b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, true, false);
+        b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, true, false, target_lt);
     }
 
     if let Some(mv) = a {
@@ -436,6 +446,7 @@ pub(crate) fn derive_amvp<N: Neighbors>(
     [preds[0], preds[1]]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn amvp_spatial<N: Neighbors>(
     nb: &N,
     positions: &[(isize, isize)],
@@ -444,6 +455,7 @@ fn amvp_spatial<N: Neighbors>(
     cur_poc: i32,
     allow_scaled: bool,
     do_same_ref: bool,
+    target_lt: bool,
 ) -> Option<Mv> {
     // First pass: exact ref (same-POC) match, no scaling.
     if do_same_ref {
@@ -463,8 +475,11 @@ fn amvp_spatial<N: Neighbors>(
             }
         }
     }
-    // Second pass: scale from any available inter MV. Only the A group may
-    // always scale; for B this runs solely when isScaledFlagLX==0 (§8.5.3.2.7).
+    // Second pass: scale from the first available neighbor whose reference is
+    // the same long-term/short-term type as the target (§8.5.3.2.7 step 5). A
+    // long-term target uses the MV unscaled; short-term targets scale by POC
+    // distance. Only the A group may always scale; for B this runs solely when
+    // isScaledFlagLX==0.
     if !allow_scaled {
         return None;
     }
@@ -477,7 +492,10 @@ fn amvp_spatial<N: Neighbors>(
                 continue;
             }
             for l in [list, 1 - list] {
-                if m.pred_uses(l) {
+                if m.pred_uses(l) && m.ref_lt[l] == target_lt {
+                    if target_lt {
+                        return Some(m.mv[l]);
+                    }
                     let col_dist = cur_poc - m.ref_poc[l];
                     let cur_dist = cur_poc - ref_poc;
                     return Some(scale_mv(m.mv[l], col_dist, cur_dist));
