@@ -46,6 +46,12 @@ impl YuvPlanes {
     pub(crate) fn dims(&self) -> (usize, usize) {
         (self.width, self.height)
     }
+    pub(crate) fn chroma_dims(&self) -> (usize, usize) {
+        (
+            self.width.div_ceil(self.chroma.sub_w()),
+            self.height.div_ceil(self.chroma.sub_h()),
+        )
+    }
     pub(crate) fn y_u8(&self) -> Vec<u8> {
         self.y.iter().map(|&v| v as u8).collect()
     }
@@ -56,14 +62,14 @@ impl YuvPlanes {
         self.cr.iter().map(|&v| v as u8).collect()
     }
 }
-pub(crate) struct YuvPlanes {
-    pub(crate) y: Vec<u16>,
-    pub(crate) cb: Vec<u16>,
-    pub(crate) cr: Vec<u16>,
-    pub(crate) width: usize, // coded (64-multiple)
-    pub(crate) height: usize,
-    pub(crate) chroma: ChromaFormat,
-    pub(crate) bit_depth: BitDepth,
+pub struct YuvPlanes {
+    pub y: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
+    pub width: usize, // coded (64-multiple)
+    pub height: usize,
+    pub chroma: ChromaFormat,
+    pub bit_depth: BitDepth,
 }
 
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};

@@ -73,7 +73,7 @@ pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
 pub use info::{ImageInfo, read_heic_info, read_heic_info_with_limits};
 pub use limits::ParseLimits;
 pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
-pub use video::{VideoDecoder, VideoFrame};
+pub use video::{FrameYuv, VideoDecoder, VideoFrame, decode_hevc, decode_hevc_frame_at};
 
 /// Convert a decoded u16 YUV plane to the appropriate typed buffer.
 /// 8-bit images produce `SampleBuf::U8` (direct cast, no precision loss).

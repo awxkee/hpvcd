@@ -195,8 +195,11 @@ pub(crate) struct FullDecoder<'cab> {
     slice_type: u8,
     /// cabac_init_flag for the current slice (swaps P/B context init tables).
     cabac_init: bool,
+    /// Explicit weighted-prediction table for the current slice, when weighted
+    /// prediction is enabled by the PPS for this slice type (§7.4.7.3).
+    pred_weights: Option<crate::inter::PredWeightTable>,
     /// Per-4×4-luma motion field for the current picture.
-    motion: Vec<crate::inter::MotionInfo>,
+    motion: Vec<MotionInfo>,
     /// Reference picture lists for the current slice (planes + POC).
     ref_list0: Vec<crate::dpb::RefEntry>,
     ref_list1: Vec<crate::dpb::RefEntry>,
@@ -220,6 +223,7 @@ pub(crate) struct FullDecoder<'cab> {
     /// Reference frame planes (cloned Y/Cb/Cr) indexed by DPB index used in
     /// ref lists, supplied by the driver before decoding the slice.
     ref_frames: Vec<crate::inter::RefFramePlanes>,
+    chroma_scratch: Box<[u16; 1024]>,
 }
 
 impl FullDecoder<'static> {
@@ -338,7 +342,7 @@ impl FullDecoder<'static> {
             tu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             tu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
             slice_idx: crate::plane::Plane::owned(vec![0u16; grid_w * grid_h]),
-            cur_slice_idx: 0,
+            cur_slice_idx: 1,
             cu_tqb: false,
             ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
             grid_w,
@@ -374,6 +378,7 @@ impl FullDecoder<'static> {
             strong_smoothing: true,
             slice_type: hdr.slice_type,
             cabac_init: hdr.cabac_init,
+            pred_weights: hdr.pred_weights.clone(),
             motion: vec![crate::inter::MotionInfo::intra(); grid_w * grid_h],
             ref_list0: Vec::new(),
             ref_list1: Vec::new(),
@@ -389,6 +394,7 @@ impl FullDecoder<'static> {
             ref_frames: Vec::new(),
             sps,
             pps,
+            chroma_scratch: Box::new([0; 1024]),
         })
     }
 }
@@ -403,6 +409,7 @@ impl<'cab> FullDecoder<'cab> {
         self.cab.reset_with(cabac)?;
         self.slice_type = hdr.slice_type;
         self.cabac_init = hdr.cabac_init;
+        self.pred_weights = hdr.pred_weights.clone();
         if !hdr.dependent_slice_segment {
             // Independent segment: reset entropy contexts and slice-level state.
             self.cur_slice_idx = self.cur_slice_idx.wrapping_add(1);
@@ -886,7 +893,7 @@ impl<'cab> FullDecoder<'cab> {
         if !self.sao_luma && !self.sao_chroma {
             return;
         }
-        // §7.3.8.3: merge flags are only coded when the neighbouring CTB is
+        // §7.3.8.3: merge flags are only coded when the neighboring CTB is
         // available — same tile and same slice. At a tile/slice boundary the
         // flag is absent, so reading it would desync CABAC.
         let left_avail = rx > 0 && self.ctb_merge_avail(rx, ry, rx - 1, ry);
@@ -1684,6 +1691,7 @@ impl<'cab> FullDecoder<'cab> {
         let mut inc = 0;
         if x0 >= 4
             && self.same_tile(x0 - 1, y0)
+            && self.same_slice(x0 - 1, y0)
             && let Some(g) = self.grid_idx(x0 - 1, y0)
             && self.decoded[g]
             && self.ct_depth[g] as usize > depth as usize
@@ -1692,6 +1700,7 @@ impl<'cab> FullDecoder<'cab> {
         }
         if y0 >= 4
             && self.same_tile(x0, y0 - 1)
+            && self.same_slice(x0, y0 - 1)
             && let Some(g) = self.grid_idx(x0, y0 - 1)
             && self.decoded[g]
             && self.ct_depth[g] as usize > depth as usize
@@ -2182,6 +2191,8 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     fn mark_decoded(&mut self, x0: usize, y0: usize, size: usize) {
+        let mark_slice = self.cur_slice_idx > 1;
+        let s = self.cur_slice_idx;
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
                 if xx < self.w
@@ -2189,6 +2200,13 @@ impl<'cab> FullDecoder<'cab> {
                     && let Some(g) = self.grid_idx(xx, yy)
                 {
                     self.decoded[g] = true;
+                    // Keep slice ownership in lock-step with `decoded` so that
+                    // intra neighbors decoded earlier in this same slice (but
+                    // before the enclosing CU's set_slice_idx runs) are seen as
+                    // same-slice rather than defaulting to the initial 0.
+                    if mark_slice {
+                        self.slice_idx[g] = s;
+                    }
                 }
             }
         }
@@ -2248,6 +2266,12 @@ impl<'cab> FullDecoder<'cab> {
         // tests the `decoded` map) would wrongly zero valid candidates and
         // desync CABAC.
         if !self.same_tile(x as usize, y as usize) {
+            return MODE_DC;
+        }
+        if !self.same_slice(x as usize, y as usize) {
+            return MODE_DC;
+        }
+        if !self.constrained_intra_ok(x as usize, y as usize) {
             return MODE_DC;
         }
         self.grid_idx(x as usize, y as usize)
@@ -2693,11 +2717,11 @@ impl<'cab> FullDecoder<'cab> {
     /// True when luma pixel `(x, y)` lies in the same tile as the CTB currently
     /// being decoded. Always true when tiles are disabled.
     #[inline]
-    /// Whether the neighbouring CTB `(nrx, nry)` is available for SAO merge from
+    /// Whether the neighboring CTB `(nrx, nry)` is available for SAO merge from
     /// the current CTB `(rx, ry)`: it must be in the same tile and the same
     /// slice (§6.4.1). Uses per-CTB tile ids and the per-4×4 slice-index map.
     fn ctb_merge_avail(&self, rx: usize, ry: usize, nrx: usize, nry: usize) -> bool {
-        // Fast path: no tiles and a single slice segment → the neighbour is
+        // Fast path: no tiles and a single slice segment → the neighbor is
         // always available (the raster/tile-scan caller already guarantees it
         // was decoded). Avoids the per-CTB tile/slice map lookups.
         if self.tiles.is_none() && self.cur_slice_idx <= 1 {
@@ -2708,7 +2732,7 @@ impl<'cab> FullDecoder<'cab> {
         {
             return false;
         }
-        // Same slice: the neighbour must belong to the slice segment currently
+        // Same slice: the neighbor must belong to the slice segment currently
         // being decoded. Its slice index was recorded when it was decoded; the
         // current CTB's own index is `cur_slice_idx` (its samples aren't marked
         // until its CUs are decoded, after SAO parsing).
@@ -2727,11 +2751,43 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
+    /// Whether luma sample (x, y) belongs to the current slice segment's slice.
+    /// A neighbor in an earlier slice is unavailable for intra prediction and
+    /// context derivation (§6.4.1). Cheap no-op for single-slice pictures where
+    /// the whole `slice_idx` map stays 0 and `cur_slice_idx <= 1`.
+    #[inline]
+    fn same_slice(&self, x: usize, y: usize) -> bool {
+        if self.cur_slice_idx <= 1 {
+            return true;
+        }
+        self.slice_idx_at(x, y) == self.cur_slice_idx
+    }
+
+    /// Constrained intra prediction (§8.4.4.2.1): when the PPS flag is set, a
+    /// neighbor coded in an inter mode is treated as unavailable for intra
+    /// reference gathering and MPM derivation. No-op when the flag is off.
+    #[inline]
+    fn constrained_intra_ok(&self, x: usize, y: usize) -> bool {
+        if !self.pps._constrained_intra_pred {
+            return true;
+        }
+        self.grid_idx(x, y)
+            .and_then(|g| self.motion.get(g))
+            .map(|m| m.is_intra)
+            .unwrap_or(false)
+    }
+
     fn luma_avail(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
             return false;
         }
         if !self.same_tile(x as usize, y as usize) {
+            return false;
+        }
+        if !self.same_slice(x as usize, y as usize) {
+            return false;
+        }
+        if !self.constrained_intra_ok(x as usize, y as usize) {
             return false;
         }
         self.grid_idx(x as usize, y as usize)
@@ -2749,6 +2805,12 @@ impl<'cab> FullDecoder<'cab> {
             return false;
         }
         if !self.same_tile(lx, ly) {
+            return false;
+        }
+        if !self.same_slice(lx, ly) {
+            return false;
+        }
+        if !self.constrained_intra_ok(lx, ly) {
             return false;
         }
         self.grid_idx(lx, ly)
@@ -3397,17 +3459,13 @@ impl<'cab> FullDecoder<'cab> {
     fn predict_only_chroma(&mut self, is_cb: bool, cx0: usize, cy0: usize, n: usize, mode: u8) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
         let n2 = n * n;
-        let pred_tmp: [u16; 1024] = {
-            let mut buf = [0u16; 1024];
-            buf[..n2].copy_from_slice(&self.scratch.pred[..n2]);
-            buf
-        };
+        self.chroma_scratch[..n2].copy_from_slice(&self.scratch.pred[..n2]);
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
         if valid_w != 0 && valid_h != 0 {
             let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-            let pred = &pred_tmp[..n2];
+            let pred = &self.chroma_scratch[..n2];
             if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
                 copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
             }
@@ -3535,7 +3593,7 @@ impl RowFactory {
             tu_edge_v: mkb(self.tu_edge_v),
             tu_edge_h: mkb(self.tu_edge_h),
             slice_idx: mku16(self.slice_idx),
-            cur_slice_idx: 0,
+            cur_slice_idx: 1,
             cu_tqb: false,
             grid_w: self.grid_w,
             grid_h: self.grid_h,
@@ -3575,6 +3633,7 @@ impl RowFactory {
             strong_smoothing: self.strong_smoothing,
             slice_type: crate::inter::SLICE_I,
             cabac_init: false,
+            pred_weights: None,
             motion: Vec::new(),
             ref_list0: Vec::new(),
             ref_list1: Vec::new(),
@@ -3588,6 +3647,7 @@ impl RowFactory {
             collocated_from_l0: true,
             collocated_ref_idx: 0,
             ref_frames: Vec::new(),
+            chroma_scratch: Box::new([0; 1024]),
         })
     }
 }
@@ -3793,7 +3853,7 @@ impl<'a> DecoderNeighbours<'a> {
     }
 }
 
-impl<'a> crate::motion::Neighbours for DecoderNeighbours<'a> {
+impl<'a> crate::motion::Neighbors for DecoderNeighbours<'a> {
     fn available(&self, x: isize, y: isize) -> bool {
         if x < 0 || y < 0 {
             return false;
@@ -3802,7 +3862,8 @@ impl<'a> crate::motion::Neighbours for DecoderNeighbours<'a> {
         match self.grid(x, y) {
             Some(g) => {
                 self.decoded.get(g).copied().unwrap_or(false)
-                    && self.slice_idx.get(g).copied().unwrap_or(u16::MAX) == self.cur_slice
+                    && (self.cur_slice <= 1
+                        || self.slice_idx.get(g).copied().unwrap_or(u16::MAX) == self.cur_slice)
             }
             None => false,
         }
@@ -3871,7 +3932,7 @@ impl<'a> crate::motion::Neighbours for DecoderNeighbours<'a> {
 }
 
 impl<'cab> FullDecoder<'cab> {
-    /// cu_skip_flag with the neighbour-based context increment (§9.3.4.2.2).
+    /// cu_skip_flag with the neighbor-based context increment (§9.3.4.2.2).
     fn decode_cu_skip_flag(&mut self, x0: usize, y0: usize) -> bool {
         let mut inc = 0usize;
         if x0 >= 4
@@ -3907,7 +3968,7 @@ impl<'cab> FullDecoder<'cab> {
     ) {
         // Motion-based deblock boundary strength (§8.7.2.4): before overwriting
         // the motion field, mark BS=1 on this PU's left/top edges where the
-        // already-decoded neighbour differs enough (different ref picture,
+        // already-decoded neighbor differs enough (different ref picture,
         // different number of MVs, or |ΔMV| ≥ 4 quarter-pel in x or y).
         self.mark_motion_bs(x0, y0, w, h, &mi);
         for yy in (y0..y0 + h).step_by(4) {
@@ -3922,7 +3983,7 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// Mark BS=1 on a PU's left (vertical) and top (horizontal) 8-grid edges
-    /// where the neighbouring block's motion differs enough to require filtering.
+    /// where the neighboring block's motion differs enough to require filtering.
     fn mark_motion_bs(
         &mut self,
         x0: usize,
@@ -4178,7 +4239,16 @@ impl<'cab> FullDecoder<'cab> {
         part_idx: usize,
         merge_idx: usize,
     ) -> crate::inter::MotionInfo {
-        let nb = self.neighbours();
+        let nb = self.neighbors();
+        let par_mrg_level = self.pps.log2_parallel_merge_level;
+        // singleMCLFlag (§8.5.3.2.1): for 8×8 CUs with a parallel merge level > 2
+        // every PU derives its merge list as if it were the whole 2Nx2N CU.
+        let single_mcl = par_mrg_level > 2 && cuw == 8;
+        let (px, py, pw, ph, part_idx) = if single_mcl {
+            (cux, cuy, cuw, cuh, 0)
+        } else {
+            (px, py, pw, ph, part_idx)
+        };
         let pu = crate::motion::PuGeom {
             x: px,
             y: py,
@@ -4190,6 +4260,7 @@ impl<'cab> FullDecoder<'cab> {
             cu_y: cuy,
             cu_w: cuw,
             cu_h: cuh,
+            par_mrg_level,
         };
         let cand = crate::motion::derive_merge(
             &nb,
@@ -4219,7 +4290,7 @@ impl<'cab> FullDecoder<'cab> {
         mi
     }
 
-    fn neighbours(&self) -> DecoderNeighbours<'_> {
+    fn neighbors(&self) -> DecoderNeighbours<'_> {
         DecoderNeighbours {
             motion: &self.motion,
             decoded: &self.decoded,
@@ -4260,7 +4331,8 @@ impl<'cab> FullDecoder<'cab> {
         let is_b = self.slice_type == crate::inter::SLICE_B;
         // inter_pred_idc: PRED_L0 / PRED_L1 / PRED_BI.
         let (use_l0, use_l1) = if is_b {
-            self.decode_inter_pred_idc(pw, ph)
+            let ct_depth = self.log2_ctb.saturating_sub(cuw.trailing_zeros()) as usize;
+            self.decode_inter_pred_idc(pw, ph, ct_depth)
         } else {
             (true, false)
         };
@@ -4295,9 +4367,19 @@ impl<'cab> FullDecoder<'cab> {
         mi
     }
 
-    fn decode_inter_pred_idc(&mut self, _pw: usize, _ph: usize) -> (bool, bool) {
-        // ctxInc uses cqtDepth for the first bin (prototype: fixed ctx 0/4).
-        let bi = self.cab.decode_bin(&mut self.ctx.inter_pred_idc[0]) != 0;
+    fn decode_inter_pred_idc(&mut self, pw: usize, ph: usize, ct_depth: usize) -> (bool, bool) {
+        // §7.3.8.6 / §9.3.4.2.2: for an 8×4 or 4×8 PU (nPbW+nPbH == 12) bi-
+        // prediction is disallowed, so only the L0/L1 selection bin (ctx 4) is
+        // coded. Otherwise the first bin (ctx = CtDepth of the CU) chooses BI vs
+        // uni; on uni, ctx 4 selects the list.
+        if pw + ph == 12 {
+            let l1 = self.cab.decode_bin(&mut self.ctx.inter_pred_idc[4]) != 0;
+            return if l1 { (false, true) } else { (true, false) };
+        }
+        let bi = self
+            .cab
+            .decode_bin(&mut self.ctx.inter_pred_idc[ct_depth.min(4)])
+            != 0;
         if bi {
             return (true, true);
         }
@@ -4344,7 +4426,7 @@ impl<'cab> FullDecoder<'cab> {
                 .map(|r| r.poc)
                 .unwrap_or(self.cur_poc)
         };
-        let nb = self.neighbours();
+        let nb = self.neighbors();
         let pu = crate::motion::PuGeom {
             x: px,
             y: py,
@@ -4356,6 +4438,7 @@ impl<'cab> FullDecoder<'cab> {
             cu_y: cuy,
             cu_w: cuw,
             cu_h: cuh,
+            par_mrg_level: self.pps.log2_parallel_merge_level,
         };
         let preds = crate::motion::derive_amvp(
             &nb,
@@ -4444,14 +4527,23 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// Motion-compensate a PU into the reconstruction planes.
-    fn motion_compensate(
-        &mut self,
-        x0: usize,
-        y0: usize,
-        w: usize,
-        h: usize,
-        mi: &crate::inter::MotionInfo,
-    ) {
+    /// Return the active weighted-prediction table iff the PPS enables it for
+    /// this slice type (weighted_pred for P, weighted_bipred for B). Otherwise
+    /// default (non-weighted) averaging is used.
+    fn luma_weighted(&self) -> Option<&crate::inter::PredWeightTable> {
+        let enabled = match self.slice_type {
+            crate::inter::SLICE_P => self.pps.weighted_pred,
+            crate::inter::SLICE_B => self.pps.weighted_bipred,
+            _ => false,
+        };
+        if enabled {
+            self.pred_weights.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn motion_compensate(&mut self, x0: usize, y0: usize, w: usize, h: usize, mi: &MotionInfo) {
         let bd = self.bd;
         let bd_c = self.bd_c;
         // Gather up to two predictions per plane, then combine.
@@ -4466,21 +4558,59 @@ impl<'cab> FullDecoder<'cab> {
             None
         };
         let stride = self.w;
+        let weighted = self.luma_weighted().cloned();
         match (luma0, luma1) {
             (Some(a), Some(b)) => {
                 let mut out = vec![0u16; w * h];
-                crate::mc::bi_pred(&a, &b, w, h, bd, &mut out, w);
+                if let Some(wt) = &weighted {
+                    let (w0, o0) = wt.luma(0, mi.ref_idx[0]);
+                    let (w1, o1) = wt.luma(1, mi.ref_idx[1]);
+                    crate::mc::bi_pred_weighted(
+                        &a,
+                        &b,
+                        w,
+                        h,
+                        bd,
+                        w0,
+                        o0,
+                        w1,
+                        o1,
+                        wt.luma_log2_denom,
+                        &mut out,
+                        w,
+                    );
+                } else {
+                    crate::mc::bi_pred(&a, &b, w, h, bd, &mut out, w);
+                }
                 self.blit_luma(x0, y0, w, h, &out);
             }
             (Some(a), None) | (None, Some(a)) => {
                 let mut out = vec![0u16; w * h];
-                crate::mc::uni_pred(&a, w, h, bd, &mut out, w);
+                // Which list produced this uni-prediction.
+                let list = if mi.pred.l0 { 0 } else { 1 };
+                let ridx = mi.ref_idx[list];
+                if let Some(wt) = &weighted {
+                    let (wgt, off) = wt.luma(list, ridx);
+                    crate::mc::uni_pred_weighted(
+                        &a,
+                        w,
+                        h,
+                        bd,
+                        wgt,
+                        off,
+                        wt.luma_log2_denom,
+                        &mut out,
+                        w,
+                    );
+                } else {
+                    crate::mc::uni_pred(&a, w, h, bd, &mut out, w);
+                }
                 self.blit_luma(x0, y0, w, h, &out);
             }
             (None, None) => {}
         }
         let _ = stride;
-        // Chroma (4:2:0 assumed for the prototype).
+        // Chroma motion compensation (chroma MV derived per SubWidthC/SubHeightC).
         if !self.sps.chroma.is_monochrome() {
             let cw = w / self.sub_w;
             let ch = h / self.sub_h;
@@ -4499,9 +4629,47 @@ impl<'cab> FullDecoder<'cab> {
                 };
                 let mut out = vec![0u16; cw * ch];
                 match (c0, c1) {
-                    (Some(a), Some(b)) => crate::mc::bi_pred(&a, &b, cw, ch, bd_c, &mut out, cw),
+                    (Some(a), Some(b)) => {
+                        if let Some(wt) = &weighted {
+                            let (w0, o0) = wt.chroma(0, mi.ref_idx[0], plane);
+                            let (w1, o1) = wt.chroma(1, mi.ref_idx[1], plane);
+                            crate::mc::bi_pred_weighted(
+                                &a,
+                                &b,
+                                cw,
+                                ch,
+                                bd_c,
+                                w0,
+                                o0,
+                                w1,
+                                o1,
+                                wt.chroma_log2_denom,
+                                &mut out,
+                                cw,
+                            );
+                        } else {
+                            crate::mc::bi_pred(&a, &b, cw, ch, bd_c, &mut out, cw);
+                        }
+                    }
                     (Some(a), None) | (None, Some(a)) => {
-                        crate::mc::uni_pred(&a, cw, ch, bd_c, &mut out, cw)
+                        let list = if mi.pred.l0 { 0 } else { 1 };
+                        let ridx = mi.ref_idx[list];
+                        if let Some(wt) = &weighted {
+                            let (wgt, off) = wt.chroma(list, ridx, plane);
+                            crate::mc::uni_pred_weighted(
+                                &a,
+                                cw,
+                                ch,
+                                bd_c,
+                                wgt,
+                                off,
+                                wt.chroma_log2_denom,
+                                &mut out,
+                                cw,
+                            );
+                        } else {
+                            crate::mc::uni_pred(&a, cw, ch, bd_c, &mut out, cw);
+                        }
                     }
                     (None, None) => continue,
                 }
@@ -4569,9 +4737,12 @@ impl<'cab> FullDecoder<'cab> {
             width: frame.cw,
             height: frame.ch,
         };
-        // Chroma MV precision is 1/8 for 4:2:0 (mv is luma 1/4-pel).
-        let mvcx = mv.x as isize;
-        let mvcy = mv.y as isize;
+        // Chroma MV derivation (§8.5.3.3.3.2): the 1/8-pel chroma motion vector
+        // is the luma 1/4-pel MV scaled by 2/SubWidthC and 2/SubHeightC. For
+        // 4:2:0 (SubW=SubH=2) this is the identity; 4:2:2 doubles the vertical
+        // component and 4:4:4 doubles both.
+        let mvcx = mv.x as isize * 2 / self.sub_w as isize;
+        let mvcy = mv.y as isize * 2 / self.sub_h as isize;
         let ix = cx as isize + (mvcx >> 3);
         let iy = cy as isize + (mvcy >> 3);
         let fx = (mvcx & 7) as usize;
@@ -4641,12 +4812,8 @@ impl<'cab> FullDecoder<'cab> {
 
     /// Extract the coded picture's motion field and grid dimensions for storage
     /// in the DPB (temporal MV prediction of later pictures).
-    pub(crate) fn take_motion(&mut self) -> (Vec<crate::inter::MotionInfo>, usize, usize) {
+    pub(crate) fn take_motion(&mut self) -> (Vec<MotionInfo>, usize, usize) {
         (std::mem::take(&mut self.motion), self.grid_w, self.grid_h)
-    }
-
-    pub(crate) fn poc(&self) -> i32 {
-        self.cur_poc
     }
 }
 
@@ -4749,6 +4916,10 @@ pub(crate) struct SliceHeader {
     pub(crate) poc_lsb: i32,
     /// Resolved short-term RPS for the current picture (from SPS or inline).
     pub(crate) cur_rps: crate::rps::ShortTermRps,
+    /// Long-term reference POCs for this picture. Each is (poc_or_lsb,
+    /// used_by_curr, has_msb): when `has_msb` the value is a full POC, otherwise
+    /// only the POC LSB is known and matching is by LSB.
+    pub(crate) lt_refs: Vec<(i32, bool, bool)>,
     /// num_ref_idx_l0/l1 active minus nothing (already the active counts).
     pub(crate) num_ref_idx_l0: usize,
     pub(crate) num_ref_idx_l1: usize,
@@ -4844,6 +5015,7 @@ pub(crate) fn parse_slice_header_full(
             slice_type: crate::inter::SLICE_I,
             poc_lsb: 0,
             cur_rps: crate::rps::ShortTermRps::default(),
+            lt_refs: Vec::new(),
             num_ref_idx_l0: 0,
             num_ref_idx_l1: 0,
             list_mod_l0: Vec::new(),
@@ -4875,6 +5047,7 @@ pub(crate) fn parse_slice_header_full(
     let mut poc_lsb = 0i32;
     let mut cur_rps = crate::rps::ShortTermRps::default();
     let mut num_lt = 0usize;
+    let mut lt_refs: Vec<(i32, bool, bool)> = Vec::new();
     if !is_idr {
         poc_lsb = r
             .read_bits(sps.log2_max_poc_lsb)
@@ -4894,8 +5067,9 @@ pub(crate) fn parse_slice_header_full(
                 cur_rps = sps.short_term_rps[0].clone();
             }
         }
-        // long_term reference pictures.
-        if !sps.lt_ref_poc_lsb.is_empty() || long_term_ref_pics_present(sps) {
+        // long_term reference pictures (§7.3.6.1). Collect each LT ref's POC
+        // (or POC LSB when the MSB delta is not signalled) and used_by_curr flag.
+        if long_term_ref_pics_present(sps) {
             let num_lt_sps = if !sps.lt_ref_poc_lsb.is_empty() {
                 r.read_ue().map_err(|_| e("num_lt_sps"))? as usize
             } else {
@@ -4903,20 +5077,44 @@ pub(crate) fn parse_slice_header_full(
             };
             let num_lt_pics = r.read_ue().map_err(|_| e("num_lt_pics"))? as usize;
             num_lt = num_lt_sps + num_lt_pics;
+            let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
+            let mut prev_delta_msb = 0i32;
             for i in 0..num_lt {
-                if i < num_lt_sps {
-                    if sps.lt_ref_poc_lsb.len() > 1 {
+                let (poc_lsb_lt, used) = if i < num_lt_sps {
+                    let idx = if sps.lt_ref_poc_lsb.len() > 1 {
                         let bits = ceil_log2(sps.lt_ref_poc_lsb.len() as u64);
-                        r.read_bits(bits).map_err(|_| e("lt_idx_sps"))?;
-                    }
+                        r.read_bits(bits).map_err(|_| e("lt_idx_sps"))? as usize
+                    } else {
+                        0
+                    };
+                    (
+                        *sps.lt_ref_poc_lsb.get(idx).unwrap_or(&0) as i32,
+                        *sps.lt_used_by_curr.get(idx).unwrap_or(&false),
+                    )
                 } else {
-                    r.read_bits(sps.log2_max_poc_lsb)
-                        .map_err(|_| e("poc_lsb_lt"))?;
-                    r.read_flag().map_err(|_| e("used_by_curr_lt"))?;
-                }
+                    let lsb = r
+                        .read_bits(sps.log2_max_poc_lsb)
+                        .map_err(|_| e("poc_lsb_lt"))? as i32;
+                    let used = r.read_flag().map_err(|_| e("used_by_curr_lt"))?;
+                    (lsb, used)
+                };
                 let delta_msb_present = r.read_flag().map_err(|_| e("delta_msb_present"))?;
                 if delta_msb_present {
-                    r.read_ue().map_err(|_| e("delta_poc_msb_cycle_lt"))?;
+                    let delta_msb = r.read_ue().map_err(|_| e("delta_poc_msb_cycle_lt"))? as i32;
+                    // delta_poc_msb_cycle_lt is delta-coded for entries past the
+                    // first in each group (§7.4.8).
+                    let cycle = if i == 0 || i == num_lt_sps {
+                        delta_msb
+                    } else {
+                        delta_msb + prev_delta_msb
+                    };
+                    prev_delta_msb = cycle;
+                    let cur_msb = poc_lsb - (poc_lsb % max_poc_lsb);
+                    let poc = cur_msb - cycle * max_poc_lsb + poc_lsb_lt;
+                    lt_refs.push((poc, used, true));
+                } else {
+                    // No MSB: only the LSB is known; match references by LSB.
+                    lt_refs.push((poc_lsb_lt, used, false));
                 }
             }
         }
@@ -5082,6 +5280,7 @@ pub(crate) fn parse_slice_header_full(
         slice_type,
         poc_lsb,
         cur_rps,
+        lt_refs,
         num_ref_idx_l0,
         num_ref_idx_l1,
         list_mod_l0,
@@ -5099,7 +5298,7 @@ pub(crate) fn parse_slice_header_full(
 /// Whether the SPS signals long-term reference pictures (a non-empty SPS LT set
 /// or the presence flag). Used to decide if the slice header carries LT syntax.
 fn long_term_ref_pics_present(sps: &Sps) -> bool {
-    !sps.lt_ref_poc_lsb.is_empty()
+    sps.long_term_ref_pics_present
 }
 
 /// Ceil(log2(n)) — the number of bits needed to represent values 0..n-1.

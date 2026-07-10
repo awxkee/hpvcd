@@ -333,7 +333,7 @@ const COEFF_G2: [u8; 18] = [
 ///   part_mode = 184, prev_intra_luma_pred_flag = 184, intra_chroma_pred_mode = 63
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IntraModeContexts {
-    pub(crate) part_mode: CtxModel,
+    pub(crate) _part_mode: CtxModel,
     pub(crate) prev_intra_luma_pred_flag: CtxModel,
     pub(crate) intra_chroma_pred_mode: CtxModel,
 }
@@ -341,7 +341,7 @@ pub(crate) struct IntraModeContexts {
 impl IntraModeContexts {
     pub(crate) fn init_islice(qp: u8) -> Self {
         Self {
-            part_mode: CtxModel::init(184, qp),
+            _part_mode: CtxModel::init(184, qp),
             prev_intra_luma_pred_flag: CtxModel::init(184, qp),
             intra_chroma_pred_mode: CtxModel::init(63, qp),
         }
@@ -355,7 +355,7 @@ impl IntraModeContexts {
         }
         let it = init_type as usize;
         Self {
-            part_mode: CtxModel::init(154, qp),
+            _part_mode: CtxModel::init(154, qp),
             prev_intra_luma_pred_flag: CtxModel::init([184u8, 154, 183][it], qp),
             intra_chroma_pred_mode: CtxModel::init([63u8, 152, 152][it], qp),
         }

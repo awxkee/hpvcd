@@ -1,13 +1,31 @@
 /*
  * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
- * // BSD-3-Clause OR Apache-2.0
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-//! Motion vector derivation: spatial/temporal merge candidate lists, combined
-//! bi-predictive and zero candidates, and AMVP predictor derivation. Ported
-//! from de265's `motion.cc` (§8.5.3.2), rewritten in safe Rust. The decoder
-//! supplies neighbour motion via the `Neighbours` accessor so this module stays
-//! free of picture-buffer details.
 
 use crate::dpb::RefEntry;
 use crate::inter::{MotionInfo, Mv, PredFlags};
@@ -36,8 +54,8 @@ pub(crate) fn scale_mv(mv: Mv, col_dist: i32, cur_dist: i32) -> Mv {
     Mv::new(sc(mv.x), sc(mv.y))
 }
 
-/// Motion of a spatial neighbour, or `None` if unavailable/intra.
-pub(crate) trait Neighbours {
+/// Motion of a spatial neighbor, or `None` if unavailable/intra.
+pub(crate) trait Neighbors {
     /// Motion at luma position (x, y) if available and inter-coded and in the
     /// same slice/tile; else None.
     fn motion_at(&self, x: isize, y: isize) -> Option<MotionInfo>;
@@ -69,7 +87,7 @@ impl MergeCand {
     }
 }
 
-/// Position of a PU for neighbour derivation.
+/// Position of a PU for neighbor derivation.
 pub(crate) struct PuGeom {
     pub(crate) x: usize,
     pub(crate) y: usize,
@@ -84,13 +102,16 @@ pub(crate) struct PuGeom {
     pub(crate) cu_y: usize,
     pub(crate) cu_w: usize,
     pub(crate) cu_h: usize,
+    /// log2 of the parallel merge estimation region size (§7.4.3.3.1). A
+    /// spatial candidate in the same region as the PU is unavailable.
+    pub(crate) par_mrg_level: u32,
 }
 
 /// Derive the merge candidate list (§8.5.3.2.1) and return the candidate at
 /// `merge_idx`. `max_cand` = MaxNumMergeCand. `col_ref` supplies the collocated
 /// reference POC for temporal candidates; `list_poc` maps ref_idx→POC per list.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn derive_merge<N: Neighbours>(
+pub(crate) fn derive_merge<N: Neighbors>(
     nb: &N,
     pu: &PuGeom,
     merge_idx: usize,
@@ -168,17 +189,30 @@ enum SpatialPos {
     B2,
 }
 
-fn spatial<N: Neighbours>(
+fn spatial<N: Neighbors>(
     nb: &N,
     px: isize,
     py: isize,
     pu: &PuGeom,
     pos: SpatialPos,
 ) -> Option<MergeCand> {
-    // Second-PU redundancy: a neighbour inside the same CU's first PU is
+    // Second-PU redundancy: a neighbor inside the same CU's first PU is
     // unavailable (§8.5.3.2.2). Simplified for common partition shapes.
     if pu.part_idx == 1 && inside_first_pu(px, py, pu, pos) {
         return None;
+    }
+    // Parallel merge estimation region (§8.5.3.2.2): a spatial neighbor that
+    // falls in the same merge-estimation region as the PU is unavailable, so
+    // that all PBs in the region can derive their merge lists in parallel.
+    if pu.par_mrg_level > 2 {
+        let lvl = pu.par_mrg_level;
+        if px >= 0
+            && py >= 0
+            && (pu.x as isize >> lvl) == (px >> lvl)
+            && (pu.y as isize >> lvl) == (py >> lvl)
+        {
+            return None;
+        }
     }
     if !nb.available(px, py) {
         return None;
@@ -191,7 +225,7 @@ fn spatial<N: Neighbours>(
 }
 
 fn inside_first_pu(px: isize, py: isize, pu: &PuGeom, _pos: SpatialPos) -> bool {
-    // If the neighbour position lies within the CU but before this PU's start,
+    // If the neighbor position lies within the CU but before this PU's start,
     // it belongs to the first PU. Covers Nx2N/2NxN second-PU exclusion.
     let within_cu = px >= pu.cu_x as isize
         && px < (pu.cu_x + pu.cu_w) as isize
@@ -200,7 +234,7 @@ fn inside_first_pu(px: isize, py: isize, pu: &PuGeom, _pos: SpatialPos) -> bool 
     within_cu && !(px >= pu.x as isize && py >= pu.y as isize)
 }
 
-fn temporal_merge<N: Neighbours>(
+fn temporal_merge<N: Neighbors>(
     nb: &N,
     pu: &PuGeom,
     list0: &[RefEntry],
@@ -241,8 +275,8 @@ fn derive_combined(cands: &mut Vec<MergeCand>, max_cand: usize) {
     if cands.len() < 2 || cands.len() >= max_cand {
         return;
     }
-    const L0: [usize; 12] = [0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3];
-    const L1: [usize; 12] = [1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2];
+    static L0: [usize; 12] = [0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3];
+    static L1: [usize; 12] = [1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2];
     let n = cands.len();
     let mut k = 0;
     while cands.len() < max_cand && k < n * (n - 1) {
@@ -305,7 +339,7 @@ fn push_unique(cands: &mut Vec<MergeCand>, c: MergeCand, max_cand: usize) {
 
 /// AMVP predictor derivation (§8.5.3.2.6). Returns the two predictor MVs for
 /// `mvp_flag` selection. `ref_idx`/`list` identify the target reference.
-pub(crate) fn derive_amvp<N: Neighbours>(
+pub(crate) fn derive_amvp<N: Neighbors>(
     nb: &N,
     pu: &PuGeom,
     list: usize,
@@ -322,7 +356,7 @@ pub(crate) fn derive_amvp<N: Neighbours>(
     let b_pos = [(x + w, y - 1), (x + w - 1, y - 1), (x - 1, y - 1)];
 
     // isScaledFlagLX (§8.5.3.2.7 step 5): set when either A block is available
-    // as a *block* — including intra neighbours. It gates whether the B group
+    // as a *block* — including intra neighbors. It gates whether the B group
     // may produce a scaled candidate.
     let is_scaled_flag =
         nb.available(a_pos[0].0, a_pos[0].1) || nb.available(a_pos[1].0, a_pos[1].1);
@@ -369,7 +403,7 @@ pub(crate) fn derive_amvp<N: Neighbours>(
     [preds[0], preds[1]]
 }
 
-fn amvp_spatial<N: Neighbours>(
+fn amvp_spatial<N: Neighbors>(
     nb: &N,
     positions: &[(isize, isize)],
     list: usize,

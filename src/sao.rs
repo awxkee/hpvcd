@@ -298,9 +298,9 @@ fn apply_sao_edge_offset_scalar(
             let inb = |xx: i32, yy: i32| -> bool {
                 xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h
             };
-            // §8.7.3.2: if either neighbour lies outside the picture the sample
+            // §8.7.3.2: if either neighbor lies outside the picture the sample
             // is left unchanged (edgeIdx not applied). Substituting `s` is wrong
-            // — the other neighbour can still yield a nonzero edgeIdx.
+            // — the other neighbor can still yield a nonzero edgeIdx.
             if !inb(x1, y1) || !inb(x2, y2) {
                 continue;
             }
@@ -731,7 +731,7 @@ pub(crate) fn apply_sao_plane_banded_scalar(
                     let s = s0 as i32;
                     let (x1, y1) = (x as i32 + dx, y as i32 + dy);
                     let (x2, y2) = (x as i32 - dx, y as i32 - dy);
-                    // §8.7.3.2: an out-of-picture neighbour makes the sample
+                    // §8.7.3.2: an out-of-picture neighbor makes the sample
                     // unavailable → leave it unchanged (edgeIdx not applied).
                     if !inb(x1, y1) || !inb(x2, y2) {
                         continue;

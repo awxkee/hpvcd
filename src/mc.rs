@@ -1,25 +1,40 @@
 /*
  * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
- * // BSD-3-Clause OR Apache-2.0
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! HEVC motion compensation: fractional-sample luma (8-tap) and chroma (4-tap)
-//! interpolation into 16-bit intermediates, plus uni/bi weighted-prediction
-//! combine to final samples. Coefficients per Rec. ITU-T H.265 Tables 8-11/8-12,
-//! cross-checked against de265's `fallback-motion`. Kernels are safe scalar Rust
-//! parameterised by bit depth; SIMD backends can slot in behind the same
-//! function-pointer dispatch used elsewhere (`resolve_*`).
-
-/// Luma 8-tap filters, indexed by quarter-pel fraction 0..=3.
-const LUMA_FILTER: [[i32; 8]; 4] = [
+static LUMA_FILTER: [[i32; 8]; 4] = [
     [0, 0, 0, 64, 0, 0, 0, 0],
     [-1, 4, -10, 58, 17, -5, 1, 0],
     [-1, 4, -11, 40, 40, -11, 4, -1],
     [0, 1, -5, 17, 58, -10, 4, -1],
 ];
 
-/// Chroma 4-tap filters, indexed by eighth-pel fraction 0..=7.
-const CHROMA_FILTER: [[i32; 4]; 8] = [
+static CHROMA_FILTER: [[i32; 4]; 8] = [
     [0, 64, 0, 0],
     [-2, 58, 10, -2],
     [-4, 54, 16, -2],
@@ -290,6 +305,78 @@ pub(crate) fn bi_pred(
             .zip(dst_row.iter_mut().take(w))
         {
             let v = (a as i32 + b as i32 + offset) >> shift;
+            *out = clip(v, max);
+        }
+    }
+}
+
+/// Explicit weighted uni-prediction (§8.5.3.3.4.3). `log2_denom` is the weight
+/// denominator (WpOffsetBdShift folded into `offset` by the caller's o1 term).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uni_pred_weighted(
+    src: &[i16],
+    w: usize,
+    h: usize,
+    bd: u8,
+    weight: i32,
+    offset: i32,
+    log2_denom: u8,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
+    // shift1 brings the 14-bit interpolated sample down; the weight is applied
+    // in that domain and then rounded by log2WD = log2_denom + shift1.
+    let shift1 = 14 - bd as i32;
+    let log2_wd = log2_denom as i32 + shift1;
+    let max = (1 << bd) - 1;
+    let round = if log2_wd >= 1 { 1 << (log2_wd - 1) } else { 0 };
+    let off = offset << (bd as i32 - 8);
+    let src = &src[..w * h];
+    for (src_row, dst_row) in src.chunks_exact(w).zip(dst.chunks_exact_mut(dst_stride)) {
+        for (&s, out) in src_row.iter().zip(dst_row.iter_mut().take(w)) {
+            let v = if log2_wd >= 1 {
+                ((s as i32 * weight + round) >> log2_wd) + off
+            } else {
+                s as i32 * weight + off
+            };
+            *out = clip(v, max);
+        }
+    }
+}
+
+/// Explicit weighted bi-prediction (§8.5.3.3.4.3).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bi_pred_weighted(
+    s0: &[i16],
+    s1: &[i16],
+    w: usize,
+    h: usize,
+    bd: u8,
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+    log2_denom: u8,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
+    let shift1 = 14 - bd as i32;
+    let log2_wd = log2_denom as i32 + shift1;
+    let max = (1 << bd) - 1;
+    let bd_off = bd as i32 - 8;
+    // Offsets are signalled in 8-bit units; scale to the sample bit depth.
+    let o0 = o0 << bd_off;
+    let o1 = o1 << bd_off;
+    let rnd = ((o0 + o1 + 1) as i64) << log2_wd;
+    let s0 = &s0[..w * h];
+    let s1 = &s1[..w * h];
+    for ((r0, r1), dst_row) in s0
+        .chunks_exact(w)
+        .zip(s1.chunks_exact(w))
+        .zip(dst.chunks_exact_mut(dst_stride))
+    {
+        for ((&a, &b), out) in r0.iter().zip(r1.iter()).zip(dst_row.iter_mut().take(w)) {
+            let v = ((a as i64 * w0 as i64 + b as i64 * w1 as i64 + rnd) >> (log2_wd + 1)) as i32;
             *out = clip(v, max);
         }
     }

@@ -27,23 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Parallel in-loop deblocking (HEVC §8.7.2), split from the serial version in
-//! `decode.rs`. The picture is filtered in two ordered passes — all vertical
-//! edges, then all horizontal — for luma and then chroma. Each pass is a pure
-//! function of the buffer state at the pass's start (no edge reads another
-//! edge's writes within the same pass, because edges are 8 px apart while a
-//! filter touches at most ±4 px), which is what lets a pass run in parallel.
-//!
-//! Decomposition: each pass is split into CTB-aligned row bands.
-//!   * Vertical pass — every pixel access for row `s` is `s*w + …`, so row
-//!     bands are perfectly disjoint with no halo. CTB alignment (a multiple of
-//!     both 4 and 8) keeps each 4-row filter segment inside one band, so the
-//!     joint `d_total` decision is identical to the serial path.
-//!   * Horizontal pass — `horiz_bands` places each band boundary in the row gap
-//!     between neighboring horizontal filters. Every edge's read/write footprint
-//!     is therefore inside exactly one band, so the pass runs in place without a
-//!     whole-plane snapshot.
-
 use crate::exec::ExecContext;
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
 

@@ -62,6 +62,9 @@ pub(crate) struct Sps {
     /// Long-term reference POC LSBs signalled at SPS level.
     pub(crate) lt_ref_poc_lsb: Vec<u32>,
     pub(crate) lt_used_by_curr: Vec<bool>,
+    /// long_term_ref_pics_present_flag (§7.4.3.2). LT refs may still be signalled
+    /// per-slice even when the SPS candidate list is empty.
+    pub(crate) long_term_ref_pics_present: bool,
     pub(crate) scaling_list_enabled: bool,
     pub(crate) scaling_list: Option<ScalingList>,
     pub(crate) sao_enabled: bool,
@@ -76,6 +79,9 @@ pub(crate) struct Sps {
     pub(crate) color_primaries: u8, // ISO/IEC 23091-2 Table 2; 2 = unspecified
     pub(crate) transfer_characteristics: u8, // ISO/IEC 23091-2 Table 3; 2 = unspecified
     pub(crate) matrix_coefficients: u8, // ISO/IEC 23091-2 Table 4; 2 = unspecified
+    /// VUI timing: frame rate = time_scale / num_units_in_tick (0 = absent).
+    pub(crate) vui_num_units_in_tick: u32,
+    pub(crate) vui_time_scale: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -530,11 +536,14 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let temporal_mvp_enabled = r.read_flag().map_err(|_| e("temporal_mvp"))?;
     let strong_intra_smoothing = r.read_flag().map_err(|_| e("strong_intra_smoothing"))?;
-    // VUI parameters — extract matrix_coefficients and video_full_range_flag.
+    // VUI parameters — extract matrix_coefficients, video_full_range_flag, and
+    // the timing info (frame rate) if present.
     let mut video_full_range = false;
     let mut color_primaries = 2u8; // unspecified
     let mut transfer_characteristics = 2u8; // unspecified
     let mut matrix_coefficients = 2u8; // unspecified
+    let mut vui_num_units_in_tick = 0u32;
+    let mut vui_time_scale = 0u32;
     if r.read_flag().map_err(|_| e("vui_present"))? {
         // aspect_ratio_info_present_flag
         if r.read_flag().map_err(|_| e("ar_present"))? {
@@ -560,7 +569,27 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
                 matrix_coefficients = r.read_bits(8).map_err(|_| e("matrix_coeff"))? as u8;
             }
         }
-        // We only need the above; skip the rest of the VUI.
+        // chroma_loc_info_present_flag
+        if r.read_flag().map_err(|_| e("chroma_loc_present"))? {
+            r.read_ue().map_err(|_| e("chroma_sample_loc_top"))?;
+            r.read_ue().map_err(|_| e("chroma_sample_loc_bottom"))?;
+        }
+        r.read_flag().map_err(|_| e("neutral_chroma"))?; // neutral_chroma_indication_flag
+        r.read_flag().map_err(|_| e("field_seq"))?; // field_seq_flag
+        r.read_flag().map_err(|_| e("frame_field_info"))?; // frame_field_info_present_flag
+        // default_display_window_flag
+        if r.read_flag().map_err(|_| e("def_disp_win"))? {
+            r.read_ue().map_err(|_| e("ddw_left"))?;
+            r.read_ue().map_err(|_| e("ddw_right"))?;
+            r.read_ue().map_err(|_| e("ddw_top"))?;
+            r.read_ue().map_err(|_| e("ddw_bottom"))?;
+        }
+        // vui_timing_info_present_flag — the frame-rate source.
+        if r.read_flag().map_err(|_| e("timing_present"))? {
+            vui_num_units_in_tick = r.read_bits(32).map_err(|_| e("num_units_in_tick"))?;
+            vui_time_scale = r.read_bits(32).map_err(|_| e("time_scale"))?;
+            // The remaining timing/HRD fields aren't needed for the frame rate.
+        }
     }
 
     let chroma = match chroma_idc {
@@ -612,6 +641,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         short_term_rps,
         lt_ref_poc_lsb,
         lt_used_by_curr,
+        long_term_ref_pics_present: long_term_present,
         scaling_list,
         scaling_list_enabled,
         sao_enabled,
@@ -626,6 +656,8 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         color_primaries,
         transfer_characteristics,
         matrix_coefficients,
+        vui_num_units_in_tick,
+        vui_time_scale,
     })
 }
 

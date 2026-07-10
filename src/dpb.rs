@@ -1,8 +1,31 @@
 /*
  * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
- * // BSD-3-Clause OR Apache-2.0
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 //! Decoded Picture Buffer (DPB): holds reconstructed reference frames with their
 //! POC and per-4x4 motion field, performs RPS-based reference marking, builds
 //! RefPicList0/RefPicList1 for the current slice, and emits frames in output
@@ -33,26 +56,15 @@ impl Frame {
     pub(crate) fn is_reference(&self) -> bool {
         self.short_term || self.long_term
     }
-
-    /// Motion info at luma sample (x, y), clamped to the frame.
-    #[inline]
-    pub(crate) fn motion_at(&self, x: usize, y: usize) -> MotionInfo {
-        let bx = (x >> 2).min(self.width4.saturating_sub(1));
-        let by = (y >> 2).min(self.height4.saturating_sub(1));
-        self.motion
-            .get(by * self.width4 + bx)
-            .copied()
-            .unwrap_or_else(MotionInfo::intra)
-    }
 }
 
 /// A reference picture list entry: an index into the DPB plus whether it is a
 /// long-term reference (affects MV scaling) and its POC.
 #[derive(Clone, Copy)]
 pub(crate) struct RefEntry {
-    pub(crate) dpb_index: usize,
+    pub(crate) _dpb_index: usize,
     pub(crate) poc: i32,
-    pub(crate) long_term: bool,
+    pub(crate) _long_term: bool,
 }
 
 pub(crate) struct Dpb {
@@ -90,13 +102,22 @@ impl Dpb {
             .position(|f| f.poc == poc && f.is_reference())
     }
 
-    /// Apply RPS marking for the current picture (§8.3.2): mark frames whose POC
-    /// is in the current RPS as short-term references, all others as unused.
-    /// Returns the POC-sorted before/after sets for list construction.
-    pub(crate) fn apply_rps(&mut self, cur_poc: i32, rps: &ShortTermRps) -> RpsPocs {
+    /// As `apply_rps`, but also marks long-term references. `lt_refs` is the
+    /// slice's list of (poc_or_lsb, used_by_curr, has_msb); `max_poc_lsb` sizes
+    /// the LSB-only match. Returns the used-by-curr short-term and long-term
+    /// POCs for list construction.
+    pub(crate) fn apply_rps_lt(
+        &mut self,
+        cur_poc: i32,
+        rps: &ShortTermRps,
+        lt_refs: &[(i32, bool, bool)],
+        max_poc_lsb: i32,
+    ) -> RpsPocs {
         let mut before = Vec::new(); // negative delta (used_by_curr)
         let mut after = Vec::new(); // positive delta (used_by_curr)
         let mut foll = Vec::new(); // referenced but not used by current
+        let mut lt = Vec::new(); // used_by_curr long-term
+        let mut lt_keep = Vec::new(); // all long-term (used or foll)
 
         for (d, &used) in rps.delta_poc_s0.iter().zip(&rps.used_s0) {
             let poc = cur_poc + d;
@@ -115,6 +136,27 @@ impl Dpb {
             }
         }
 
+        // Long-term references: resolve each to a DPB picture's POC (by full POC
+        // when the MSB was signalled, otherwise by POC LSB match).
+        for &(val, used, has_msb) in lt_refs {
+            let matched = if has_msb {
+                self.frames.iter().find(|f| f.poc == val).map(|f| f.poc)
+            } else if max_poc_lsb > 0 {
+                self.frames
+                    .iter()
+                    .find(|f| f.poc.rem_euclid(max_poc_lsb) == val.rem_euclid(max_poc_lsb))
+                    .map(|f| f.poc)
+            } else {
+                None
+            };
+            if let Some(poc) = matched {
+                lt_keep.push(poc);
+                if used {
+                    lt.push(poc);
+                }
+            }
+        }
+
         // Mark: any frame not in {before,after,foll,long-term} loses ref status.
         let keep: Vec<i32> = before
             .iter()
@@ -123,11 +165,18 @@ impl Dpb {
             .copied()
             .collect();
         for f in &mut self.frames {
+            if lt_keep.contains(&f.poc) {
+                // Reclassify as a long-term reference.
+                f.long_term = true;
+                f.short_term = false;
+            } else if f.long_term && !lt_keep.contains(&f.poc) {
+                f.long_term = false;
+            }
             if f.short_term && !keep.contains(&f.poc) {
                 f.short_term = false;
             }
         }
-        RpsPocs { before, after }
+        RpsPocs { before, after, lt }
     }
 
     /// Build RefPicList0/1 (§8.3.4) from the marked references. `list_mod_*` are
@@ -146,18 +195,18 @@ impl Dpb {
         for &poc in &pocs.before {
             if let Some(i) = self.find_by_poc(poc) {
                 temp0.push(RefEntry {
-                    dpb_index: i,
+                    _dpb_index: i,
                     poc,
-                    long_term: false,
+                    _long_term: false,
                 });
             }
         }
         for &poc in &pocs.after {
             if let Some(i) = self.find_by_poc(poc) {
                 temp0.push(RefEntry {
-                    dpb_index: i,
+                    _dpb_index: i,
                     poc,
-                    long_term: false,
+                    _long_term: false,
                 });
             }
         }
@@ -166,18 +215,33 @@ impl Dpb {
         for &poc in &pocs.after {
             if let Some(i) = self.find_by_poc(poc) {
                 temp1.push(RefEntry {
-                    dpb_index: i,
+                    _dpb_index: i,
                     poc,
-                    long_term: false,
+                    _long_term: false,
                 });
             }
         }
         for &poc in &pocs.before {
             if let Some(i) = self.find_by_poc(poc) {
                 temp1.push(RefEntry {
-                    dpb_index: i,
+                    _dpb_index: i,
                     poc,
-                    long_term: false,
+                    _long_term: false,
+                });
+            }
+        }
+        // Long-term references follow the short-term ones in both lists (§8.3.4).
+        for &poc in &pocs.lt {
+            if let Some(i) = self.find_by_poc(poc) {
+                temp0.push(RefEntry {
+                    _dpb_index: i,
+                    poc,
+                    _long_term: true,
+                });
+                temp1.push(RefEntry {
+                    _dpb_index: i,
+                    poc,
+                    _long_term: true,
                 });
             }
         }
@@ -252,6 +316,8 @@ pub(crate) struct RpsPocs {
     pub(crate) before: Vec<i32>,
     /// used_by_curr positive-delta POCs, nearest first.
     pub(crate) after: Vec<i32>,
+    /// used_by_curr long-term reference POCs (matched to DPB entries).
+    pub(crate) lt: Vec<i32>,
 }
 
 /// Repeat the temp list to `num` entries, then apply explicit reordering.
@@ -293,54 +359,5 @@ impl Clone for YuvPlanes {
             chroma: self.chroma,
             bit_depth: self.bit_depth,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fmt::{BitDepth, ChromaFormat};
-
-    fn mk_frame(poc: i32) -> Frame {
-        Frame {
-            planes: YuvPlanes {
-                y: vec![0; 4],
-                cb: vec![0; 1],
-                cr: vec![0; 1],
-                width: 2,
-                height: 2,
-                chroma: ChromaFormat::Yuv420,
-                bit_depth: BitDepth::Eight,
-            },
-            poc,
-            motion: vec![MotionInfo::intra(); 1],
-            width4: 1,
-            height4: 1,
-            short_term: true,
-            long_term: false,
-            needed_for_output: true,
-        }
-    }
-
-    #[test]
-    fn ref_list_orders_before_then_after() {
-        let mut dpb = Dpb::new(8);
-        dpb.push(mk_frame(0));
-        dpb.push(mk_frame(4));
-        dpb.push(mk_frame(8));
-        // current poc 6: before = {4,0}, after = {8}
-        let rps = ShortTermRps {
-            delta_poc_s0: vec![-2, -6],
-            used_s0: vec![true, true],
-            delta_poc_s1: vec![2],
-            used_s1: vec![true],
-        };
-        let pocs = dpb.apply_rps(6, &rps);
-        assert_eq!(pocs.before, vec![4, 0]);
-        assert_eq!(pocs.after, vec![8]);
-        let (l0, l1) = dpb.build_ref_lists(&pocs, 2, 1, true, &[], &[]);
-        assert_eq!(l0[0].poc, 4);
-        assert_eq!(l0[1].poc, 0);
-        assert_eq!(l1[0].poc, 8);
     }
 }

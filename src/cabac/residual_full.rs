@@ -387,7 +387,7 @@ pub(crate) fn residual_coding(
     let last_sb = sb_table.index(last_sbx, last_sby);
     let last_in_sb = pos_table.index(last_x & 3, last_y & 3);
 
-    // csbf neighbour tracking
+    // csbf neighbor tracking
     let mut csbf = [0u8; 64];
     let csbf = &mut csbf[..sb_w * sb_w];
     let mut c1_carry = 1i32; // greater1 ctx carried across sub-blocks
@@ -401,7 +401,7 @@ pub(crate) fn residual_coding(
         let mut infer_dc = false;
         let coded;
         if i < last_sb && i > 0 {
-            // neighbour-based context
+            // neighbor-based context
             let right = if sbx + 1 < sb_w {
                 csbf[(sbx + 1) + sby * sb_w]
             } else {
