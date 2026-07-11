@@ -1,0 +1,348 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+//! Inter-prediction data types: motion vectors, per-PU motion info, and the
+//! weighted-prediction table. Motion derivation and compensation live in
+//! `motion.rs` / `mc.rs`; this module holds the shared plain-data structures.
+
+use crate::bitreader::BitReader;
+use crate::error::DecodeError;
+
+fn e(s: &'static str) -> DecodeError {
+    DecodeError::Bitstream(s.into())
+}
+
+#[inline]
+fn wp_offset_range(bit_depth: u8, high_precision: bool) -> i32 {
+    if high_precision {
+        1i32 << bit_depth.saturating_sub(1)
+    } else {
+        128
+    }
+}
+
+#[inline]
+fn wp_offset_scale(bit_depth: u8, high_precision: bool) -> i32 {
+    if high_precision {
+        1
+    } else {
+        1i32 << bit_depth.saturating_sub(8)
+    }
+}
+
+#[inline]
+fn normalize_luma_offset(offset: i32, bit_depth: u8, high_precision: bool) -> i32 {
+    let range = wp_offset_range(bit_depth, high_precision);
+    offset
+        .clamp(-range, range - 1)
+        .saturating_mul(wp_offset_scale(bit_depth, high_precision))
+}
+
+#[inline]
+fn derive_chroma_offset(
+    delta: i32,
+    weight: i32,
+    log2_denom: u8,
+    bit_depth: u8,
+    high_precision: bool,
+) -> i32 {
+    let range = wp_offset_range(bit_depth, high_precision) as i64;
+    let pred = range - ((range * weight as i64) >> log2_denom);
+    let offset = (delta as i64 + pred).clamp(-range, range - 1) as i32;
+    offset.saturating_mul(wp_offset_scale(bit_depth, high_precision))
+}
+
+/// A quarter-pel motion vector.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(crate) struct Mv {
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+}
+
+impl Mv {
+    #[inline]
+    pub(crate) fn new(x: i16, y: i16) -> Self {
+        Mv { x, y }
+    }
+}
+
+/// Prediction direction flags for a PU.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(crate) struct PredFlags {
+    pub(crate) l0: bool,
+    pub(crate) l1: bool,
+}
+
+/// Per-PU (or per-4x4 block) motion information stored in the picture's motion
+/// field, used by spatial/temporal MV prediction of later blocks and by the
+/// collocated temporal predictor of later pictures.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct MotionInfo {
+    pub(crate) pred: PredFlags,
+    pub(crate) mv: [Mv; 2],
+    /// Reference index into RefPicList0 / RefPicList1 (-1 = unused).
+    pub(crate) ref_idx: [i8; 2],
+    /// POC of the referenced pictures (for temporal scaling), valid where used.
+    pub(crate) ref_poc: [i32; 2],
+    /// Long-term status of the referenced pictures (§8.5.3.2.9): a mismatch in
+    /// long-term status between a candidate's reference and the target reference
+    /// makes the candidate unavailable, and a long-term target is never scaled.
+    pub(crate) ref_lt: [bool; 2],
+    /// True when the block is intra-coded (not a valid MV predictor).
+    pub(crate) is_intra: bool,
+}
+
+impl MotionInfo {
+    #[inline]
+    pub(crate) fn intra() -> Self {
+        MotionInfo {
+            is_intra: true,
+            ref_idx: [-1, -1],
+            ..Default::default()
+        }
+    }
+
+    /// Whether list `l` (0 or 1) contributes a motion vector for this block.
+    #[inline]
+    pub(crate) fn pred_used(&self, l: usize) -> bool {
+        if l == 0 { self.pred.l0 } else { self.pred.l1 }
+    }
+}
+
+/// Weighted prediction parameters (§7.4.7.3). Weights are applied as
+/// `(sample * w + (1 << (shift-1))) >> shift + o` with `shift = log2_denom`.
+#[derive(Clone, Debug)]
+pub(crate) struct PredWeightTable {
+    pub(crate) luma_log2_denom: u8,
+    pub(crate) chroma_log2_denom: u8,
+    /// [list][ref] weight/offset. Offsets are normalized to reconstructed-
+    /// sample units while parsing: legacy offsets are scaled by
+    /// `1 << (bit_depth - 8)`, high-precision offsets are left unscaled.
+    pub(crate) luma_weight: [Vec<i32>; 2],
+    pub(crate) luma_offset: [Vec<i32>; 2],
+    /// [list][ref][cb=0/cr=1], with offsets in reconstructed-sample units.
+    pub(crate) chroma_weight: [Vec<[i32; 2]>; 2],
+    pub(crate) chroma_offset: [Vec<[i32; 2]>; 2],
+    /// Whether an explicit weight was signalled for each entry.
+    pub(crate) luma_flag: [Vec<bool>; 2],
+    pub(crate) chroma_flag: [Vec<bool>; 2],
+}
+
+impl PredWeightTable {
+    /// Parse `pred_weight_table()`. `num_ref` = active ref counts per list;
+    /// `has_l1` false for P slices. `bd_*` are luma/chroma bit depths.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse(
+        r: &mut BitReader,
+        num_ref: [usize; 2],
+        has_l1: bool,
+        chroma: bool,
+        bd_luma: u8,
+        bd_chroma: u8,
+        high_precision_offsets: bool,
+        // SCC (§7.3.6.3): per-list mask of entries whose reference picture is
+        // the current picture — their weight flags are NOT coded and the
+        // neutral weight is inferred.
+        is_curr_pic: [&[bool]; 2],
+    ) -> Result<Self, DecodeError> {
+        let luma_log2_denom = r.read_ue().map_err(|_| e("luma_log2_denom"))? as u8;
+        let chroma_log2_denom = if chroma {
+            let d = r.read_se().map_err(|_| e("delta_chroma_log2_denom"))?;
+            (luma_log2_denom as i32 + d).clamp(0, 7) as u8
+        } else {
+            0
+        };
+        let default_luma_w = 1i32 << luma_log2_denom;
+        let default_chroma_w = 1i32 << chroma_log2_denom;
+
+        let mut t = PredWeightTable {
+            luma_log2_denom,
+            chroma_log2_denom,
+            luma_weight: [Vec::new(), Vec::new()],
+            luma_offset: [Vec::new(), Vec::new()],
+            chroma_weight: [Vec::new(), Vec::new()],
+            chroma_offset: [Vec::new(), Vec::new()],
+            luma_flag: [Vec::new(), Vec::new()],
+            chroma_flag: [Vec::new(), Vec::new()],
+        };
+
+        let lists = if has_l1 { 2 } else { 1 };
+        for (list, &n) in num_ref[..lists].iter().enumerate() {
+            let skip = |i: usize| is_curr_pic[list].get(i).copied().unwrap_or(false);
+            let mut luma_flags = Vec::with_capacity(n);
+            for i in 0..n {
+                luma_flags.push(if skip(i) {
+                    false
+                } else {
+                    r.read_flag().map_err(|_| e("luma_weight_flag"))?
+                });
+            }
+            let mut chroma_flags = vec![false; n];
+            if chroma {
+                for (i, dst) in chroma_flags[..n].iter_mut().enumerate() {
+                    *dst = if skip(i) {
+                        false
+                    } else {
+                        r.read_flag().map_err(|_| e("chroma_weight_flag"))?
+                    };
+                }
+            }
+            for i in 0..n {
+                if luma_flags[i] {
+                    let dw = r.read_se().map_err(|_| e("delta_luma_weight"))?;
+                    let o = r.read_se().map_err(|_| e("luma_offset"))?;
+                    t.luma_weight[list].push(default_luma_w + dw);
+                    t.luma_offset[list].push(normalize_luma_offset(
+                        o,
+                        bd_luma,
+                        high_precision_offsets,
+                    ));
+                } else {
+                    t.luma_weight[list].push(default_luma_w);
+                    t.luma_offset[list].push(0);
+                }
+                if chroma && chroma_flags[i] {
+                    let mut w = [0i32; 2];
+                    let mut o = [0i32; 2];
+                    for c in 0..2 {
+                        let dw = r.read_se().map_err(|_| e("delta_chroma_weight"))?;
+                        let doff = r.read_se().map_err(|_| e("delta_chroma_offset"))?;
+                        w[c] = default_chroma_w + dw;
+                        o[c] = derive_chroma_offset(
+                            doff,
+                            w[c],
+                            chroma_log2_denom,
+                            bd_chroma,
+                            high_precision_offsets,
+                        );
+                    }
+                    t.chroma_weight[list].push(w);
+                    t.chroma_offset[list].push(o);
+                } else {
+                    t.chroma_weight[list].push([default_chroma_w, default_chroma_w]);
+                    t.chroma_offset[list].push([0, 0]);
+                }
+            }
+            t.luma_flag[list] = luma_flags;
+            t.chroma_flag[list] = chroma_flags;
+        }
+        Ok(t)
+    }
+
+    /// (weight, offset) for luma prediction from `list` and `ref_idx`. Falls
+    /// back to the neutral default (weight = 1<<denom, offset = 0) for indices
+    /// past the parsed table.
+    #[inline]
+    pub(crate) fn luma(&self, list: usize, ref_idx: i8) -> (i32, i32) {
+        let i = ref_idx.max(0) as usize;
+        let w = self
+            .luma_weight
+            .get(list)
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or(1 << self.luma_log2_denom);
+        let o = self
+            .luma_offset
+            .get(list)
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or(0);
+        (w, o)
+    }
+
+    /// (weight, offset) for chroma `plane` (0=Cb, 1=Cr) from `list`/`ref_idx`.
+    #[inline]
+    pub(crate) fn chroma(&self, list: usize, ref_idx: i8, plane: usize) -> (i32, i32) {
+        let i = ref_idx.max(0) as usize;
+        let w = self
+            .chroma_weight
+            .get(list)
+            .and_then(|v| v.get(i))
+            .map(|p| p[plane])
+            .unwrap_or(1 << self.chroma_log2_denom);
+        let o = self
+            .chroma_offset
+            .get(list)
+            .and_then(|v| v.get(i))
+            .map(|p| p[plane])
+            .unwrap_or(0);
+        (w, o)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{derive_chroma_offset, normalize_luma_offset};
+
+    #[test]
+    fn legacy_offsets_are_scaled_from_eight_bit_units() {
+        assert_eq!(normalize_luma_offset(7, 8, false), 7);
+        assert_eq!(normalize_luma_offset(7, 10, false), 28);
+        assert_eq!(normalize_luma_offset(-128, 12, false), -2048);
+    }
+
+    #[test]
+    fn high_precision_offsets_stay_in_native_sample_units() {
+        assert_eq!(normalize_luma_offset(7, 10, true), 7);
+        assert_eq!(normalize_luma_offset(511, 10, true), 511);
+        assert_eq!(normalize_luma_offset(-512, 10, true), -512);
+    }
+
+    #[test]
+    fn chroma_offset_uses_the_mode_specific_prediction_range() {
+        // denom=2, weight=5, delta=3:
+        // legacy range 128 -> (128 - 160 + 3) * 4 = -116 at 10-bit;
+        // high-precision range 512 -> 512 - 640 + 3 = -125.
+        assert_eq!(derive_chroma_offset(3, 5, 2, 10, false), -116);
+        assert_eq!(derive_chroma_offset(3, 5, 2, 10, true), -125);
+    }
+}
+
+/// Slice types.
+pub(crate) const SLICE_B: u8 = 0;
+pub(crate) const SLICE_P: u8 = 1;
+pub(crate) const SLICE_I: u8 = 2;
+
+/// An owned reference picture the motion-compensation path reads from. Planes
+/// are stored at coded (CTB-aligned) dimensions matching the current picture.
+#[derive(Clone)]
+pub(crate) struct RefFramePlanes {
+    pub(crate) poc: i32,
+    pub(crate) y: Vec<u16>,
+    pub(crate) cb: Vec<u16>,
+    pub(crate) cr: Vec<u16>,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) cw: usize,
+    pub(crate) ch: usize,
+    /// Per-4×4 motion field of the reference (for temporal MVP).
+    pub(crate) motion: Vec<MotionInfo>,
+    pub(crate) width4: usize,
+    pub(crate) height4: usize,
+}

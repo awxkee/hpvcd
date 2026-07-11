@@ -27,14 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! A plane/grid buffer that is either **owned** (a `Vec`, the normal serial
-//! case) or a **shared aliasing view** (a raw pointer + length) into buffers
-//! owned elsewhere. This lets the WPP wavefront hand each row-decoder mutable
-//! views over the *same* picture planes without changing any of the decoder's
-//! per-CTB methods: `Plane<T>` derefs to `[T]`, so `self.y[i]`, `self.y[a..b]`,
-//! `self.y.get(i)`, `self.y.len()`, `self.y.iter()` and `copy_from_slice` all
-//! work unchanged.
-//!
 //! # Safety contract for the `Shared` variant
 //! Multiple `Shared` planes may alias one backing buffer **only** when the
 //! wavefront guarantees the live `&mut` regions are disjoint at every instant.

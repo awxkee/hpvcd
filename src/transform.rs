@@ -486,17 +486,26 @@ fn idct_raw<const N: usize>(c: [i32; N]) -> [i32; N] {
 
 /// 2-D partial-butterfly inverse DCT into `out[..N*N]`.
 #[inline]
-fn inv_dct_n_into<const N: usize, S: Coeff>(coeff: &[S], bit_depth: u8, nx: usize, out: &mut [S]) {
+fn inv_dct_n_into<const N: usize, S: Coeff>(
+    coeff: &[S],
+    bit_depth: u8,
+    max_log2_tr_dynamic_range: i32,
+    nx: usize,
+    out: &mut [S],
+) {
     debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
     debug_assert!(coeff.len() >= N * N);
     debug_assert!(out.len() >= N * N);
 
     let shift1 = 7i32;
     let add1 = 1i32 << (shift1 - 1);
-    let shift2 = 20 - bit_depth as i32;
+    let shift2 = max_log2_tr_dynamic_range + 5 - bit_depth as i32;
     let add2 = 1i32 << (shift2 - 1);
-    // Stage-1 output is always clamped to i16 range regardless of storage width.
-    let mut tmp = [0i16; 32 * 32];
+    let clip_min = -(1i32 << max_log2_tr_dynamic_range);
+    let clip_max = (1i32 << max_log2_tr_dynamic_range) - 1;
+    // Extended precision raises the normative transform range above i16, so
+    // the scalar reference path keeps the complete stage-1 result in i32.
+    let mut tmp = [0i32; 32 * 32];
 
     // Columns >= nx are all-zero on input, so their stage-1 output stays zero in tmp.
     let nx = nx.min(N);
@@ -504,7 +513,7 @@ fn inv_dct_n_into<const N: usize, S: Coeff>(coeff: &[S], bit_depth: u8, nx: usiz
         let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c].to_i32());
         let raw = idct_raw::<N>(col);
         for (m, &raw) in raw.iter().enumerate() {
-            tmp[m * N + c] = ((raw + add1) >> shift1).clamp(-32768, 32767) as i16;
+            tmp[m * N + c] = ((raw + add1) >> shift1).clamp(clip_min, clip_max);
         }
     }
 
@@ -514,7 +523,7 @@ fn inv_dct_n_into<const N: usize, S: Coeff>(coeff: &[S], bit_depth: u8, nx: usiz
         .iter()
         .zip(out.as_chunks_mut::<N>().0.iter_mut())
     {
-        let row: [i32; N] = std::array::from_fn(|k| tmp_row[k] as i32);
+        let row: [i32; N] = std::array::from_fn(|k| tmp_row[k]);
         let raw = idct_raw::<N>(row);
         for (dst, &raw) in out_row.iter_mut().zip(raw.iter()) {
             *dst = S::from_i32((raw + add2) >> shift2);
@@ -527,16 +536,19 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
     coeff: &[S],
     t: &[[i32; N]; N],
     bit_depth: u8,
+    max_log2_tr_dynamic_range: i32,
     nx: usize,
     out: &mut [S],
 ) {
     let bd = bit_depth as i32;
     let shift1 = 7i32;
     let add1 = 1i32 << (shift1 - 1);
-    let shift2 = 20 - bd;
+    let shift2 = max_log2_tr_dynamic_range + 5 - bd;
     let add2 = 1i32 << (shift2 - 1);
+    let clip_min = -(1i32 << max_log2_tr_dynamic_range);
+    let clip_max = (1i32 << max_log2_tr_dynamic_range) - 1;
 
-    let mut tmp = [0i16; 32 * 32];
+    let mut tmp = [0i32; 32 * 32];
     let mut acc = [0i32; N];
 
     let nx = nx.min(N);
@@ -553,7 +565,7 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
             }
         }
         for (m, &acc) in acc[..N].iter().enumerate() {
-            tmp[m * N + c] = ((acc + add1) >> shift1).clamp(-32768, 32767) as i16;
+            tmp[m * N + c] = ((acc + add1) >> shift1).clamp(clip_min, clip_max);
         }
     }
 
@@ -568,7 +580,6 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
             if rk == 0 {
                 continue;
             }
-            let rk = rk as i32;
             for (acc, &tm) in acc[..N].iter_mut().zip(trow.iter()) {
                 *acc += tm * rk;
             }
@@ -584,6 +595,22 @@ pub(crate) struct DequantParams {
     pub factor: i64,
     pub add: i64,
     pub shift: i32,
+    /// Normative inverse-quantisation input/output range for this component.
+    pub clip_min: i64,
+    pub clip_max: i64,
+}
+
+impl DequantParams {
+    #[inline]
+    pub(crate) fn simd_i16_range(self) -> bool {
+        self.clip_min == -32768 && self.clip_max == 32767
+    }
+
+    #[inline]
+    pub(crate) fn clipped_max_abs(self, max_abs_level: i32) -> i64 {
+        let clip_abs = self.clip_min.saturating_neg().max(self.clip_max);
+        i64::from(max_abs_level.max(0)).min(clip_abs)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -599,16 +626,36 @@ pub(crate) struct ScalingMatrix<'a> {
     dc: u8,
     log2_size: u32,
     flat_16: bool,
+    max_coeff: i64,
 }
 
 impl<'a> ScalingMatrix<'a> {
     #[inline]
+    #[cfg(test)]
     pub(crate) fn new(coeffs: &'a [u8; 64], dc: u8, n: usize, flat_16: bool) -> Self {
+        let log2_size = n.trailing_zeros();
+        let used = if log2_size == 2 { 16 } else { 64 };
+        let mut max_coeff = coeffs[..used].iter().copied().max().unwrap_or(0);
+        if log2_size >= 4 {
+            max_coeff = max_coeff.max(dc);
+        }
+        Self::new_with_max(coeffs, dc, n, flat_16, max_coeff)
+    }
+
+    #[inline]
+    pub(crate) fn new_with_max(
+        coeffs: &'a [u8; 64],
+        dc: u8,
+        n: usize,
+        flat_16: bool,
+        max_coeff: u8,
+    ) -> Self {
         ScalingMatrix {
             coeffs,
             dc,
-            log2_size: (n as u32).trailing_zeros(),
+            log2_size: n.trailing_zeros(),
             flat_16,
+            max_coeff: if flat_16 { 16 } else { i64::from(max_coeff) },
         }
     }
 
@@ -637,23 +684,33 @@ impl<'a> ScalingMatrix<'a> {
 
     #[inline]
     pub(crate) fn max_coeff(self) -> i64 {
-        if self.flat_16 {
-            return 16;
-        }
-
-        let mut max_v = (if self.log2_size >= 4 { self.dc } else { 0 }) as i64;
-        for &v in self.coeffs.iter() {
-            max_v = max_v.max(v as i64);
-        }
-        max_v
+        self.max_coeff
     }
 }
 
 #[inline]
-pub(crate) fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantParams {
+pub(crate) fn max_log2_transform_dynamic_range(bit_depth: u8, extended_precision: bool) -> i32 {
+    if extended_precision {
+        15.max(bit_depth as i32 + 6)
+    } else {
+        15
+    }
+}
+
+#[inline]
+pub(crate) fn dequant_params(
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    extended_precision: bool,
+) -> DequantParams {
     let log2n = (n as u32).trailing_zeros() as i64;
     let bd = bit_depth as i64;
-    let bd_shift = (bd + log2n - 5).max(1);
+    let max_range = max_log2_transform_dynamic_range(bit_depth, extended_precision) as i64;
+    // Equivalent to HM's rightShift with the neutral scaling-list value (16)
+    // folded into `factor`: bitDepth + log2TrSize + 10 - MaxLog2TrDynamicRange.
+    let bd_shift = bd + log2n + 10 - max_range;
+    debug_assert!(bd_shift > 0);
     let max_qp_prime = 51 + 6 * (bit_depth as i32 - 8);
     let qp_scaled = qp_prime.clamp(0, max_qp_prime) as i64;
     let scale = DEQUANT_SCALE[(qp_scaled % 6) as usize];
@@ -662,16 +719,27 @@ pub(crate) fn dequant_params(n: usize, qp_prime: i32, bit_depth: u8) -> DequantP
         factor: scale * per * 16,
         add: 1i64 << (bd_shift - 1),
         shift: bd_shift as i32,
+        clip_min: -(1i64 << max_range),
+        clip_max: (1i64 << max_range) - 1,
     }
 }
 
 #[inline]
-pub(crate) fn transform_skip_params(n: usize, qp_prime: i32, bit_depth: u8) -> TransformSkipParams {
-    let dequant = dequant_params(n, qp_prime, bit_depth);
+pub(crate) fn transform_skip_params(
+    n: usize,
+    qp_prime: i32,
+    bit_depth: u8,
+    extended_precision: bool,
+) -> TransformSkipParams {
+    let dequant = dequant_params(n, qp_prime, bit_depth, extended_precision);
     let log2n = (n as u32).trailing_zeros() as i32;
-    // getTransformShift(bitDepth, log2TrSize, maxLog2TrDynamicRange), with
-    // maxLog2TrDynamicRange fixed to 15 for the supported HEVC profiles.
-    let tr_shift = 15i32 - bit_depth as i32 - log2n;
+    let max_range = max_log2_transform_dynamic_range(bit_depth, extended_precision);
+    let mut tr_shift = max_range - bit_depth as i32 - log2n;
+    // RExt extended precision forbids the negative transform-skip shift used by
+    // legacy very-high-bit-depth processing.
+    if extended_precision {
+        tr_shift = tr_shift.max(0);
+    }
     let tr_add = if tr_shift > 0 {
         1i32 << (tr_shift - 1)
     } else {
@@ -701,7 +769,9 @@ pub(crate) fn dequantize_into_scalar<S: Coeff>(
 ) {
     for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
         // l*factor can exceed i32 at high QP, so the intermediate stays i64.
-        let v = ((l as i64 * params.factor + params.add) >> params.shift).clamp(-32768, 32767);
+        let l = i64::from(l).clamp(params.clip_min, params.clip_max);
+        let v = ((l * params.factor + params.add) >> params.shift)
+            .clamp(params.clip_min, params.clip_max);
         *o = S::from_i32(v as i32);
     }
 }
@@ -712,15 +782,11 @@ pub(crate) fn dequantize_transform_skip_into_scalar<S: Coeff>(
     params: TransformSkipParams,
     out: &mut [S],
 ) {
-    debug_assert!(
-        n == 4,
-        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
-    );
-
     for (o, &l) in out[..n * n].iter_mut().zip(levels.iter()) {
-        let deq = ((l as i64 * params.dequant.factor + params.dequant.add) >> params.dequant.shift)
-            .clamp(-32768, 32767) as i32;
-        let residual = apply_transform_skip_shift(deq, params).clamp(-32768, 32767);
+        let l = i64::from(l).clamp(params.dequant.clip_min, params.dequant.clip_max);
+        let deq = ((l * params.dequant.factor + params.dequant.add) >> params.dequant.shift)
+            .clamp(params.dequant.clip_min, params.dequant.clip_max) as i32;
+        let residual = apply_transform_skip_shift(deq, params);
         *o = S::from_i32(residual);
     }
 }
@@ -735,7 +801,8 @@ pub(crate) fn dequantize_scaled_into_scalar<S: Coeff>(
     let base_factor = params.factor / 16;
     for (idx, (o, &l)) in out[..n * n].iter_mut().zip(levels.iter()).enumerate() {
         let factor = base_factor * scaling.coeff(idx);
-        let v = ((l as i64 * factor + params.add) >> params.shift).clamp(-32768, 32767);
+        let l = i64::from(l).clamp(params.clip_min, params.clip_max);
+        let v = ((l * factor + params.add) >> params.shift).clamp(params.clip_min, params.clip_max);
         *o = S::from_i32(v as i32);
     }
 }
@@ -747,17 +814,13 @@ pub(crate) fn dequantize_transform_skip_scaled_into_scalar<S: Coeff>(
     scaling: ScalingMatrix<'_>,
     out: &mut [S],
 ) {
-    debug_assert!(
-        n == 4,
-        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
-    );
-
     let base_factor = params.dequant.factor / 16;
     for (idx, (o, &l)) in out[..n * n].iter_mut().zip(levels.iter()).enumerate() {
         let factor = base_factor * scaling.coeff(idx);
-        let deq = ((l as i64 * factor + params.dequant.add) >> params.dequant.shift)
-            .clamp(-32768, 32767) as i32;
-        let residual = apply_transform_skip_shift(deq, params).clamp(-32768, 32767);
+        let l = i64::from(l).clamp(params.dequant.clip_min, params.dequant.clip_max);
+        let deq = ((l * factor + params.dequant.add) >> params.dequant.shift)
+            .clamp(params.dequant.clip_min, params.dequant.clip_max) as i32;
+        let residual = apply_transform_skip_shift(deq, params);
         *o = S::from_i32(residual);
     }
 }
@@ -888,7 +951,7 @@ pub(crate) fn resolve_dequant() -> DequantFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_into_avx2;
@@ -916,7 +979,7 @@ pub(crate) fn resolve_dequant16() -> DequantFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_into_avx2_16;
@@ -944,7 +1007,7 @@ pub(crate) fn resolve_dequant_skip() -> DequantSkipFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_into_avx2;
@@ -972,7 +1035,7 @@ pub(crate) fn resolve_dequant_skip16() -> DequantSkipFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_into_avx2_16;
@@ -1000,7 +1063,7 @@ pub(crate) fn resolve_dequant_scaled() -> DequantScaledFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_scaled_into_avx2;
@@ -1028,7 +1091,7 @@ pub(crate) fn resolve_dequant_scaled16() -> DequantScaledFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_scaled_into_avx2_16;
@@ -1056,7 +1119,7 @@ pub(crate) fn resolve_dequant_skip_scaled() -> DequantSkipScaledFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_scaled_into_avx2;
@@ -1084,7 +1147,7 @@ pub(crate) fn resolve_dequant_skip_scaled16() -> DequantSkipScaledFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::dequantize_transform_skip_scaled_into_avx2_16;
@@ -1122,7 +1185,7 @@ pub(crate) fn resolve_inv_transform() -> InvTransformFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_into_avx2;
@@ -1150,7 +1213,7 @@ pub(crate) fn resolve_inv_transform_dst4() -> InvTransform4Fn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_dst_into_avx2;
@@ -1178,7 +1241,7 @@ pub(crate) fn resolve_inv_transform16() -> InvTransformFn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_into_avx2_16;
@@ -1206,7 +1269,7 @@ pub(crate) fn resolve_inv_transform_dst4_16() -> InvTransform4Fn16 {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::inv_transform_dst_into_avx2_16;
@@ -1226,17 +1289,45 @@ pub(crate) fn inv_transform_into_scalar(
     out: &mut [i32],
 ) {
     match n {
-        4 => inv_dct_n_into::<4, i32>(coeff, bit_depth, nx, out),
-        8 => inv_dct_n_into::<8, i32>(coeff, bit_depth, nx, out),
-        16 => inv_dct_n_into::<16, i32>(coeff, bit_depth, nx, out),
-        32 => inv_dct_n_into::<32, i32>(coeff, bit_depth, nx, out),
+        4 => inv_dct_n_into::<4, i32>(coeff, bit_depth, 15, nx, out),
+        8 => inv_dct_n_into::<8, i32>(coeff, bit_depth, 15, nx, out),
+        16 => inv_dct_n_into::<16, i32>(coeff, bit_depth, 15, nx, out),
+        32 => inv_dct_n_into::<32, i32>(coeff, bit_depth, 15, nx, out),
+        _ => panic!("unsupported transform size {n}"),
+    }
+}
+
+/// Scalar inverse DCT using the RExt component transform dynamic range.
+pub(crate) fn inv_transform_into_scalar_extended(
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    out: &mut [i32],
+) {
+    let max_range = max_log2_transform_dynamic_range(bit_depth, true);
+    match n {
+        4 => inv_dct_n_into::<4, i32>(coeff, bit_depth, max_range, nx, out),
+        8 => inv_dct_n_into::<8, i32>(coeff, bit_depth, max_range, nx, out),
+        16 => inv_dct_n_into::<16, i32>(coeff, bit_depth, max_range, nx, out),
+        32 => inv_dct_n_into::<32, i32>(coeff, bit_depth, max_range, nx, out),
         _ => panic!("unsupported transform size {n}"),
     }
 }
 
 /// Scalar inverse 4×4 DST/ADST-like intra transform into `out[..16]`.
 pub(crate) fn inv_transform_dst_into_scalar(coeff: &[i32], bit_depth: u8, out: &mut [i32]) {
-    inv_transform_n_into::<4, i32>(coeff, &DST4, bit_depth, 4, out);
+    inv_transform_n_into::<4, i32>(coeff, &DST4, bit_depth, 15, 4, out);
+}
+
+/// Scalar inverse 4×4 DST using the RExt component transform dynamic range.
+pub(crate) fn inv_transform_dst_into_scalar_extended(
+    coeff: &[i32],
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    let max_range = max_log2_transform_dynamic_range(bit_depth, true);
+    inv_transform_n_into::<4, i32>(coeff, &DST4, bit_depth, max_range, 4, out);
 }
 
 /// Scalar i16 inverse DCT (8-bit depth path).
@@ -1248,15 +1339,380 @@ pub(crate) fn inv_transform_into_scalar16(
     out: &mut [i16],
 ) {
     match n {
-        4 => inv_dct_n_into::<4, i16>(coeff, bit_depth, nx, out),
-        8 => inv_dct_n_into::<8, i16>(coeff, bit_depth, nx, out),
-        16 => inv_dct_n_into::<16, i16>(coeff, bit_depth, nx, out),
-        32 => inv_dct_n_into::<32, i16>(coeff, bit_depth, nx, out),
+        4 => inv_dct_n_into::<4, i16>(coeff, bit_depth, 15, nx, out),
+        8 => inv_dct_n_into::<8, i16>(coeff, bit_depth, 15, nx, out),
+        16 => inv_dct_n_into::<16, i16>(coeff, bit_depth, 15, nx, out),
+        32 => inv_dct_n_into::<32, i16>(coeff, bit_depth, 15, nx, out),
         _ => panic!("unsupported transform size {n}"),
     }
 }
 
 /// Scalar i16 inverse 4×4 DST (8-bit depth path).
 pub(crate) fn inv_transform_dst_into_scalar16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {
-    inv_transform_n_into::<4, i16>(coeff, &DST4, bit_depth, 4, out);
+    inv_transform_n_into::<4, i16>(coeff, &DST4, bit_depth, 15, 4, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DequantFn, DequantFn16, DequantScaledFn, DequantScaledFn16, DequantSkipFn, DequantSkipFn16,
+        DequantSkipScaledFn, DequantSkipScaledFn16, ScalingMatrix, dequant_params,
+        dequantize_into_scalar_i16, dequantize_into_scalar_i32, dequantize_scaled_into_scalar_i16,
+        dequantize_scaled_into_scalar_i32, dequantize_transform_skip_into_scalar_i16,
+        dequantize_transform_skip_into_scalar_i32,
+        dequantize_transform_skip_scaled_into_scalar_i16,
+        dequantize_transform_skip_scaled_into_scalar_i32, inv_transform_into_scalar_extended,
+        max_log2_transform_dynamic_range, transform_skip_params,
+    };
+
+    const SCALING_COEFFS: [u8; 64] = [
+        0, 1, 2, 3, 4, 8, 16, 32, 64, 127, 255, 17, 5, 9, 23, 41, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    ];
+
+    fn levels(count: usize, stress: bool) -> Vec<i32> {
+        const SAFE: [i32; 16] = [0, 1, -1, 2, -2, 3, -3, 7, -7, 15, -15, 31, -31, 63, -63, 5];
+        const STRESS: [i32; 16] = [
+            0, 1, -1, 255, -255, 4095, -4095, 32767, -32767, 100_000, -100_000, 1_000_000,
+            -1_000_000, 17, -33, 511,
+        ];
+        let src = if stress { &STRESS } else { &SAFE };
+        (0..count).map(|i| src[i % src.len()]).collect()
+    }
+
+    fn max_abs_level(levels: &[i32]) -> i32 {
+        levels.iter().map(|v| v.abs()).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn extended_precision_uses_component_dynamic_range() {
+        assert_eq!(max_log2_transform_dynamic_range(8, false), 15);
+        assert_eq!(max_log2_transform_dynamic_range(8, true), 15);
+        assert_eq!(max_log2_transform_dynamic_range(10, true), 16);
+        assert_eq!(max_log2_transform_dynamic_range(12, true), 18);
+    }
+
+    #[test]
+    fn extended_dequant_preserves_values_above_i16() {
+        let params = dequant_params(4, 75, 12, true);
+        assert_eq!(params.clip_min, -262_144);
+        assert_eq!(params.clip_max, 262_143);
+
+        let mut out = [0i32; 16];
+        dequantize_into_scalar_i32(&[1; 16], 4, params, 1, &mut out);
+        assert!(
+            out[0] > i16::MAX as i32,
+            "extended result was truncated: {}",
+            out[0]
+        );
+        assert!(out.iter().all(|&v| v == out[0]));
+    }
+
+    #[test]
+    fn extended_transform_skip_uses_extended_dynamic_range() {
+        let legacy = transform_skip_params(32, 0, 12, false);
+        let extended = transform_skip_params(32, 0, 12, true);
+        assert_eq!(legacy.tr_shift, -2);
+        assert_eq!(extended.tr_shift, 1);
+    }
+
+    #[test]
+    fn extended_inverse_transform_accepts_full_12bit_range() {
+        let mut coeff = [0i32; 16];
+        coeff[0] = (1 << 18) - 1;
+        let mut out = [0i32; 16];
+        inv_transform_into_scalar_extended(&coeff, 4, 12, 1, &mut out);
+        assert!(out.iter().all(|&v| v != i32::MIN));
+        assert!(out.iter().any(|&v| v != 0));
+    }
+
+    #[test]
+    fn scaling_matrix_max_ignores_unused_4x4_entries() {
+        let mut coeffs = [0u8; 64];
+        coeffs[..16].fill(7);
+        coeffs[63] = 255;
+
+        assert_eq!(ScalingMatrix::new(&coeffs, 0, 4, false).max_coeff(), 7);
+        assert_eq!(ScalingMatrix::new(&coeffs, 0, 8, false).max_coeff(), 255);
+        assert_eq!(ScalingMatrix::new(&coeffs, 0, 4, true).max_coeff(), 16);
+    }
+
+    fn validate_dequant_backend(
+        backend: &str,
+        dequant: DequantFn,
+        dequant16: DequantFn16,
+        dequant_scaled: DequantScaledFn,
+        dequant_scaled16: DequantScaledFn16,
+        dequant_skip: DequantSkipFn,
+        dequant_skip16: DequantSkipFn16,
+        dequant_skip_scaled: DequantSkipScaledFn,
+        dequant_skip_scaled16: DequantSkipScaledFn16,
+    ) {
+        let scaling = ScalingMatrix::new(&SCALING_COEFFS, 16, 4, false);
+
+        // Every SIMD implementation is a 4x4 kernel. Exercise both its normal
+        // multiply path and its overflow-safe path against the scalar oracle.
+        for bit_depth in [8u8, 10, 12] {
+            let max_qp_prime = 51 + 6 * (i32::from(bit_depth) - 8);
+            for qp_prime in [0, max_qp_prime / 2, max_qp_prime] {
+                let params = transform_skip_params(4, qp_prime, bit_depth, false);
+                for stress in [false, true] {
+                    let levels = levels(16, stress);
+                    let max_abs = max_abs_level(&levels);
+
+                    let mut expected_dequant32 = [0i32; 16];
+                    let mut actual_dequant32 = [i32::MIN; 16];
+                    dequantize_into_scalar_i32(
+                        &levels,
+                        4,
+                        params.dequant,
+                        max_abs,
+                        &mut expected_dequant32,
+                    );
+                    dequant(&levels, 4, params.dequant, max_abs, &mut actual_dequant32);
+                    assert_eq!(
+                        actual_dequant32, expected_dequant32,
+                        "{backend} i32 dequant mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected_dequant16 = [0i16; 16];
+                    let mut actual_dequant16 = [i16::MIN; 16];
+                    dequantize_into_scalar_i16(
+                        &levels,
+                        4,
+                        params.dequant,
+                        max_abs,
+                        &mut expected_dequant16,
+                    );
+                    dequant16(&levels, 4, params.dequant, max_abs, &mut actual_dequant16);
+                    assert_eq!(
+                        actual_dequant16, expected_dequant16,
+                        "{backend} i16 dequant mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected_dequant_scaled32 = [0i32; 16];
+                    let mut actual_dequant_scaled32 = [i32::MIN; 16];
+                    dequantize_scaled_into_scalar_i32(
+                        &levels,
+                        4,
+                        params.dequant,
+                        scaling,
+                        max_abs,
+                        &mut expected_dequant_scaled32,
+                    );
+                    dequant_scaled(
+                        &levels,
+                        4,
+                        params.dequant,
+                        scaling,
+                        max_abs,
+                        &mut actual_dequant_scaled32,
+                    );
+                    assert_eq!(
+                        actual_dequant_scaled32, expected_dequant_scaled32,
+                        "{backend} scaled i32 dequant mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected_dequant_scaled16 = [0i16; 16];
+                    let mut actual_dequant_scaled16 = [i16::MIN; 16];
+                    dequantize_scaled_into_scalar_i16(
+                        &levels,
+                        4,
+                        params.dequant,
+                        scaling,
+                        max_abs,
+                        &mut expected_dequant_scaled16,
+                    );
+                    dequant_scaled16(
+                        &levels,
+                        4,
+                        params.dequant,
+                        scaling,
+                        max_abs,
+                        &mut actual_dequant_scaled16,
+                    );
+                    assert_eq!(
+                        actual_dequant_scaled16, expected_dequant_scaled16,
+                        "{backend} scaled i16 dequant mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected32 = [0i32; 16];
+                    let mut actual32 = [i32::MIN; 16];
+                    dequantize_transform_skip_into_scalar_i32(
+                        &levels,
+                        4,
+                        params,
+                        max_abs,
+                        &mut expected32,
+                    );
+                    dequant_skip(&levels, 4, params, max_abs, &mut actual32);
+                    assert_eq!(
+                        actual32, expected32,
+                        "{backend} i32 TS mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected16 = [0i16; 16];
+                    let mut actual16 = [i16::MIN; 16];
+                    dequantize_transform_skip_into_scalar_i16(
+                        &levels,
+                        4,
+                        params,
+                        max_abs,
+                        &mut expected16,
+                    );
+                    dequant_skip16(&levels, 4, params, max_abs, &mut actual16);
+                    assert_eq!(
+                        actual16, expected16,
+                        "{backend} i16 TS mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected_scaled32 = [0i32; 16];
+                    let mut actual_scaled32 = [i32::MIN; 16];
+                    dequantize_transform_skip_scaled_into_scalar_i32(
+                        &levels,
+                        4,
+                        params,
+                        scaling,
+                        max_abs,
+                        &mut expected_scaled32,
+                    );
+                    dequant_skip_scaled(&levels, 4, params, scaling, max_abs, &mut actual_scaled32);
+                    assert_eq!(
+                        actual_scaled32, expected_scaled32,
+                        "{backend} scaled i32 TS mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+
+                    let mut expected_scaled16 = [0i16; 16];
+                    let mut actual_scaled16 = [i16::MIN; 16];
+                    dequantize_transform_skip_scaled_into_scalar_i16(
+                        &levels,
+                        4,
+                        params,
+                        scaling,
+                        max_abs,
+                        &mut expected_scaled16,
+                    );
+                    dequant_skip_scaled16(
+                        &levels,
+                        4,
+                        params,
+                        scaling,
+                        max_abs,
+                        &mut actual_scaled16,
+                    );
+                    assert_eq!(
+                        actual_scaled16, expected_scaled16,
+                        "{backend} scaled i16 TS mismatch: bd={bit_depth}, qp'={qp_prime}, stress={stress}"
+                    );
+                }
+            }
+        }
+
+        // RExt permits transform skip beyond 4x4. SIMD entry points must route
+        // those sizes to the generic implementation rather than processing only
+        // the first vector/block. Verify every output sample for all legal sizes.
+        for n in [8usize, 16, 32] {
+            let levels = levels(n * n, true);
+            let max_abs = max_abs_level(&levels);
+            let params = transform_skip_params(n, 75, 12, false);
+
+            let mut expected32 = vec![0i32; n * n];
+            let mut actual32 = vec![i32::MIN; n * n];
+            dequantize_transform_skip_into_scalar_i32(&levels, n, params, max_abs, &mut expected32);
+            dequant_skip(&levels, n, params, max_abs, &mut actual32);
+            assert_eq!(
+                actual32, expected32,
+                "{backend} {n}x{n} TS fallback mismatch"
+            );
+
+            let mut expected16 = vec![0i16; n * n];
+            let mut actual16 = vec![i16::MIN; n * n];
+            dequantize_transform_skip_into_scalar_i16(&levels, n, params, max_abs, &mut expected16);
+            dequant_skip16(&levels, n, params, max_abs, &mut actual16);
+            assert_eq!(
+                actual16, expected16,
+                "{backend} {n}x{n} i16 TS fallback mismatch"
+            );
+        }
+
+        // Extended precision has a wider normative range than these i16-range
+        // SIMD kernels. Public backend entry points must select the scalar i32
+        // implementation rather than silently clipping to +/-32768.
+        for bit_depth in [10u8, 12] {
+            let levels = levels(16, true);
+            let max_abs = max_abs_level(&levels);
+            let params = transform_skip_params(4, 0, bit_depth, true);
+
+            let mut expected = [0i32; 16];
+            let mut actual = [i32::MIN; 16];
+            dequantize_transform_skip_scaled_into_scalar_i32(
+                &levels,
+                4,
+                params,
+                scaling,
+                max_abs,
+                &mut expected,
+            );
+            dequant_skip_scaled(&levels, 4, params, scaling, max_abs, &mut actual);
+            assert_eq!(
+                actual, expected,
+                "{backend} extended scaled TS fallback mismatch: bd={bit_depth}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn transform_skip_sse41_matches_scalar_for_all_supported_modes() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        validate_dequant_backend(
+            "SSE4.1",
+            crate::sse::dequantize_into_sse41,
+            crate::sse::dequantize_into_sse41_16,
+            crate::sse::dequantize_scaled_into_sse41,
+            crate::sse::dequantize_scaled_into_sse41_16,
+            crate::sse::dequantize_transform_skip_into_sse41,
+            crate::sse::dequantize_transform_skip_into_sse41_16,
+            crate::sse::dequantize_transform_skip_scaled_into_sse41,
+            crate::sse::dequantize_transform_skip_scaled_into_sse41_16,
+        );
+    }
+
+    #[cfg(all(feature = "avx", target_arch = "x86_64"))]
+    #[test]
+    fn transform_skip_avx2_matches_scalar_for_all_supported_modes() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        validate_dequant_backend(
+            "AVX2",
+            crate::avx::dequantize_into_avx2,
+            crate::avx::dequantize_into_avx2_16,
+            crate::avx::dequantize_scaled_into_avx2,
+            crate::avx::dequantize_scaled_into_avx2_16,
+            crate::avx::dequantize_transform_skip_into_avx2,
+            crate::avx::dequantize_transform_skip_into_avx2_16,
+            crate::avx::dequantize_transform_skip_scaled_into_avx2,
+            crate::avx::dequantize_transform_skip_scaled_into_avx2_16,
+        );
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn transform_skip_neon_matches_scalar_for_all_supported_modes() {
+        validate_dequant_backend(
+            "NEON",
+            crate::neon::dequantize_into_neon,
+            crate::neon::dequantize_into_neon16,
+            crate::neon::dequantize_scaled_into_neon,
+            crate::neon::dequantize_scaled_into_neon16,
+            crate::neon::dequantize_transform_skip_into_neon,
+            crate::neon::dequantize_transform_skip_into_neon16,
+            crate::neon::dequantize_transform_skip_scaled_into_neon,
+            crate::neon::dequantize_transform_skip_scaled_into_neon16,
+        );
+    }
 }

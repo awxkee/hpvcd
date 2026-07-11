@@ -29,7 +29,13 @@
 
 use core::arch::x86_64::*;
 
-use crate::transform::{DequantParams, ScalingMatrix, TransformSkipParams};
+use crate::transform::{
+    DequantParams, ScalingMatrix, TransformSkipParams, dequantize_into_scalar_i16,
+    dequantize_into_scalar_i32, dequantize_scaled_into_scalar_i16,
+    dequantize_scaled_into_scalar_i32, dequantize_transform_skip_into_scalar_i16,
+    dequantize_transform_skip_into_scalar_i32, dequantize_transform_skip_scaled_into_scalar_i16,
+    dequantize_transform_skip_scaled_into_scalar_i32,
+};
 
 #[inline(always)]
 fn supported_n(n: usize) -> bool {
@@ -42,25 +48,21 @@ fn mullo_safe_from_max(max_abs_level: i32, params: DequantParams) -> bool {
         return false;
     }
     let limit = ((i32::MAX as i64 - params.add) / params.factor).max(0);
-    i64::from(max_abs_level) <= limit
+    params.clipped_max_abs(max_abs_level) <= limit
 }
 
 #[inline(always)]
-fn scaled_mullo_safe_from_max(
-    max_abs_level: i32,
-    params: DequantParams,
-    scaling: ScalingMatrix<'_>,
-) -> bool {
+fn scaled_mullo_safe_from_max(max_abs_level: i32, params: DequantParams, max_coeff: i64) -> bool {
     let base_factor = params.factor / 16;
     if base_factor <= 0 || params.add > i32::MAX as i64 {
         return false;
     }
-    let max_factor = base_factor * scaling.max_coeff();
+    let max_factor = base_factor * max_coeff;
     if max_factor <= 0 || max_factor > i32::MAX as i64 {
         return false;
     }
     let limit = ((i32::MAX as i64 - params.add) / max_factor).max(0);
-    i64::from(max_abs_level) <= limit
+    params.clipped_max_abs(max_abs_level) <= limit
 }
 
 #[inline(always)]
@@ -69,11 +71,9 @@ fn avx2_factor_ok(params: DequantParams) -> bool {
 }
 
 #[inline(always)]
-fn avx2_scaled_factor_ok(params: DequantParams, scaling: ScalingMatrix<'_>) -> bool {
+fn avx2_scaled_factor_ok(params: DequantParams, max_coeff: i64) -> bool {
     let base_factor = params.factor / 16;
-    base_factor > 0
-        && base_factor * scaling.max_coeff() <= i32::MAX as i64
-        && params.add <= i32::MAX as i64
+    base_factor > 0 && base_factor * max_coeff <= i32::MAX as i64 && params.add <= i32::MAX as i64
 }
 
 #[inline(always)]
@@ -119,6 +119,14 @@ fn clip_i16_s32x8_with(v: __m256i, lo: __m256i, hi: __m256i) -> __m256i {
 
 #[inline]
 #[target_feature(enable = "avx2")]
+fn load_dequant_levels8(src: &[i32; 8], clip_lo: __m256i, clip_hi: __m256i) -> __m256i {
+    // HEVC clips the coefficient level before inverse quantisation. This is
+    // observable with scaling-list coefficients below the neutral value 16.
+    clip_i16_s32x8_with(load_i32x8(src), clip_lo, clip_hi)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
 fn pack_i32x8_to_i16x16(lo: __m256i, hi: __m256i) -> __m256i {
     // vpackssdw is lane-local: [lo0..3, hi0..3 | lo4..7, hi4..7].
     // Reorder qwords into the natural output order: [lo0..7, hi0..7].
@@ -135,7 +143,7 @@ fn dequant8_avx2_const(
     clip_lo: __m256i,
     clip_hi: __m256i,
 ) -> __m256i {
-    let v = load_i32x8(levels);
+    let v = load_dequant_levels8(levels, clip_lo, clip_hi);
     let v = _mm256_mullo_epi32(v, factor);
     let v = _mm256_add_epi32(v, add);
     clip_i16_s32x8_with(sra_epi32_count(v, shift), clip_lo, clip_hi)
@@ -151,7 +159,7 @@ fn dequant8_scaled_avx2_const(
     clip_lo: __m256i,
     clip_hi: __m256i,
 ) -> __m256i {
-    let v = load_i32x8(levels);
+    let v = load_dequant_levels8(levels, clip_lo, clip_hi);
     let f = load_i32x8(factors);
     let v = _mm256_mullo_epi32(v, f);
     let v = _mm256_add_epi32(v, add);
@@ -223,7 +231,7 @@ fn dequant8_avx2_saturating_const(
     clip_lo: __m256i,
     clip_hi: __m256i,
 ) -> __m256i {
-    let v = load_i32x8(levels);
+    let v = load_dequant_levels8(levels, clip_lo, clip_hi);
     let over_hi = _mm256_cmpgt_epi32(v, pos_cut_minus_one);
     let over_lo = _mm256_cmpgt_epi32(neg_keep_min, v);
     let safe = _mm256_max_epi32(_mm256_min_epi32(v, pos_cut_minus_one), neg_keep_min);
@@ -247,7 +255,7 @@ fn dequant8_scaled_avx2_saturating_const(
     clip_lo: __m256i,
     clip_hi: __m256i,
 ) -> __m256i {
-    let v = load_i32x8(levels);
+    let v = load_dequant_levels8(levels, clip_lo, clip_hi);
     let f = load_i32x8(factors);
     let pos_cut_minus_one = load_i32x8(pos_cut_minus_one);
     let neg_keep_min = load_i32x8(neg_keep_min);
@@ -1067,8 +1075,10 @@ pub(crate) fn dequantize_into_avx2(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    debug_assert!(supported_n(n));
-    debug_assert!(avx2_factor_ok(params));
+    if !supported_n(n) || !params.simd_i16_range() || !avx2_factor_ok(params) {
+        dequantize_into_scalar_i32(levels, n, params, max_abs_level, out);
+        return;
+    }
     if mullo_safe_from_max(max_abs_level, params) {
         unsafe { dequantize_into_avx2_mullo_impl(levels, n, params, out) }
     } else {
@@ -1083,8 +1093,10 @@ pub(crate) fn dequantize_into_avx2_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    debug_assert!(supported_n(n));
-    debug_assert!(avx2_factor_ok(params));
+    if !supported_n(n) || !params.simd_i16_range() || !avx2_factor_ok(params) {
+        dequantize_into_scalar_i16(levels, n, params, max_abs_level, out);
+        return;
+    }
     if mullo_safe_from_max(max_abs_level, params) {
         unsafe { dequantize_into_avx2_16_mullo_impl(levels, n, params, out) }
     } else {
@@ -1099,8 +1111,10 @@ pub(crate) fn dequantize_transform_skip_into_avx2(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    debug_assert_eq!(n, 4);
-    debug_assert!(avx2_factor_ok(params.dequant));
+    if n != 4 || !params.dequant.simd_i16_range() || !avx2_factor_ok(params.dequant) {
+        dequantize_transform_skip_into_scalar_i32(levels, n, params, max_abs_level, out);
+        return;
+    }
     if mullo_safe_from_max(max_abs_level, params.dequant) {
         unsafe { dequantize_transform_skip_into_avx2_mullo_impl(levels, n, params, out) }
     } else {
@@ -1115,8 +1129,10 @@ pub(crate) fn dequantize_transform_skip_into_avx2_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    debug_assert_eq!(n, 4);
-    debug_assert!(avx2_factor_ok(params.dequant));
+    if n != 4 || !params.dequant.simd_i16_range() || !avx2_factor_ok(params.dequant) {
+        dequantize_transform_skip_into_scalar_i16(levels, n, params, max_abs_level, out);
+        return;
+    }
     if mullo_safe_from_max(max_abs_level, params.dequant) {
         unsafe { dequantize_transform_skip_into_avx2_16_mullo_impl(levels, n, params, out) }
     } else {
@@ -1132,9 +1148,16 @@ pub(crate) fn dequantize_scaled_into_avx2(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    debug_assert!(supported_n(n));
-    debug_assert!(avx2_scaled_factor_ok(params, scaling));
-    if scaled_mullo_safe_from_max(max_abs_level, params, scaling) {
+    if !supported_n(n) || !params.simd_i16_range() {
+        dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
+        return;
+    }
+    let max_coeff = scaling.max_coeff();
+    if !avx2_scaled_factor_ok(params, max_coeff) {
+        dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
+        return;
+    }
+    if scaled_mullo_safe_from_max(max_abs_level, params, max_coeff) {
         unsafe { dequantize_scaled_into_avx2_mullo_impl(levels, n, params, scaling, out) }
     } else {
         unsafe { dequantize_scaled_into_avx2_saturating_impl(levels, n, params, scaling, out) }
@@ -1149,9 +1172,16 @@ pub(crate) fn dequantize_scaled_into_avx2_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    debug_assert!(supported_n(n));
-    debug_assert!(avx2_scaled_factor_ok(params, scaling));
-    if scaled_mullo_safe_from_max(max_abs_level, params, scaling) {
+    if !supported_n(n) || !params.simd_i16_range() {
+        dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
+        return;
+    }
+    let max_coeff = scaling.max_coeff();
+    if !avx2_scaled_factor_ok(params, max_coeff) {
+        dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
+        return;
+    }
+    if scaled_mullo_safe_from_max(max_abs_level, params, max_coeff) {
         unsafe { dequantize_scaled_into_avx2_16_mullo_impl(levels, n, params, scaling, out) }
     } else {
         unsafe { dequantize_scaled_into_avx2_16_saturating_impl(levels, n, params, scaling, out) }
@@ -1166,9 +1196,30 @@ pub(crate) fn dequantize_transform_skip_scaled_into_avx2(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    debug_assert_eq!(n, 4);
-    debug_assert!(avx2_scaled_factor_ok(params.dequant, scaling));
-    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, scaling) {
+    if n != 4 || !params.dequant.simd_i16_range() {
+        dequantize_transform_skip_scaled_into_scalar_i32(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
+        return;
+    }
+    let max_coeff = scaling.max_coeff();
+    if !avx2_scaled_factor_ok(params.dequant, max_coeff) {
+        dequantize_transform_skip_scaled_into_scalar_i32(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
+        return;
+    }
+    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_avx2_mullo_impl(levels, n, params, scaling, out)
         }
@@ -1189,9 +1240,30 @@ pub(crate) fn dequantize_transform_skip_scaled_into_avx2_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    debug_assert_eq!(n, 4);
-    debug_assert!(avx2_scaled_factor_ok(params.dequant, scaling));
-    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, scaling) {
+    if n != 4 || !params.dequant.simd_i16_range() {
+        dequantize_transform_skip_scaled_into_scalar_i16(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
+        return;
+    }
+    let max_coeff = scaling.max_coeff();
+    if !avx2_scaled_factor_ok(params.dequant, max_coeff) {
+        dequantize_transform_skip_scaled_into_scalar_i16(
+            levels,
+            n,
+            params,
+            scaling,
+            max_abs_level,
+            out,
+        );
+        return;
+    }
+    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_avx2_16_mullo_impl(
                 levels, n, params, scaling, out,

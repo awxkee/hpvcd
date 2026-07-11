@@ -146,6 +146,7 @@ fn edge_offset8_avx2(
     samples: __m256i,
     n1: __m256i,
     n2: __m256i,
+    valid: __m256i,
     offsets: &[i32; 4],
     zero: __m256i,
     max: __m256i,
@@ -184,8 +185,41 @@ fn edge_offset8_avx2(
 
     (
         clamp_i32x8(_mm256_add_epi32(samples, off), zero, max),
-        active,
+        _mm256_and_si256(active, valid),
     )
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+fn edge_offset16_masked_avx2(
+    dst: &[u16; 16],
+    samples: &[u16; 16],
+    n1: &[u16; 16],
+    n2: &[u16; 16],
+    valid: &[u16; 16],
+    offsets: &[i32; 4],
+    zero: __m256i,
+    max: __m256i,
+) -> __m256i {
+    let old = load_u16x16(dst);
+    let s = load_u16x16(samples);
+    let a = load_u16x16(n1);
+    let b = load_u16x16(n2);
+    let v = load_u16x16(valid);
+
+    let (s_lo, s_hi) = u16x16_to_i32x8_pair(s);
+    let (a_lo, a_hi) = u16x16_to_i32x8_pair(a);
+    let (b_lo, b_hi) = u16x16_to_i32x8_pair(b);
+    let (v_lo, v_hi) = u16x16_to_i32x8_pair(v);
+    let valid_lo = _mm256_cmpgt_epi32(v_lo, zero);
+    let valid_hi = _mm256_cmpgt_epi32(v_hi, zero);
+
+    let (lo, mlo) = edge_offset8_avx2(s_lo, a_lo, b_lo, valid_lo, offsets, zero, max);
+    let (hi, mhi) = edge_offset8_avx2(s_hi, a_hi, b_hi, valid_hi, offsets, zero, max);
+    let out = pack_u16x16_from_i32x8_pair(lo, hi);
+    let mask = pack_mask_u16x16_from_i32x8_pair(mlo, mhi);
+    _mm256_blendv_epi8(old, out, mask)
 }
 
 #[inline]
@@ -203,13 +237,14 @@ fn edge_offset16_avx2(
     let s = load_u16x16(samples);
     let a = load_u16x16(n1);
     let b = load_u16x16(n2);
+    let valid = _mm256_cmpeq_epi32(zero, zero);
 
     let (s_lo, s_hi) = u16x16_to_i32x8_pair(s);
     let (a_lo, a_hi) = u16x16_to_i32x8_pair(a);
     let (b_lo, b_hi) = u16x16_to_i32x8_pair(b);
 
-    let (lo, mlo) = edge_offset8_avx2(s_lo, a_lo, b_lo, offsets, zero, max);
-    let (hi, mhi) = edge_offset8_avx2(s_hi, a_hi, b_hi, offsets, zero, max);
+    let (lo, mlo) = edge_offset8_avx2(s_lo, a_lo, b_lo, valid, offsets, zero, max);
+    let (hi, mhi) = edge_offset8_avx2(s_hi, a_hi, b_hi, valid, offsets, zero, max);
     let out = pack_u16x16_from_i32x8_pair(lo, hi);
     let mask = pack_mask_u16x16_from_i32x8_pair(mlo, mhi);
     _mm256_blendv_epi8(old, out, mask)
@@ -242,15 +277,6 @@ fn band_offset_tail16_avx2(
     dst.copy_from_slice(&tmp[..len]);
 }
 
-#[inline]
-fn neighbor_sample_or_self(src: &[u16], w: usize, h: usize, x: i32, y: i32, s: u16) -> u16 {
-    if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
-        src.get(y as usize * w + x as usize).copied().unwrap_or(s)
-    } else {
-        s
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -276,6 +302,7 @@ fn edge_offset_tail16_avx2(
     let mut s = [0u16; 16];
     let mut n1 = [0u16; 16];
     let mut n2 = [0u16; 16];
+    let mut valid = [0u16; 16];
     let Some(src_base) = src_row_base(y, w) else {
         return;
     };
@@ -283,13 +310,25 @@ fn edge_offset_tail16_avx2(
     for lane in 0..dst.len() {
         let x = x0 + lane;
         let sample = src.get(src_base + x).copied().unwrap_or(0);
+        let x1 = x as i32 + dx;
+        let y1 = y as i32 + dy;
+        let x2 = x as i32 - dx;
+        let y2 = y as i32 - dy;
+        let ok1 = x1 >= 0 && y1 >= 0 && (x1 as usize) < w && (y1 as usize) < h;
+        let ok2 = x2 >= 0 && y2 >= 0 && (x2 as usize) < w && (y2 as usize) < h;
         d[lane] = dst[lane];
         s[lane] = sample;
-        n1[lane] = neighbor_sample_or_self(src, w, h, x as i32 + dx, y as i32 + dy, sample);
-        n2[lane] = neighbor_sample_or_self(src, w, h, x as i32 - dx, y as i32 - dy, sample);
+        if ok1 && ok2 {
+            n1[lane] = src[y1 as usize * w + x1 as usize];
+            n2[lane] = src[y2 as usize * w + x2 as usize];
+            valid[lane] = 1;
+        } else {
+            n1[lane] = sample;
+            n2[lane] = sample;
+        }
     }
 
-    let out = edge_offset16_avx2(&d, &s, &n1, &n2, offsets, zero, max);
+    let out = edge_offset16_masked_avx2(&d, &s, &n1, &n2, &valid, offsets, zero, max);
     let mut tmp = [0u16; 16];
     store_u16x16(&mut tmp, out);
     let len = dst.len();
@@ -805,19 +844,21 @@ pub(crate) fn apply_sao_plane_avx2(
     }
 
     unsafe {
-        match (type_idx, eo_class) {
-            (1, _) => apply_sao_band_offset_avx2_impl(
+        match type_idx {
+            1 => apply_sao_band_offset_avx2_impl(
                 dst, src, w, 0, x0, y0, x_end, y_end, offsets, band_pos, bd,
             ),
-            (2, 0) => apply_sao_edge_offset_horizontal_avx2_impl(
-                dst, src, w, h, 0, x0, y0, x_end, y_end, offsets, bd,
-            ),
-            (2, 1) => apply_sao_edge_offset_vertical_avx2_impl(
-                dst, src, w, h, 0, x0, y0, x_end, y_end, offsets, bd,
-            ),
-            (2, _) => apply_sao_edge_offset_diagonal_avx2_impl(
-                dst, src, w, h, 0, x0, y0, x_end, y_end, offsets, eo_class, bd,
-            ),
+            2 => match eo_class {
+                0 => apply_sao_edge_offset_horizontal_avx2_impl(
+                    dst, src, w, h, 0, x0, y0, x_end, y_end, offsets, bd,
+                ),
+                1 => apply_sao_edge_offset_vertical_avx2_impl(
+                    dst, src, w, h, 0, x0, y0, x_end, y_end, offsets, bd,
+                ),
+                _ => apply_sao_edge_offset_diagonal_avx2_impl(
+                    dst, src, w, h, 0, x0, y0, x_end, y_end, offsets, eo_class, bd,
+                ),
+            },
             _ => {}
         }
     }
@@ -845,19 +886,21 @@ pub(crate) fn apply_sao_plane_banded_avx2(
     }
 
     unsafe {
-        match (type_idx, eo_class) {
-            (1, _) => apply_sao_band_offset_avx2_impl(
+        match type_idx {
+            1 => apply_sao_band_offset_avx2_impl(
                 dst_band, src_full, w, band_y0, x0, y0, x_end, y_end, offsets, band_pos, bd,
             ),
-            (2, 0) => apply_sao_edge_offset_horizontal_avx2_impl(
-                dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, bd,
-            ),
-            (2, 1) => apply_sao_edge_offset_vertical_avx2_impl(
-                dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, bd,
-            ),
-            (2, _) => apply_sao_edge_offset_diagonal_avx2_impl(
-                dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, eo_class, bd,
-            ),
+            2 => match eo_class {
+                0 => apply_sao_edge_offset_horizontal_avx2_impl(
+                    dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, bd,
+                ),
+                1 => apply_sao_edge_offset_vertical_avx2_impl(
+                    dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, bd,
+                ),
+                _ => apply_sao_edge_offset_diagonal_avx2_impl(
+                    dst_band, src_full, w, h, band_y0, x0, y0, x_end, y_end, offsets, eo_class, bd,
+                ),
+            },
             _ => {}
         }
     }

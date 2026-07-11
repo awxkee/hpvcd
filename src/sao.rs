@@ -79,7 +79,7 @@ pub(crate) fn resolve_apply_sao_plane() -> SaoPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_plane_avx2;
@@ -107,7 +107,7 @@ pub(crate) fn resolve_apply_sao_plane_banded() -> SaoPlaneBandedFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_plane_banded_avx2;
@@ -135,7 +135,7 @@ pub(crate) fn resolve_apply_sao_band_offset_inplace() -> SaoBandOffsetInplaceFn 
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_band_offset_inplace_avx2;
@@ -163,7 +163,7 @@ pub(crate) fn resolve_apply_sao_band_offset_banded_inplace() -> SaoBandOffsetBan
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::apply_sao_band_offset_banded_inplace_avx2;
@@ -298,16 +298,14 @@ fn apply_sao_edge_offset_scalar(
             let inb = |xx: i32, yy: i32| -> bool {
                 xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h
             };
-            let n1 = if inb(x1, y1) {
-                src[y1 as usize * w + x1 as usize] as i32
-            } else {
-                s
-            };
-            let n2 = if inb(x2, y2) {
-                src[y2 as usize * w + x2 as usize] as i32
-            } else {
-                s
-            };
+            // §8.7.3.2: if either neighbor lies outside the picture the sample
+            // is left unchanged (edgeIdx not applied). Substituting `s` is wrong
+            // — the other neighbor can still yield a nonzero edgeIdx.
+            if !inb(x1, y1) || !inb(x2, y2) {
+                continue;
+            }
+            let n1 = src[y1 as usize * w + x1 as usize] as i32;
+            let n2 = src[y2 as usize * w + x2 as usize] as i32;
 
             let sign1 = (s > n1) as i32 - (s < n1) as i32;
             let sign2 = (s > n2) as i32 - (s < n2) as i32;
@@ -355,6 +353,137 @@ pub(crate) struct SaoPlanesCtx<'a> {
     pub bd_c: u8,
     pub sao_luma: bool,
     pub sao_chroma: bool,
+}
+
+/// Per-4×4-luma boundary maps + flags used to decide SAO edge-offset neighbor
+/// availability (§8.7.3.2) on the restricted (serial) path.
+pub(crate) struct SaoBoundary<'a> {
+    pub gw: usize,
+    pub log2_ctb: u32,
+    pub sub_w: usize,
+    pub sub_h: usize,
+    pub slice_idx: &'a [u16],
+    pub tqb: &'a [bool],
+    pub pcm: &'a [bool],
+    pub loop_filter_across_slices: bool,
+    pub pcm_loop_filter_disabled: bool,
+    pub tile_grid: Option<&'a crate::tiles::TileGrid>,
+}
+
+impl SaoBoundary<'_> {
+    /// Whether luma sample `(x, y)` is a valid SAO edge-offset neighbor of the
+    /// sample at `(cx, cy)` (luma coords). A cross slice/tile boundary with
+    /// filtering disabled, or a PCM/TQB exemption on either endpoint, makes the
+    /// neighbor unavailable.
+    #[inline]
+    pub(crate) fn luma_neighbor_ok(&self, cx: usize, cy: usize, x: usize, y: usize) -> bool {
+        if self.gw == 0 {
+            return true;
+        }
+        let gc = (cy / 4) * self.gw + (cx / 4);
+        let gn = (y / 4) * self.gw + (x / 4);
+        if self.tqb.get(gc).copied().unwrap_or(false) || self.tqb.get(gn).copied().unwrap_or(false)
+        {
+            return false;
+        }
+        if self.pcm_loop_filter_disabled
+            && (self.pcm.get(gc).copied().unwrap_or(false)
+                || self.pcm.get(gn).copied().unwrap_or(false))
+        {
+            return false;
+        }
+        if !self.loop_filter_across_slices
+            && self.slice_idx.get(gc).copied().unwrap_or(0)
+                != self.slice_idx.get(gn).copied().unwrap_or(0)
+        {
+            return false;
+        }
+        if let Some(g) = self.tile_grid {
+            let c = self.log2_ctb;
+            if g.tile_id_at(cx >> c, cy >> c) != g.tile_id_at(x >> c, y >> c) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Chroma analogue: map chroma coords back to luma to consult the maps.
+    #[inline]
+    pub(crate) fn chroma_neighbor_ok(&self, ccx: usize, ccy: usize, cx: usize, cy: usize) -> bool {
+        self.luma_neighbor_ok(
+            ccx * self.sub_w,
+            ccy * self.sub_h,
+            cx * self.sub_w,
+            cy * self.sub_h,
+        )
+    }
+}
+
+/// Edge-offset SAO with per-neighbor boundary gating (§8.7.3.2). Used only on
+/// the restricted path; when either neighbor is unavailable the sample is left
+/// unchanged (edgeIdx forced to 0). `neighbor_ok(cx, cy, nx, ny)` reports
+/// whether neighbor `(nx, ny)` may be used for the sample at `(cx, cy)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_sao_edge_offset_gated(
+    dst: &mut [u16],
+    src: &[u16],
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    x_end: usize,
+    y_end: usize,
+    offsets: &[i32; 4],
+    eo_class: u8,
+    bd: u8,
+    neighbor_ok: &dyn Fn(usize, usize, usize, usize) -> bool,
+) {
+    let max_val = ((1u32 << bd) - 1) as i32;
+    let (dx, dy): (i32, i32) = match eo_class {
+        0 => (1, 0),
+        1 => (0, 1),
+        2 => (1, 1),
+        _ => (1, -1),
+    };
+    for y in y0..y_end {
+        for x in x0..x_end {
+            let s = src[y * w + x] as i32;
+            let x1 = x as i32 + dx;
+            let y1 = y as i32 + dy;
+            let x2 = x as i32 - dx;
+            let y2 = y as i32 - dy;
+            let ok1 = x1 >= 0
+                && y1 >= 0
+                && (x1 as usize) < w
+                && (y1 as usize) < h
+                && neighbor_ok(x, y, x1 as usize, y1 as usize);
+            let ok2 = x2 >= 0
+                && y2 >= 0
+                && (x2 as usize) < w
+                && (y2 as usize) < h
+                && neighbor_ok(x, y, x2 as usize, y2 as usize);
+            // §8.7.3.2: if either neighbor is unavailable, the sample is not
+            // modified.
+            if !ok1 || !ok2 {
+                continue;
+            }
+            let n1 = src[y1 as usize * w + x1 as usize] as i32;
+            let n2 = src[y2 as usize * w + x2 as usize] as i32;
+            let sign1 = (s > n1) as i32 - (s < n1) as i32;
+            let sign2 = (s > n2) as i32 - (s < n2) as i32;
+            let edge_idx = sign1 + sign2 + 2;
+            let offset = match edge_idx {
+                0 => offsets[0],
+                1 => offsets[1],
+                3 => offsets[2],
+                4 => offsets[3],
+                _ => 0,
+            };
+            if offset != 0 {
+                dst[y * w + x] = (s + offset).clamp(0, max_val) as u16;
+            }
+        }
+    }
 }
 
 /// Apply SAO to one CTB-row's worth of output. `*_dst` are band slices.
@@ -602,22 +731,19 @@ pub(crate) fn apply_sao_plane_banded_scalar(
                     let s = s0 as i32;
                     let (x1, y1) = (x as i32 + dx, y as i32 + dy);
                     let (x2, y2) = (x as i32 - dx, y as i32 - dy);
-                    let n1 = if inb(x1, y1) {
-                        src_full
-                            .get(y1 as usize * w + x1 as usize)
-                            .copied()
-                            .unwrap_or(s0) as i32
-                    } else {
-                        s
-                    };
-                    let n2 = if inb(x2, y2) {
-                        src_full
-                            .get(y2 as usize * w + x2 as usize)
-                            .copied()
-                            .unwrap_or(s0) as i32
-                    } else {
-                        s
-                    };
+                    // §8.7.3.2: an out-of-picture neighbor makes the sample
+                    // unavailable → leave it unchanged (edgeIdx not applied).
+                    if !inb(x1, y1) || !inb(x2, y2) {
+                        continue;
+                    }
+                    let n1 = src_full
+                        .get(y1 as usize * w + x1 as usize)
+                        .copied()
+                        .unwrap_or(s0) as i32;
+                    let n2 = src_full
+                        .get(y2 as usize * w + x2 as usize)
+                        .copied()
+                        .unwrap_or(s0) as i32;
                     let sign1 = (s > n1) as i32 - (s < n1) as i32;
                     let sign2 = (s > n2) as i32 - (s < n2) as i32;
                     let offset = match sign1 + sign2 + 2 {
@@ -764,4 +890,120 @@ pub(crate) fn apply_sao_parallel(
     });
 
     (y_dm.into_inner(), cb_dm.into_inner(), cr_dm.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a boundary where the vertical line x=4 splits slice 0 (left) from
+    // slice 1 (right), on a 8×2 luma grid (gw=2, one 4×4 row).
+    fn split_slice_bnd(slice_idx: &[u16]) -> SaoBoundary<'_> {
+        SaoBoundary {
+            gw: 2,
+            log2_ctb: 6,
+            sub_w: 2,
+            sub_h: 2,
+            slice_idx,
+            tqb: &[false, false],
+            pcm: &[false, false],
+            loop_filter_across_slices: false,
+            pcm_loop_filter_disabled: false,
+            tile_grid: None,
+        }
+    }
+
+    #[test]
+    fn cross_slice_neighbor_unavailable() {
+        // grid cell 0 = slice 0 (x 0..4), cell 1 = slice 1 (x 4..8).
+        let slices = [0u16, 1];
+        let b = split_slice_bnd(&slices);
+        // Sample at x=3 (slice 0), neighbor at x=4 (slice 1) → unavailable.
+        assert!(!b.luma_neighbor_ok(3, 0, 4, 0));
+        // Same-slice neighbor is available.
+        assert!(b.luma_neighbor_ok(3, 0, 2, 0));
+        assert!(b.luma_neighbor_ok(5, 0, 6, 0));
+    }
+
+    #[test]
+    fn across_slices_enabled_allows_neighbor() {
+        let slices = [0u16, 1];
+        let mut b = split_slice_bnd(&slices);
+        b.loop_filter_across_slices = true;
+        assert!(b.luma_neighbor_ok(3, 0, 4, 0));
+    }
+
+    #[test]
+    fn gated_eo_skips_when_neighbor_unavailable() {
+        // 4×1 luma row: values chosen so the middle sample would get an offset
+        // if both neighbors were used, but the right neighbor is "unavailable".
+        // Horizontal EO (eo_class 0): neighbors are x-1 and x+1.
+        let src = [10u16, 5, 10, 5];
+        let mut dst = src;
+        let offsets = [7i32, 0, 0, 0]; // edge_idx 0 (local min) → +7
+        // Sample x=1 (val 5) has neighbors 10 and 10 → local min → edge_idx 0.
+        // Make the x+1 neighbor unavailable → sample must be left unchanged.
+        let ok = |_cx: usize, _cy: usize, nx: usize, _ny: usize| nx != 2;
+        apply_sao_edge_offset_gated(&mut dst, &src, 4, 1, 0, 0, 4, 1, &offsets, 0, 8, &ok);
+        // x=1 unchanged because its right neighbor (x=2) was unavailable.
+        assert_eq!(dst[1], 5);
+    }
+
+    #[test]
+    fn banded_eo_matches_serial_scalar_for_all_classes() {
+        let w = 19usize;
+        let h = 11usize;
+        let bd = 10u8;
+        let max_v = (1u16 << bd) - 1;
+        let src: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let x = i % w;
+                let y = i / w;
+                ((x * 73 + y * 191 + (x * y * 17)) & max_v as usize) as u16
+            })
+            .collect();
+        let offsets = [3i32, -2, 4, -5];
+        let x0 = 1usize;
+        let x_end = w - 1;
+        let y0 = 2usize;
+        let y_end = h - 2;
+
+        for eo_class in 0..4u8 {
+            let mut serial = src.clone();
+            apply_sao_plane_scalar(
+                &mut serial,
+                &src,
+                w,
+                h,
+                x0,
+                y0,
+                x_end,
+                y_end,
+                2,
+                &offsets,
+                0,
+                eo_class,
+                bd,
+            );
+
+            let band_y0 = y0;
+            let mut band = src[band_y0 * w..y_end * w].to_vec();
+            apply_sao_plane_banded_scalar(
+                &mut band, &src, w, h, band_y0, x0, y0, x_end, y_end, 2, &offsets, 0, eo_class, bd,
+            );
+
+            assert_eq!(&band[..], &serial[band_y0 * w..y_end * w]);
+        }
+    }
+
+    #[test]
+    fn gated_eo_applies_when_all_available() {
+        let src = [10u16, 5, 10, 5];
+        let mut dst = src;
+        let offsets = [7i32, 0, 0, 0];
+        let ok = |_cx: usize, _cy: usize, _nx: usize, _ny: usize| true;
+        apply_sao_edge_offset_gated(&mut dst, &src, 4, 1, 0, 0, 4, 1, &offsets, 0, 8, &ok);
+        // x=1 is a local minimum (5 between 10 and 10) → edge_idx 0 → +7 = 12.
+        assert_eq!(dst[1], 12);
+    }
 }

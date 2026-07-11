@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{cabac, deblock, intra, reconstruct, sao, transform};
+use crate::{cabac, deblock, intra, mc, reconstruct, sao, transform};
 
 #[derive(Clone)]
 pub(crate) struct ExecContext {
@@ -50,6 +50,7 @@ pub(crate) struct ExecContext {
 
     pub(crate) reconstruct: reconstruct::ReconstructFn,
     pub(crate) reconstruct16: reconstruct::ReconstructFn16,
+    pub(crate) narrow_i32_to_i16: reconstruct::NarrowI32ToI16Fn,
 
     pub(crate) sao_plane: sao::SaoPlaneFn,
     pub(crate) sao_plane_banded: sao::SaoPlaneBandedFn,
@@ -64,6 +65,13 @@ pub(crate) struct ExecContext {
     pub(crate) luma_deblock_horizontal_pair: Option<deblock::LumaDeblockPairFn>,
     pub(crate) chroma_deblock_vertical_pair: Option<deblock::ChromaDeblockPairFn>,
     pub(crate) chroma_deblock_horizontal_pair: Option<deblock::ChromaDeblockPairFn>,
+
+    pub(crate) motion_luma_interp: mc::LumaInterpFn,
+    pub(crate) motion_chroma_interp: mc::ChromaInterpFn,
+    pub(crate) motion_uni_mc: mc::UniMcFn,
+    pub(crate) motion_bi_mc: mc::BiMcFn,
+    pub(crate) motion_uni_mc_weighted: mc::UniMcWeightedFn,
+    pub(crate) motion_bi_mc_weighted: mc::BiMcWeightedFn,
 }
 
 impl Default for ExecContext {
@@ -96,6 +104,7 @@ impl ExecContext {
 
             reconstruct: reconstruct::resolve_reconstruct_add_clip(),
             reconstruct16: reconstruct::resolve_reconstruct_add_clip16(),
+            narrow_i32_to_i16: reconstruct::resolve_narrow_i32_to_i16(),
 
             sao_plane: sao::resolve_apply_sao_plane(),
             sao_plane_banded: sao::resolve_apply_sao_plane_banded(),
@@ -110,6 +119,13 @@ impl ExecContext {
             luma_deblock_horizontal_pair: deblock::resolve_luma_horizontal_pair(),
             chroma_deblock_vertical_pair: deblock::resolve_chroma_vertical_pair(),
             chroma_deblock_horizontal_pair: deblock::resolve_chroma_horizontal_pair(),
+
+            motion_luma_interp: mc::resolve_luma_interp(),
+            motion_chroma_interp: mc::resolve_chroma_interp(),
+            motion_uni_mc: mc::resolve_uni_mc(),
+            motion_bi_mc: mc::resolve_bi_mc(),
+            motion_uni_mc_weighted: mc::resolve_uni_mc_weighted(),
+            motion_bi_mc_weighted: mc::resolve_bi_mc_weighted(),
         }
     }
 }

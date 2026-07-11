@@ -30,8 +30,8 @@
 use core::arch::aarch64::*;
 
 use crate::deblock::{
-    chroma_horizontal_plane_scalar, chroma_vertical_plane_scalar, luma_horizontal_plane_scalar,
-    luma_vertical_plane_scalar,
+    LumaDecision, chroma_horizontal_plane_scalar, chroma_vertical_plane_scalar,
+    luma_horizontal_plane_scalar, luma_vertical_plane_scalar,
 };
 
 #[inline]
@@ -368,7 +368,17 @@ fn clamp_i32x4(v: int32x4_t, lo: int32x4_t, hi: int32x4_t) -> int32x4_t {
     vminq_s32(vmaxq_s32(v, lo), hi)
 }
 
-#[allow(clippy::many_single_char_names)]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn decompose(d: LumaDecision) -> (bool, bool, bool) {
+    match d {
+        LumaDecision::Skip => (false, false, false),
+        LumaDecision::Strong => (true, false, false),
+        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
+    }
+}
+
 #[inline]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
@@ -381,7 +391,9 @@ fn luma_filter4_neon(
     q1: int32x4_t,
     q2: int32x4_t,
     q3: int32x4_t,
-    beta: i32,
+    strong_all: bool,
+    do_p1: bool,
+    do_q1: bool,
     tc: i32,
     maxv: i32,
 ) -> (
@@ -396,17 +408,8 @@ fn luma_filter4_neon(
     let maxv_v = vdupq_n_s32(maxv);
     let three = vdupq_n_s32(3);
 
-    let dp = vabsq_s32(vaddq_s32(vsubq_s32(p2, vshlq_n_s32::<1>(p1)), p0));
-    let dq = vabsq_s32(vaddq_s32(vsubq_s32(q2, vshlq_n_s32::<1>(q1)), q0));
-    let d = vaddq_s32(dp, dq);
-
-    let strong_d = vcltq_s32(d, vdupq_n_s32(beta >> 2));
-    let strong_pq = vcltq_s32(vabsq_s32(vsubq_s32(p0, q0)), vdupq_n_s32((5 * tc + 1) >> 1));
-    let strong_far = vcltq_s32(
-        vaddq_s32(vabsq_s32(vsubq_s32(p3, p0)), vabsq_s32(vsubq_s32(q0, q3))),
-        vdupq_n_s32((beta * 3) >> 3),
-    );
-    let strong = vandq_u32(vandq_u32(strong_d, strong_pq), strong_far);
+    // Uniform per-segment strong decision (all lanes equal).
+    let strong = vdupq_n_u32(if strong_all { u32::MAX } else { 0 });
 
     let p0s = clamp_i32x4(
         vshrq_n_s32::<3>(vaddq_s32(
@@ -466,54 +469,54 @@ fn luma_filter4_neon(
         maxv_v,
     );
 
-    let delta = vshrq_n_s32::<4>(vaddq_s32(
+    let delta0 = vshrq_n_s32::<4>(vaddq_s32(
         vsubq_s32(
             vmulq_n_s32(vsubq_s32(q0, p0), 9),
             vmulq_n_s32(vsubq_s32(q1, p1), 3),
         ),
         vdupq_n_s32(8),
     ));
-    let delta = clamp_i32x4(delta, vdupq_n_s32(-tc), vdupq_n_s32(tc));
-    let p0w = clamp_i32x4(vaddq_s32(p0, delta), zero, maxv_v);
-    let q0w = clamp_i32x4(vsubq_s32(q0, delta), zero, maxv_v);
+    let weak_active = vcltq_s32(vabsq_s32(delta0), vdupq_n_s32(tc * 10));
+    let delta = clamp_i32x4(delta0, vdupq_n_s32(-tc), vdupq_n_s32(tc));
+    let p0w = blend_i32x4(
+        p0,
+        clamp_i32x4(vaddq_s32(p0, delta), zero, maxv_v),
+        weak_active,
+    );
+    let q0w = blend_i32x4(
+        q0,
+        clamp_i32x4(vsubq_s32(q0, delta), zero, maxv_v),
+        weak_active,
+    );
 
     let half_tc = tc >> 1;
-    let thres_v = vdupq_n_s32((tc * 10 + 1) >> 1);
-    let delta_half = vshrq_n_s32::<1>(delta);
-
-    let p1_cond = vcltq_s32(
-        vabsq_s32(vsubq_s32(vshlq_n_s32::<1>(vsubq_s32(p0, p1)), delta)),
-        thres_v,
-    );
     let dp1 = clamp_i32x4(
-        vaddq_s32(
+        vshrq_n_s32::<1>(vaddq_s32(
             vsubq_s32(
                 vshrq_n_s32::<1>(vaddq_s32(vaddq_s32(p2, p0), vdupq_n_s32(1))),
                 p1,
             ),
-            delta_half,
-        ),
+            delta,
+        )),
         vdupq_n_s32(-half_tc),
         vdupq_n_s32(half_tc),
     );
-    let p1w = blend_i32x4(p1, clamp_i32x4(vaddq_s32(p1, dp1), zero, maxv_v), p1_cond);
+    let p1_mask = if do_p1 { weak_active } else { vdupq_n_u32(0) };
+    let p1w = blend_i32x4(p1, clamp_i32x4(vaddq_s32(p1, dp1), zero, maxv_v), p1_mask);
 
-    let q1_cond = vcltq_s32(
-        vabsq_s32(vaddq_s32(vshlq_n_s32::<1>(vsubq_s32(q0, q1)), delta)),
-        thres_v,
-    );
     let dq1 = clamp_i32x4(
-        vsubq_s32(
+        vshrq_n_s32::<1>(vsubq_s32(
             vsubq_s32(
                 vshrq_n_s32::<1>(vaddq_s32(vaddq_s32(q2, q0), vdupq_n_s32(1))),
                 q1,
             ),
-            delta_half,
-        ),
+            delta,
+        )),
         vdupq_n_s32(-half_tc),
         vdupq_n_s32(half_tc),
     );
-    let q1w = blend_i32x4(q1, clamp_i32x4(vaddq_s32(q1, dq1), zero, maxv_v), q1_cond);
+    let q1_mask = if do_q1 { weak_active } else { vdupq_n_u32(0) };
+    let q1w = blend_i32x4(q1, clamp_i32x4(vaddq_s32(q1, dq1), zero, maxv_v), q1_mask);
 
     (
         blend_i32x4(p0w, p0s, strong),
@@ -534,10 +537,11 @@ fn luma_horizontal_plane_neon_impl(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
+    let (strong_all, do_p1, do_q1) = decompose(decision);
     let p3_base = (edge - 4 - row0) * w + scan;
     let p2_base = (edge - 3 - row0) * w + scan;
     let p1_base = (edge - 2 - row0) * w + scan;
@@ -556,8 +560,9 @@ fn luma_horizontal_plane_neon_impl(
     let q2 = vreinterpretq_s32_u32(vmovl_u16(load_u16x4(&pix[q2_base..])));
     let q3 = vreinterpretq_s32_u32(vmovl_u16(load_u16x4(&pix[q3_base..])));
 
-    let (p0n, p1n, p2n, q0n, q1n, q2n) =
-        luma_filter4_neon(p3, p2, p1, p0, q0, q1, q2, q3, beta, tc, maxv);
+    let (p0n, p1n, p2n, q0n, q1n, q2n) = luma_filter4_neon(
+        p3, p2, p1, p0, q0, q1, q2, q3, strong_all, do_p1, do_q1, tc, maxv,
+    );
     store_u16x4(&mut pix[p0_base..], narrow_u16x4(p0n));
     store_u16x4(&mut pix[p1_base..], narrow_u16x4(p1n));
     store_u16x4(&mut pix[p2_base..], narrow_u16x4(p2n));
@@ -575,16 +580,18 @@ fn luma_vertical_plane_neon_impl(
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
+    let (strong_all, do_p1, do_q1) = decompose(decision);
     let base = (s - row0) * w;
     let edge_start = edge - 4;
     let (p3, p2, p1, p0, q0, q1, q2, q3) = load_luma_vertical8x4(pix, w, base, edge_start);
 
-    let (p0n, p1n, p2n, q0n, q1n, q2n) =
-        luma_filter4_neon(p3, p2, p1, p0, q0, q1, q2, q3, beta, tc, maxv);
+    let (p0n, p1n, p2n, q0n, q1n, q2n) = luma_filter4_neon(
+        p3, p2, p1, p0, q0, q1, q2, q3, strong_all, do_p1, do_q1, tc, maxv,
+    );
     store_luma_vertical8x4(
         pix, w, base, edge_start, p3, p2n, p1n, p0n, q0n, q1n, q2n, q3,
     );
@@ -597,7 +604,7 @@ pub(crate) fn luma_horizontal_plane_neon(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
@@ -606,10 +613,10 @@ pub(crate) fn luma_horizontal_plane_neon(
     }
     let q3_row = edge + 3 - row0;
     if pix.len() < (q3_row + 1).saturating_mul(w) {
-        luma_horizontal_plane_scalar(pix, w, edge, scan, row0, beta, tc, maxv);
+        luma_horizontal_plane_scalar(pix, w, edge, scan, row0, decision, tc, maxv);
         return;
     }
-    unsafe { luma_horizontal_plane_neon_impl(pix, w, edge, scan, row0, beta, tc, maxv) };
+    unsafe { luma_horizontal_plane_neon_impl(pix, w, edge, scan, row0, decision, tc, maxv) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -619,7 +626,7 @@ pub(crate) fn luma_vertical_plane_neon(
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
@@ -628,8 +635,8 @@ pub(crate) fn luma_vertical_plane_neon(
     }
     let local_row = s - row0;
     if pix.len() < (local_row + 4).saturating_mul(w) {
-        luma_vertical_plane_scalar(pix, w, edge, s, row0, beta, tc, maxv);
+        luma_vertical_plane_scalar(pix, w, edge, s, row0, decision, tc, maxv);
         return;
     }
-    unsafe { luma_vertical_plane_neon_impl(pix, w, edge, s, row0, beta, tc, maxv) };
+    unsafe { luma_vertical_plane_neon_impl(pix, w, edge, s, row0, decision, tc, maxv) };
 }

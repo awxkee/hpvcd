@@ -41,6 +41,9 @@ pub enum DecodeError {
         h: u32,
     },
     ParamSet(String),
+    /// A syntactically valid stream that uses a coding tool this decoder does
+    /// not implement (e.g. tiles combined with WPP).
+    Unsupported(String),
     /// A configured parse limit was exceeded (e.g. box, item, or image size).
     /// The field names the limit and carries the offending vs. allowed values.
     LimitExceeded {
@@ -67,6 +70,7 @@ impl std::fmt::Display for DecodeError {
                 write!(f, "Image dimensions {w}×{h} are zero or exceed limits")
             }
             Self::ParamSet(msg) => write!(f, "SPS/PPS parse error: {msg}"),
+            Self::Unsupported(msg) => write!(f, "Unsupported HEVC feature: {msg}"),
             Self::LimitExceeded { what, value, limit } => write!(
                 f,
                 "parse limit exceeded: {what} = {value} exceeds configured limit {limit}"

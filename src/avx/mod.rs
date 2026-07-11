@@ -27,42 +27,37 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#[cfg(target_arch = "x86_64")]
 mod deblock;
-#[cfg(target_arch = "x86_64")]
 mod dequant;
-#[cfg(target_arch = "x86_64")]
 mod intra;
-#[cfg(target_arch = "x86_64")]
+mod mc;
 mod reconstruct;
-#[cfg(target_arch = "x86_64")]
 mod sao;
-#[cfg(target_arch = "x86_64")]
 mod transform;
 
-#[cfg(target_arch = "x86_64")]
 pub(crate) use deblock::{
     chroma_horizontal_plane_avx2, chroma_horizontal_plane_pair_avx2, chroma_vertical_plane_avx2,
     chroma_vertical_plane_pair_avx2, luma_horizontal_plane_avx2, luma_horizontal_plane_pair_avx2,
     luma_vertical_plane_avx2, luma_vertical_plane_pair_avx2,
 };
-#[cfg(target_arch = "x86_64")]
 pub(crate) use dequant::{
     dequantize_into_avx2, dequantize_into_avx2_16, dequantize_scaled_into_avx2,
     dequantize_scaled_into_avx2_16, dequantize_transform_skip_into_avx2,
     dequantize_transform_skip_into_avx2_16, dequantize_transform_skip_scaled_into_avx2,
     dequantize_transform_skip_scaled_into_avx2_16,
 };
-#[cfg(target_arch = "x86_64")]
 pub(crate) use intra::predict_into_avx2;
-#[cfg(target_arch = "x86_64")]
-pub(crate) use reconstruct::{add_residual_into_avx2, add_residual_into_avx2_16};
-#[cfg(target_arch = "x86_64")]
+pub(crate) use mc::{
+    bi_mc_avx2, bi_mc_weighted_avx2, chroma_interp_avx2, luma_interp_avx2, uni_mc_avx2,
+    uni_mc_weighted_avx2,
+};
+pub(crate) use reconstruct::{
+    add_residual_into_avx2, add_residual_into_avx2_16, narrow_i32_to_i16_avx2,
+};
 pub(crate) use sao::{
     apply_sao_band_offset_banded_inplace_avx2, apply_sao_band_offset_inplace_avx2,
     apply_sao_plane_avx2, apply_sao_plane_banded_avx2,
 };
-#[cfg(target_arch = "x86_64")]
 pub(crate) use transform::{
     inv_transform_dst_into_avx2, inv_transform_dst_into_avx2_16, inv_transform_into_avx2,
     inv_transform_into_avx2_16,

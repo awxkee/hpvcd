@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::deblock::LumaDecision;
 use core::arch::x86_64::*;
 
 #[inline]
@@ -163,6 +164,17 @@ fn chroma_filter8_avx2(
 #[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx2")]
+fn decompose(d: LumaDecision) -> (bool, bool, bool) {
+    match d {
+        LumaDecision::Skip => (false, false, false),
+        LumaDecision::Strong => (true, false, false),
+        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
 fn luma_filter8_avx2(
     p3: __m256i,
     p2: __m256i,
@@ -172,7 +184,12 @@ fn luma_filter8_avx2(
     q1: __m256i,
     q2: __m256i,
     q3: __m256i,
-    beta: __m256i,
+    strong_lo: bool,
+    strong_hi: bool,
+    do_p1_lo: bool,
+    do_p1_hi: bool,
+    do_q1_lo: bool,
+    do_q1_hi: bool,
     tc: __m256i,
     maxv: __m256i,
 ) -> (__m256i, __m256i, __m256i, __m256i, __m256i, __m256i) {
@@ -183,32 +200,22 @@ fn luma_filter8_avx2(
     let four = _mm256_set1_epi32(4);
     let eight = _mm256_set1_epi32(8);
 
-    let dp = abs_i32x8(_mm256_add_epi32(
-        _mm256_sub_epi32(p2, _mm256_slli_epi32::<1>(p1)),
-        p0,
-    ));
-    let dq = abs_i32x8(_mm256_add_epi32(
-        _mm256_sub_epi32(q2, _mm256_slli_epi32::<1>(q1)),
-        q0,
-    ));
-    let d = _mm256_add_epi32(dp, dq);
-
-    let strong_d = cmplt_i32x8(d, _mm256_srai_epi32::<2>(beta));
-    let strong_pq = cmplt_i32x8(
-        abs_i32x8(_mm256_sub_epi32(p0, q0)),
-        _mm256_srai_epi32::<1>(_mm256_add_epi32(
-            _mm256_mullo_epi32(_mm256_set1_epi32(5), tc),
-            one,
-        )),
-    );
-    let strong_far = cmplt_i32x8(
-        _mm256_add_epi32(
-            abs_i32x8(_mm256_sub_epi32(p3, p0)),
-            abs_i32x8(_mm256_sub_epi32(q0, q3)),
-        ),
-        _mm256_srai_epi32::<3>(_mm256_mullo_epi32(beta, three)),
-    );
-    let strong = _mm256_and_si256(_mm256_and_si256(strong_d, strong_pq), strong_far);
+    // Build per-half uniform masks (low 4 lanes = segment 0, high 4 = segment 1).
+    let half = |lo: bool, hi: bool| {
+        _mm256_set_epi32(
+            if hi { -1 } else { 0 },
+            if hi { -1 } else { 0 },
+            if hi { -1 } else { 0 },
+            if hi { -1 } else { 0 },
+            if lo { -1 } else { 0 },
+            if lo { -1 } else { 0 },
+            if lo { -1 } else { 0 },
+            if lo { -1 } else { 0 },
+        )
+    };
+    let strong = half(strong_lo, strong_hi);
+    let do_p1_mask = half(do_p1_lo, do_p1_hi);
+    let do_q1_mask = half(do_q1_lo, do_q1_hi);
 
     let p0s = clamp_i32x8(
         _mm256_srai_epi32::<3>(_mm256_add_epi32(
@@ -281,64 +288,60 @@ fn luma_filter8_avx2(
         ),
         eight,
     ));
+    // Per-line weak gate |delta0| < 10*tc.
+    let weak_active = cmplt_i32x8(
+        abs_i32x8(delta),
+        _mm256_mullo_epi32(_mm256_set1_epi32(10), tc),
+    );
     let delta = clamp_i32x8(delta, _mm256_sub_epi32(zero, tc), tc);
-    let p0w = clamp_i32x8(_mm256_add_epi32(p0, delta), zero, maxv);
-    let q0w = clamp_i32x8(_mm256_sub_epi32(q0, delta), zero, maxv);
+    let p0w = blend_i32x8(
+        p0,
+        clamp_i32x8(_mm256_add_epi32(p0, delta), zero, maxv),
+        weak_active,
+    );
+    let q0w = blend_i32x8(
+        q0,
+        clamp_i32x8(_mm256_sub_epi32(q0, delta), zero, maxv),
+        weak_active,
+    );
 
     let half_tc = _mm256_srai_epi32::<1>(tc);
     let neg_half_tc = _mm256_sub_epi32(zero, half_tc);
-    let thres = _mm256_srai_epi32::<1>(_mm256_add_epi32(
-        _mm256_mullo_epi32(_mm256_set1_epi32(10), tc),
-        one,
-    ));
-    let delta_half = _mm256_srai_epi32::<1>(delta);
 
-    let p1_cond = cmplt_i32x8(
-        abs_i32x8(_mm256_sub_epi32(
-            _mm256_slli_epi32::<1>(_mm256_sub_epi32(p0, p1)),
-            delta,
-        )),
-        thres,
-    );
     let dp1 = clamp_i32x8(
-        _mm256_add_epi32(
+        _mm256_srai_epi32::<1>(_mm256_add_epi32(
             _mm256_sub_epi32(
                 _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(p2, p0), one)),
                 p1,
             ),
-            delta_half,
-        ),
+            delta,
+        )),
         neg_half_tc,
         half_tc,
     );
+    let p1_apply = _mm256_and_si256(weak_active, do_p1_mask);
     let p1w = blend_i32x8(
         p1,
         clamp_i32x8(_mm256_add_epi32(p1, dp1), zero, maxv),
-        p1_cond,
+        p1_apply,
     );
 
-    let q1_cond = cmplt_i32x8(
-        abs_i32x8(_mm256_add_epi32(
-            _mm256_slli_epi32::<1>(_mm256_sub_epi32(q0, q1)),
-            delta,
-        )),
-        thres,
-    );
     let dq1 = clamp_i32x8(
-        _mm256_sub_epi32(
+        _mm256_srai_epi32::<1>(_mm256_sub_epi32(
             _mm256_sub_epi32(
                 _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(q2, q0), one)),
                 q1,
             ),
-            delta_half,
-        ),
+            delta,
+        )),
         neg_half_tc,
         half_tc,
     );
+    let q1_apply = _mm256_and_si256(weak_active, do_q1_mask);
     let q1w = blend_i32x8(
         q1,
         clamp_i32x8(_mm256_add_epi32(q1, dq1), zero, maxv),
-        q1_cond,
+        q1_apply,
     );
 
     (
@@ -672,10 +675,11 @@ fn luma_horizontal_plane_avx2_impl(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
+    let (strong, do_p1, do_q1) = decompose(decision);
     let p3_base = (edge - 4 - row0) * w + scan;
     let p2_base = (edge - 3 - row0) * w + scan;
     let p1_base = (edge - 2 - row0) * w + scan;
@@ -703,7 +707,12 @@ fn luma_horizontal_plane_avx2_impl(
         q1,
         q2,
         q3,
-        _mm256_set1_epi32(beta),
+        strong,
+        strong,
+        do_p1,
+        do_p1,
+        do_q1,
+        do_q1,
         _mm256_set1_epi32(tc),
         _mm256_set1_epi32(maxv),
     );
@@ -724,12 +733,14 @@ fn luma_horizontal_plane_pair_avx2_impl(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta0: i32,
+    decision0: LumaDecision,
     tc0: i32,
-    beta1: i32,
+    decision1: LumaDecision,
     tc1: i32,
     maxv: i32,
 ) {
+    let (strong0, do_p1_0, do_q1_0) = decompose(decision0);
+    let (strong1, do_p1_1, do_q1_1) = decompose(decision1);
     let p3_base = (edge - 4 - row0) * w + scan;
     let p2_base = (edge - 3 - row0) * w + scan;
     let p1_base = (edge - 2 - row0) * w + scan;
@@ -757,7 +768,12 @@ fn luma_horizontal_plane_pair_avx2_impl(
         q1,
         q2,
         q3,
-        bias_pair4(beta0, beta1),
+        strong0,
+        strong1,
+        do_p1_0,
+        do_p1_1,
+        do_q1_0,
+        do_q1_1,
         bias_pair4(tc0, tc1),
         _mm256_set1_epi32(maxv),
     );
@@ -778,10 +794,11 @@ fn luma_vertical_plane_avx2_impl(
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
+    let (strong, do_p1, do_q1) = decompose(decision);
     let base = (s - row0) * w;
     let edge_start = edge - 4;
     let (p3, p2, p1, p0, q0, q1, q2, q3) = load_luma_vertical8x4(pix, w, base, edge_start);
@@ -794,7 +811,12 @@ fn luma_vertical_plane_avx2_impl(
         zero_hi_i32x4(q1),
         zero_hi_i32x4(q2),
         zero_hi_i32x4(q3),
-        _mm256_set1_epi32(beta),
+        strong,
+        strong,
+        do_p1,
+        do_p1,
+        do_q1,
+        do_q1,
         _mm256_set1_epi32(tc),
         _mm256_set1_epi32(maxv),
     );
@@ -823,12 +845,14 @@ fn luma_vertical_plane_pair_avx2_impl(
     edge: usize,
     s: usize,
     row0: usize,
-    beta0: i32,
+    decision0: LumaDecision,
     tc0: i32,
-    beta1: i32,
+    decision1: LumaDecision,
     tc1: i32,
     maxv: i32,
 ) {
+    let (strong0, do_p1_0, do_q1_0) = decompose(decision0);
+    let (strong1, do_p1_1, do_q1_1) = decompose(decision1);
     let base0 = (s - row0) * w;
     let base1 = base0 + 4 * w;
     let edge_start = edge - 4;
@@ -844,7 +868,12 @@ fn luma_vertical_plane_pair_avx2_impl(
         combine_i32x4(q1a, q1b),
         combine_i32x4(q2a, q2b),
         combine_i32x4(q3a, q3b),
-        bias_pair4(beta0, beta1),
+        strong0,
+        strong1,
+        do_p1_0,
+        do_p1_1,
+        do_q1_0,
+        do_q1_1,
         bias_pair4(tc0, tc1),
         _mm256_set1_epi32(maxv),
     );
@@ -967,7 +996,7 @@ pub(crate) fn luma_horizontal_plane_avx2(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
@@ -978,7 +1007,7 @@ pub(crate) fn luma_horizontal_plane_avx2(
     if pix.len() < (q3_row + 1).saturating_mul(w) {
         return;
     }
-    unsafe { luma_horizontal_plane_avx2_impl(pix, w, edge, scan, row0, beta, tc, maxv) };
+    unsafe { luma_horizontal_plane_avx2_impl(pix, w, edge, scan, row0, decision, tc, maxv) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -988,9 +1017,9 @@ pub(crate) fn luma_horizontal_plane_pair_avx2(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta0: i32,
+    decision0: LumaDecision,
     tc0: i32,
-    beta1: i32,
+    decision1: LumaDecision,
     tc1: i32,
     maxv: i32,
 ) {
@@ -1002,7 +1031,9 @@ pub(crate) fn luma_horizontal_plane_pair_avx2(
         return;
     }
     unsafe {
-        luma_horizontal_plane_pair_avx2_impl(pix, w, edge, scan, row0, beta0, tc0, beta1, tc1, maxv)
+        luma_horizontal_plane_pair_avx2_impl(
+            pix, w, edge, scan, row0, decision0, tc0, decision1, tc1, maxv,
+        )
     };
 }
 
@@ -1013,7 +1044,7 @@ pub(crate) fn luma_vertical_plane_avx2(
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
@@ -1024,7 +1055,7 @@ pub(crate) fn luma_vertical_plane_avx2(
     if pix.len() < (local_row + 4).saturating_mul(w) {
         return;
     }
-    unsafe { luma_vertical_plane_avx2_impl(pix, w, edge, s, row0, beta, tc, maxv) };
+    unsafe { luma_vertical_plane_avx2_impl(pix, w, edge, s, row0, decision, tc, maxv) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1034,9 +1065,9 @@ pub(crate) fn luma_vertical_plane_pair_avx2(
     edge: usize,
     s: usize,
     row0: usize,
-    beta0: i32,
+    decision0: LumaDecision,
     tc0: i32,
-    beta1: i32,
+    decision1: LumaDecision,
     tc1: i32,
     maxv: i32,
 ) {
@@ -1048,6 +1079,8 @@ pub(crate) fn luma_vertical_plane_pair_avx2(
         return;
     }
     unsafe {
-        luma_vertical_plane_pair_avx2_impl(pix, w, edge, s, row0, beta0, tc0, beta1, tc1, maxv)
+        luma_vertical_plane_pair_avx2_impl(
+            pix, w, edge, s, row0, decision0, tc0, decision1, tc1, maxv,
+        )
     };
 }

@@ -154,6 +154,7 @@ pub(crate) fn filter_refs_into(
     n: usize,
     mode: u8,
     is_luma: bool,
+    intra_smoothing_enabled: bool,
     strong_intra_smoothing: bool,
     bit_depth: u8,
     fa_out: &mut [u16],
@@ -163,7 +164,10 @@ pub(crate) fn filter_refs_into(
     fa_out[..len].copy_from_slice(&above[..len]);
     fl_out[..len].copy_from_slice(&left[..len]);
 
-    if !is_luma || n == 4 || mode == DC {
+    // RExt's intra_smoothing_disabled_flag disables the complete reference
+    // sample filtering process, including both the normal [1 2 1] filter and
+    // the optional strong 32x32 bilinear filter.
+    if !intra_smoothing_enabled || !is_luma || n == 4 || mode == DC {
         return;
     }
 
@@ -186,9 +190,12 @@ pub(crate) fn filter_refs_into(
         let cl = left[n] as i32;
         let ct = above[n] as i32;
         if (bl + tl - 2 * cl).abs() < thr && (tr + tl - 2 * ct).abs() < thr {
-            for i in 1..2 * n {
-                fa_out[i] = ((((2 * n - i) as i32) * tl + (i as i32) * tr + n as i32) >> 6) as u16;
-                fl_out[i] = ((((2 * n - i) as i32) * tl + (i as i32) * bl + n as i32) >> 6) as u16;
+            for ((i, fa), fl) in (1..2 * n)
+                .zip(fa_out[1..2 * n].iter_mut())
+                .zip(fl_out[1..2 * n].iter_mut())
+            {
+                *fa = ((((2 * n - i) as i32) * tl + (i as i32) * tr + n as i32) >> 6) as u16;
+                *fl = ((((2 * n - i) as i32) * tl + (i as i32) * bl + n as i32) >> 6) as u16;
             }
             fa_out[0] = above[0];
             fl_out[0] = left[0];
@@ -201,11 +208,12 @@ pub(crate) fn filter_refs_into(
     let corner = above[0] as i32;
     fa_out[0] = ((left[1] as i32 + 2 * corner + above[1] as i32 + 2) >> 2) as u16;
     fl_out[0] = fa_out[0];
-    for i in 1..2 * n {
-        fa_out[i] =
-            ((above[i - 1] as i32 + 2 * above[i] as i32 + above[i + 1] as i32 + 2) >> 2) as u16;
-        fl_out[i] =
-            ((left[i - 1] as i32 + 2 * left[i] as i32 + left[i + 1] as i32 + 2) >> 2) as u16;
+    for ((i, fa), fl) in (1..2 * n)
+        .zip(fa_out[1..2 * n].iter_mut())
+        .zip(fl_out[1..2 * n].iter_mut())
+    {
+        *fa = ((above[i - 1] as i32 + 2 * above[i] as i32 + above[i + 1] as i32 + 2) >> 2) as u16;
+        *fl = ((left[i - 1] as i32 + 2 * left[i] as i32 + left[i + 1] as i32 + 2) >> 2) as u16;
     }
     fa_out[2 * n] = above[2 * n];
     fl_out[2 * n] = left[2 * n];
@@ -232,7 +240,7 @@ pub(crate) fn resolve_predict() -> PredictFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::predict_into_avx2;
@@ -360,5 +368,82 @@ pub(crate) fn predict_into_scalar(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PLANAR, filter_refs_into};
+
+    #[test]
+    fn disabled_reference_smoothing_preserves_samples() {
+        let n = 8;
+        let above: Vec<u16> = (0..=2 * n).map(|i| 100 + (i * i) as u16).collect();
+        let left: Vec<u16> = (0..=2 * n).map(|i| 100 + (3 * i * i) as u16).collect();
+        let mut filtered_above = vec![0; 2 * n + 1];
+        let mut filtered_left = vec![0; 2 * n + 1];
+
+        filter_refs_into(
+            &above,
+            &left,
+            n,
+            PLANAR,
+            true,
+            false,
+            true,
+            10,
+            &mut filtered_above,
+            &mut filtered_left,
+        );
+
+        assert_eq!(filtered_above, above);
+        assert_eq!(filtered_left, left);
+    }
+
+    #[test]
+    fn disabled_reference_smoothing_skips_strong_filter() {
+        let n = 32;
+        let mut above = vec![777; 2 * n + 1];
+        let mut left = vec![555; 2 * n + 1];
+        above[0] = 100;
+        above[n] = 200;
+        above[2 * n] = 300;
+        left[0] = 100;
+        left[n] = 250;
+        left[2 * n] = 400;
+
+        let mut disabled_above = vec![0; 2 * n + 1];
+        let mut disabled_left = vec![0; 2 * n + 1];
+        filter_refs_into(
+            &above,
+            &left,
+            n,
+            PLANAR,
+            true,
+            false,
+            true,
+            10,
+            &mut disabled_above,
+            &mut disabled_left,
+        );
+        assert_eq!(disabled_above, above);
+        assert_eq!(disabled_left, left);
+
+        let mut enabled_above = vec![0; 2 * n + 1];
+        let mut enabled_left = vec![0; 2 * n + 1];
+        filter_refs_into(
+            &above,
+            &left,
+            n,
+            PLANAR,
+            true,
+            true,
+            true,
+            10,
+            &mut enabled_above,
+            &mut enabled_left,
+        );
+        assert_ne!(enabled_above, above);
+        assert_ne!(enabled_left, left);
     }
 }

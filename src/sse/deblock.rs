@@ -33,8 +33,8 @@ use core::arch::x86::*;
 use core::arch::x86_64::*;
 
 use crate::deblock::{
-    chroma_horizontal_plane_scalar, chroma_vertical_plane_scalar, luma_horizontal_plane_scalar,
-    luma_vertical_plane_scalar,
+    LumaDecision, chroma_horizontal_plane_scalar, chroma_vertical_plane_scalar,
+    luma_horizontal_plane_scalar, luma_vertical_plane_scalar,
 };
 
 #[inline]
@@ -374,6 +374,17 @@ fn blend_i32x4(a: __m128i, b: __m128i, mask: __m128i) -> __m128i {
 #[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn decompose(d: LumaDecision) -> (bool, bool, bool) {
+    match d {
+        LumaDecision::Skip => (false, false, false),
+        LumaDecision::Strong => (true, false, false),
+        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
 fn luma_filter4_sse41(
     p3: __m128i,
     p2: __m128i,
@@ -383,7 +394,9 @@ fn luma_filter4_sse41(
     q1: __m128i,
     q2: __m128i,
     q3: __m128i,
-    beta: i32,
+    strong_all: bool,
+    do_p1: bool,
+    do_q1: bool,
     tc: i32,
     maxv: i32,
 ) -> (__m128i, __m128i, __m128i, __m128i, __m128i, __m128i) {
@@ -397,29 +410,8 @@ fn luma_filter4_sse41(
     let four = _mm_set1_epi32(4);
     let eight = _mm_set1_epi32(8);
 
-    let dp = abs_i32x4(_mm_add_epi32(
-        _mm_sub_epi32(p2, _mm_slli_epi32::<1>(p1)),
-        p0,
-    ));
-    let dq = abs_i32x4(_mm_add_epi32(
-        _mm_sub_epi32(q2, _mm_slli_epi32::<1>(q1)),
-        q0,
-    ));
-    let d = _mm_add_epi32(dp, dq);
-
-    let strong_d = cmplt_i32x4(d, _mm_set1_epi32(beta >> 2));
-    let strong_pq = cmplt_i32x4(
-        abs_i32x4(_mm_sub_epi32(p0, q0)),
-        _mm_set1_epi32((5 * tc + 1) >> 1),
-    );
-    let strong_far = cmplt_i32x4(
-        _mm_add_epi32(
-            abs_i32x4(_mm_sub_epi32(p3, p0)),
-            abs_i32x4(_mm_sub_epi32(q0, q3)),
-        ),
-        _mm_set1_epi32((beta * 3) >> 3),
-    );
-    let strong = _mm_and_si128(_mm_and_si128(strong_d, strong_pq), strong_far);
+    // Uniform per-segment strong decision (splat all lanes).
+    let strong = if strong_all { _mm_set1_epi32(-1) } else { zero };
 
     let p0s = clamp_i32x4(
         _mm_srai_epi32::<3>(_mm_add_epi32(
@@ -485,69 +477,67 @@ fn luma_filter4_sse41(
         maxv_v,
     );
 
-    let delta = _mm_srai_epi32::<4>(_mm_add_epi32(
+    // Weak filter (§8.7.2.5.7). delta0 unclamped; a line is filtered only when
+    // |delta0| < 10*tc (per-line mask). p1/q1 updates gated by uniform do_p1/do_q1.
+    let delta0 = _mm_srai_epi32::<4>(_mm_add_epi32(
         _mm_sub_epi32(
             _mm_mullo_epi32(_mm_set1_epi32(9), _mm_sub_epi32(q0, p0)),
             _mm_mullo_epi32(three, _mm_sub_epi32(q1, p1)),
         ),
         eight,
     ));
-    let delta = clamp_i32x4(delta, neg_tc_v, tc_v);
-    let p0w = clamp_i32x4(_mm_add_epi32(p0, delta), zero, maxv_v);
-    let q0w = clamp_i32x4(_mm_sub_epi32(q0, delta), zero, maxv_v);
+    let weak_active = cmplt_i32x4(abs_i32x4(delta0), _mm_set1_epi32(tc * 10));
+    let delta = clamp_i32x4(delta0, neg_tc_v, tc_v);
+    let p0w = blend_i32x4(
+        p0,
+        clamp_i32x4(_mm_add_epi32(p0, delta), zero, maxv_v),
+        weak_active,
+    );
+    let q0w = blend_i32x4(
+        q0,
+        clamp_i32x4(_mm_sub_epi32(q0, delta), zero, maxv_v),
+        weak_active,
+    );
 
     let half_tc = tc >> 1;
     let neg_half_tc_v = _mm_set1_epi32(-half_tc);
     let half_tc_v = _mm_set1_epi32(half_tc);
-    let thres_v = _mm_set1_epi32((tc * 10 + 1) >> 1);
-    let delta_half = _mm_srai_epi32::<1>(delta);
-
-    let p1_cond = cmplt_i32x4(
-        abs_i32x4(_mm_sub_epi32(
-            _mm_slli_epi32::<1>(_mm_sub_epi32(p0, p1)),
-            delta,
-        )),
-        thres_v,
-    );
+    // delta>>1 (arithmetic), matches scalar (dp1 uses +delta then >>1). Here the
+    // scalar computes ((p2+p0+1)>>1 - p1 + delta) >> 1, so keep the +delta inside.
     let dp1 = clamp_i32x4(
-        _mm_add_epi32(
+        _mm_srai_epi32::<1>(_mm_add_epi32(
             _mm_sub_epi32(
                 _mm_srai_epi32::<1>(_mm_add_epi32(_mm_add_epi32(p2, p0), one)),
                 p1,
             ),
-            delta_half,
-        ),
+            delta,
+        )),
         neg_half_tc_v,
         half_tc_v,
     );
+    let p1_mask = if do_p1 { weak_active } else { zero };
     let p1w = blend_i32x4(
         p1,
         clamp_i32x4(_mm_add_epi32(p1, dp1), zero, maxv_v),
-        p1_cond,
+        p1_mask,
     );
 
-    let q1_cond = cmplt_i32x4(
-        abs_i32x4(_mm_add_epi32(
-            _mm_slli_epi32::<1>(_mm_sub_epi32(q0, q1)),
-            delta,
-        )),
-        thres_v,
-    );
     let dq1 = clamp_i32x4(
-        _mm_sub_epi32(
+        _mm_srai_epi32::<1>(_mm_sub_epi32(
             _mm_sub_epi32(
                 _mm_srai_epi32::<1>(_mm_add_epi32(_mm_add_epi32(q2, q0), one)),
                 q1,
             ),
-            delta_half,
-        ),
+            delta,
+        )),
         neg_half_tc_v,
         half_tc_v,
     );
+    let q1_mask = if do_q1 { weak_active } else { zero };
     let q1w = blend_i32x4(
         q1,
         clamp_i32x4(_mm_add_epi32(q1, dq1), zero, maxv_v),
-        q1_cond,
+        q1_mask,
     );
 
     (
@@ -569,10 +559,11 @@ fn luma_horizontal_plane_sse41_impl(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
+    let (strong_all, do_p1, do_q1) = decompose(decision);
     let p3_base = (edge - 4 - row0) * w + scan;
     let p2_base = (edge - 3 - row0) * w + scan;
     let p1_base = (edge - 2 - row0) * w + scan;
@@ -591,8 +582,9 @@ fn luma_horizontal_plane_sse41_impl(
     let q2 = _mm_cvtepu16_epi32(load_u16x4(&pix[q2_base..]));
     let q3 = _mm_cvtepu16_epi32(load_u16x4(&pix[q3_base..]));
 
-    let (p0n, p1n, p2n, q0n, q1n, q2n) =
-        luma_filter4_sse41(p3, p2, p1, p0, q0, q1, q2, q3, beta, tc, maxv);
+    let (p0n, p1n, p2n, q0n, q1n, q2n) = luma_filter4_sse41(
+        p3, p2, p1, p0, q0, q1, q2, q3, strong_all, do_p1, do_q1, tc, maxv,
+    );
     let zero = _mm_setzero_si128();
     store_u16x4(&mut pix[p0_base..], _mm_packus_epi32(p0n, zero));
     store_u16x4(&mut pix[p1_base..], _mm_packus_epi32(p1n, zero));
@@ -611,16 +603,18 @@ fn luma_vertical_plane_sse41_impl(
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
+    let (strong_all, do_p1, do_q1) = decompose(decision);
     let base = (s - row0) * w;
     let edge_start = edge - 4;
     let (p3, p2, p1, p0, q0, q1, q2, q3) = load_luma_vertical8x4(pix, w, base, edge_start);
 
-    let (p0n, p1n, p2n, q0n, q1n, q2n) =
-        luma_filter4_sse41(p3, p2, p1, p0, q0, q1, q2, q3, beta, tc, maxv);
+    let (p0n, p1n, p2n, q0n, q1n, q2n) = luma_filter4_sse41(
+        p3, p2, p1, p0, q0, q1, q2, q3, strong_all, do_p1, do_q1, tc, maxv,
+    );
     store_luma_vertical8x4(
         pix, w, base, edge_start, p3, p2n, p1n, p0n, q0n, q1n, q2n, q3,
     );
@@ -633,7 +627,7 @@ pub(crate) fn luma_horizontal_plane_sse41(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
@@ -642,10 +636,10 @@ pub(crate) fn luma_horizontal_plane_sse41(
     }
     let q3_row = edge + 3 - row0;
     if pix.len() < (q3_row + 1).saturating_mul(w) {
-        luma_horizontal_plane_scalar(pix, w, edge, scan, row0, beta, tc, maxv);
+        luma_horizontal_plane_scalar(pix, w, edge, scan, row0, decision, tc, maxv);
         return;
     }
-    unsafe { luma_horizontal_plane_sse41_impl(pix, w, edge, scan, row0, beta, tc, maxv) };
+    unsafe { luma_horizontal_plane_sse41_impl(pix, w, edge, scan, row0, decision, tc, maxv) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -655,7 +649,7 @@ pub(crate) fn luma_vertical_plane_sse41(
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
@@ -664,8 +658,8 @@ pub(crate) fn luma_vertical_plane_sse41(
     }
     let local_row = s - row0;
     if pix.len() < (local_row + 4).saturating_mul(w) {
-        luma_vertical_plane_scalar(pix, w, edge, s, row0, beta, tc, maxv);
+        luma_vertical_plane_scalar(pix, w, edge, s, row0, decision, tc, maxv);
         return;
     }
-    unsafe { luma_vertical_plane_sse41_impl(pix, w, edge, s, row0, beta, tc, maxv) };
+    unsafe { luma_vertical_plane_sse41_impl(pix, w, edge, s, row0, decision, tc, maxv) };
 }

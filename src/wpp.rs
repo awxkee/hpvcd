@@ -34,9 +34,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::threadpool::ProgressGate;
 
-use crate::cabac::{ContextSet, IntraModeContexts};
+use crate::cabac::{ContextSet, IntraModeContexts, PaletteContexts};
 use crate::decode::FullDecoder;
 use crate::error::DecodeError;
+use crate::palette::PalettePredictor;
 use crate::threadpool::ThreadPool;
 
 /// Byte range `[start, end)` of one CTB-row sub-stream within the unescaped
@@ -125,10 +126,16 @@ pub(crate) fn run_wavefront(
 
     // Per-row completed-column gates and context-snapshot hand-off slots.
     let progress: Vec<ProgressGate> = (0..ctb_rows).map(|_| ProgressGate::new()).collect();
-    let snapshots: Vec<OnceLock<(ContextSet, IntraModeContexts)>> =
-        (0..ctb_rows).map(|_| OnceLock::new()).collect();
+    let snapshots: Vec<
+        OnceLock<(
+            ContextSet,
+            IntraModeContexts,
+            PaletteContexts,
+            PalettePredictor,
+        )>,
+    > = (0..ctb_rows).map(|_| OnceLock::new()).collect();
 
-    let (init_ctx, init_ictx) = template.init_contexts_pub();
+    let (init_ctx, init_ictx, init_pctx, init_palette) = template.init_contexts_pub();
 
     // One factory: `&mut template` taken exactly here, never during worker runs.
     let factory = template.row_factory();
@@ -148,6 +155,7 @@ pub(crate) fn run_wavefront(
             let factory_ref = &factory;
             let next_row_ref = &next_row;
             let init_ctx = init_ctx.clone();
+            let init_palette = init_palette.clone();
 
             scope.spawn(move || {
                 loop {
@@ -181,8 +189,8 @@ pub(crate) fn run_wavefront(
                     // earlier and is in flight, so this wait always resolves.
                     // Row above publishes its snapshot before progress 2, and every
                     // claimed row publishes even on error/abandon, so this resolves.
-                    let (ctx, ictx) = if ry == 0 {
-                        (init_ctx.clone(), init_ictx)
+                    let (ctx, ictx, pctx, palette_predictor) = if ry == 0 {
+                        (init_ctx.clone(), init_ictx, init_pctx, init_palette.clone())
                     } else {
                         progress_ref[ry - 1].wait_at_least(2);
                         snapshots_ref[ry - 1]
@@ -193,7 +201,9 @@ pub(crate) fn run_wavefront(
 
                     // SAFETY: disjointness upheld by the 2-CTB lag; buffers live
                     // for the whole scope (template outlives it).
-                    let mut row = match unsafe { factory_ref.make(row_cabac, ctx, ictx) } {
+                    let mut row = match unsafe {
+                        factory_ref.make(row_cabac, ctx, ictx, pctx, palette_predictor)
+                    } {
                         Ok(r) => r,
                         Err(e) => {
                             let _ = first_err_ref.set(e);
@@ -226,10 +236,17 @@ pub(crate) fn run_wavefront(
 
 /// A fresh pair of default entropy contexts, used only to unblock a stalled row
 /// below after an error so the wavefront can drain instead of deadlocking.
-fn default_contexts() -> (ContextSet, IntraModeContexts) {
+fn default_contexts() -> (
+    ContextSet,
+    IntraModeContexts,
+    PaletteContexts,
+    PalettePredictor,
+) {
     (
         ContextSet::init_islice(26),
         IntraModeContexts::init_islice(26),
+        PaletteContexts::init(26),
+        PalettePredictor::default(),
     )
 }
 
@@ -287,4 +304,38 @@ mod tests {
         assert_eq!(rows2[1].start, 4);
         assert_eq!(rows2[1].end, rbsp.len());
     }
+}
+
+/// Convert tile/WPP `entry_points` (NAL-domain sub-stream byte lengths) into
+/// RBSP offsets **relative to the CABAC payload start** (`cabac_rbsp_off`).
+/// Sub-stream 0 starts at 0; sub-stream i+1 starts after entry_points[0..=i].
+/// Mirrors `row_substreams` but returns starts relative to the slice's CABAC
+/// data so the tiled decoder can `reset_with(&cabac[start..])`. Emulation-
+/// prevention bytes make the NAL and RBSP domains diverge, so the accumulation
+/// must be done in NAL space and mapped back per boundary.
+pub(crate) fn substream_starts_rbsp_rel(
+    src_of: &[usize],
+    cabac_rbsp_off: usize,
+    entry_points: &[u32],
+    rbsp_len: usize,
+) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(entry_points.len() + 1);
+    starts.push(0usize);
+    if cabac_rbsp_off >= src_of.len() {
+        // No emulation map available; fall back to treating entries as RBSP-rel.
+        let mut acc = 0usize;
+        for &len in entry_points {
+            acc = acc.saturating_add(len as usize);
+            starts.push(acc.min(rbsp_len.saturating_sub(cabac_rbsp_off)));
+        }
+        return starts;
+    }
+    let nal_data_start = src_of[cabac_rbsp_off];
+    let mut nal_cursor = nal_data_start;
+    for &len in entry_points {
+        nal_cursor += len as usize;
+        let rbsp_abs = crate::bitreader::nal_to_rbsp_offset(src_of, nal_cursor).min(rbsp_len);
+        starts.push(rbsp_abs.saturating_sub(cabac_rbsp_off));
+    }
+    starts
 }

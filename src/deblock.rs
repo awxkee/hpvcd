@@ -27,23 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Parallel in-loop deblocking (HEVC §8.7.2), split from the serial version in
-//! `decode.rs`. The picture is filtered in two ordered passes — all vertical
-//! edges, then all horizontal — for luma and then chroma. Each pass is a pure
-//! function of the buffer state at the pass's start (no edge reads another
-//! edge's writes within the same pass, because edges are 8 px apart while a
-//! filter touches at most ±4 px), which is what lets a pass run in parallel.
-//!
-//! Decomposition: each pass is split into CTB-aligned row bands.
-//!   * Vertical pass — every pixel access for row `s` is `s*w + …`, so row
-//!     bands are perfectly disjoint with no halo. CTB alignment (a multiple of
-//!     both 4 and 8) keeps each 4-row filter segment inside one band, so the
-//!     joint `d_total` decision is identical to the serial path.
-//!   * Horizontal pass — `horiz_bands` places each band boundary in the row gap
-//!     between neighboring horizontal filters. Every edge's read/write footprint
-//!     is therefore inside exactly one band, so the pass runs in place without a
-//!     whole-plane snapshot.
-
 use crate::exec::ExecContext;
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
 
@@ -84,8 +67,21 @@ pub(crate) struct DeblockCtx<'a> {
     pub qp_bd_offset_y: i32,
     pub qp_bd_offset_c: i32,
     pub default_qp: i16,
+    pub log2_ctb: u32,
     pub qp_y_map: &'a [i16],
     pub tqb: &'a [bool],
+    /// Per-4×4 deblock edge flags and boundary strengths (see `FullDecoder`).
+    pub edge_v: &'a [bool],
+    pub edge_h: &'a [bool],
+    pub bs_v: &'a [u8],
+    pub bs_h: &'a [u8],
+    pub pcm: &'a [bool],
+    pub slice_idx: &'a [u16],
+    pub pcm_loop_filter_disabled: bool,
+    pub loop_filter_across_slices: bool,
+    /// Resolved tile geometry when tiles are enabled and cross-tile filtering is
+    /// disabled; `None` otherwise (no tile gating needed).
+    pub tile_grid: Option<crate::tiles::TileGrid>,
 }
 
 impl DeblockCtx<'_> {
@@ -111,9 +107,184 @@ impl DeblockCtx<'_> {
         let idx = (py / 4) * self.gw + (px / 4);
         self.tqb.get(idx).copied().unwrap_or(false)
     }
+
+    #[inline]
+    fn grid(&self, px: usize, py: usize) -> Option<usize> {
+        if px >= self.w || py >= self.h || self.gw == 0 {
+            return None;
+        }
+        Some((py / 4) * self.gw + (px / 4))
+    }
+
+    /// Bs for the vertical edge to the left of `(px, py)`; 0 if not filtered.
+    #[inline]
+    fn bs_v_at(&self, px: usize, py: usize) -> u8 {
+        if px == 0 {
+            return 0;
+        }
+        let g = match self.grid(px, py) {
+            Some(g) => g,
+            None => return 0,
+        };
+        if !self.edge_v.get(g).copied().unwrap_or(false) {
+            return 0;
+        }
+        if !self.filter_across(px - 1, py, px, py) {
+            return 0;
+        }
+        self.bs_v.get(g).copied().unwrap_or(0)
+    }
+
+    /// Bs for the horizontal edge above `(px, py)`; 0 if not filtered.
+    #[inline]
+    fn bs_h_at(&self, px: usize, py: usize) -> u8 {
+        if py == 0 {
+            return 0;
+        }
+        let g = match self.grid(px, py) {
+            Some(g) => g,
+            None => return 0,
+        };
+        if !self.edge_h.get(g).copied().unwrap_or(false) {
+            return 0;
+        }
+        if !self.filter_across(px, py - 1, px, py) {
+            return 0;
+        }
+        self.bs_h.get(g).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn filter_across(&self, pxp: usize, pyp: usize, pxq: usize, pyq: usize) -> bool {
+        if self.tqb_at(pxp, pyp) || self.tqb_at(pxq, pyq) {
+            return false;
+        }
+        if self.pcm_loop_filter_disabled && (self.pcm_at(pxp, pyp) || self.pcm_at(pxq, pyq)) {
+            return false;
+        }
+        if !self.loop_filter_across_slices && self.slice_at(pxp, pyp) != self.slice_at(pxq, pyq) {
+            return false;
+        }
+        if let Some(g) = &self.tile_grid {
+            let c = self.log2_ctb;
+            if g.tile_id_at(pxp >> c, pyp >> c) != g.tile_id_at(pxq >> c, pyq >> c) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn pcm_at(&self, px: usize, py: usize) -> bool {
+        self.grid(px, py)
+            .and_then(|g| self.pcm.get(g))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn slice_at(&self, px: usize, py: usize) -> u16 {
+        self.grid(px, py)
+            .and_then(|g| self.slice_idx.get(g))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// Per-4-line luma deblock decision (§8.7.2.5.3), computed once from lines 0 and
+/// 3 and applied uniformly to all 4 lines. `Weak` carries the dEp/dEq gates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LumaDecision {
+    Skip,
+    Strong,
+    Weak { do_p1: bool, do_q1: bool },
+}
+
+/// Compute the segment decision from lines 0 and 3. `g(line, tap)` reads a sample
+/// (tap: -1=p0,-2=p1,-3=p2,-4=p3, 0=q0,1=q1,2=q2,3=q3).
+#[inline]
+pub(crate) fn luma_decision(beta: i32, tc: i32, g: impl Fn(usize, i32) -> i32) -> LumaDecision {
+    let dp0 = (g(0, -3) - 2 * g(0, -2) + g(0, -1)).abs();
+    let dp3 = (g(3, -3) - 2 * g(3, -2) + g(3, -1)).abs();
+    let dq0 = (g(0, 2) - 2 * g(0, 1) + g(0, 0)).abs();
+    let dq3 = (g(3, 2) - 2 * g(3, 1) + g(3, 0)).abs();
+    if dp0 + dp3 + dq0 + dq3 >= beta {
+        return LumaDecision::Skip;
+    }
+    let dsam = |line: usize, dpq: i32| -> bool {
+        2 * dpq < (beta >> 2)
+            && (g(line, -4) - g(line, -1)).abs() + (g(line, 0) - g(line, 3)).abs() < (beta >> 3)
+            && (g(line, -1) - g(line, 0)).abs() < (5 * tc + 1) >> 1
+    };
+    if dsam(0, dp0 + dq0) && dsam(3, dp3 + dq3) {
+        LumaDecision::Strong
+    } else {
+        let side_thr = (beta + (beta >> 1)) >> 3;
+        LumaDecision::Weak {
+            do_p1: dp0 + dp3 < side_thr,
+            do_q1: dq0 + dq3 < side_thr,
+        }
+    }
 }
 
 #[inline]
+pub(crate) fn deblock_luma_segment(
+    plane: &mut [u16],
+    beta: i32,
+    tc: i32,
+    max_val: i32,
+    at: impl Fn(usize, i32) -> usize,
+) {
+    let g = |plane: &[u16], line: usize, tap: i32| plane[at(line, tap)] as i32;
+
+    let decision = luma_decision(beta, tc, |line, tap| g(plane, line, tap));
+    let (strong, do_p1, do_q1) = match decision {
+        LumaDecision::Skip => return,
+        LumaDecision::Strong => (true, false, false),
+        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
+    };
+
+    let tc2 = tc >> 1;
+    for line in 0..4 {
+        let p0 = g(plane, line, -1);
+        let p1 = g(plane, line, -2);
+        let p2 = g(plane, line, -3);
+        let p3 = g(plane, line, -4);
+        let q0 = g(plane, line, 0);
+        let q1 = g(plane, line, 1);
+        let q2 = g(plane, line, 2);
+        let q3 = g(plane, line, 3);
+        if strong {
+            // §8.7.2.5.4: each strongly-filtered sample is additionally clipped
+            // to ±2·tc around its original value.
+            let c = |orig: i32, v: i32| -> u16 {
+                v.clamp(orig - 2 * tc, orig + 2 * tc).clamp(0, max_val) as u16
+            };
+            plane[at(line, -1)] = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            plane[at(line, -2)] = c(p1, (p2 + p1 + p0 + q0 + 2) >> 2);
+            plane[at(line, -3)] = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+            plane[at(line, 0)] = c(q0, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+            plane[at(line, 1)] = c(q1, (p0 + q0 + q1 + q2 + 2) >> 2);
+            plane[at(line, 2)] = c(q2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+        } else {
+            let delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+            if delta0.abs() < tc * 10 {
+                let delta = delta0.clamp(-tc, tc);
+                plane[at(line, -1)] = (p0 + delta).clamp(0, max_val) as u16;
+                plane[at(line, 0)] = (q0 - delta).clamp(0, max_val) as u16;
+                if do_p1 {
+                    let dp1 = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-tc2, tc2);
+                    plane[at(line, -2)] = (p1 + dp1).clamp(0, max_val) as u16;
+                }
+                if do_q1 {
+                    let dq1 = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-tc2, tc2);
+                    plane[at(line, 1)] = (q1 + dq1).clamp(0, max_val) as u16;
+                }
+            }
+        }
+    }
+}
+
 fn luma_vertical_segment_params(
     ctx: &DeblockCtx<'_>,
     y: &[u16],
@@ -122,31 +293,32 @@ fn luma_vertical_segment_params(
     row1: usize,
     edge: usize,
     s: usize,
-) -> Option<(i32, i32)> {
+) -> Option<(LumaDecision, i32)> {
     let mid = s + 1;
-    let qp_p = ctx.qp_at(edge - 1, mid);
-    let qp_q = ctx.qp_at(edge, mid);
-    if ctx.tqb_at(edge - 1, mid) || ctx.tqb_at(edge, mid) {
+    // Real TU/PU/CU edge with Bs>0 and not a disabled slice/tile/PCM/TQB
+    // boundary (§8.7.2). Mirrors the serial `deblock_bs_v` gate.
+    if ctx.bs_v_at(edge, mid) == 0 {
         return None;
     }
+    let bs = ctx.bs_v_at(edge, mid) as i32;
+    let qp_p = ctx.qp_at(edge - 1, mid);
+    let qp_q = ctx.qp_at(edge, mid);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
     let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
+    // tc' = Q(qp + 2*(Bs-1) + tc_offset) (§8.7.2.5.3): Bs=2 adds 2, Bs=1 adds 0.
+    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
     let beta = BETA[beta_prime as usize];
     let tc = TC[tc_prime as usize];
     if tc == 0 {
         return None;
     }
-
-    let seg_end = (s + 4).min(row1);
-    let mut d_total = 0i32;
-    for r in s..seg_end {
-        let lr = r - row0;
-        let p = |o: usize| y[lr * w + edge - 1 - o] as i32;
-        let q = |o: usize| y[lr * w + edge + o] as i32;
-        d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
-    }
-    (d_total < beta).then_some((beta, tc))
+    // Decision from lines 0 and 3 (§8.7.2.5.3). Band-local row = global - row0.
+    let dec = luma_decision(beta, tc, |line, tap| {
+        let col = (edge as i32 + tap) as usize;
+        y[(s + line - row0) * w + col] as i32
+    });
+    let _ = row1;
+    (dec != LumaDecision::Skip).then_some((dec, tc))
 }
 
 #[inline]
@@ -157,30 +329,27 @@ fn luma_horizontal_segment_params(
     row0: usize,
     edge: usize,
     scan: usize,
-) -> Option<(i32, i32)> {
+) -> Option<(LumaDecision, i32)> {
     let mid = scan + 1;
-    let qp_p = ctx.qp_at(mid, edge - 1);
-    let qp_q = ctx.qp_at(mid, edge);
-    if ctx.tqb_at(mid, edge - 1) || ctx.tqb_at(mid, edge) {
+    if ctx.bs_h_at(mid, edge) == 0 {
         return None;
     }
+    let bs = ctx.bs_h_at(mid, edge) as i32;
+    let qp_p = ctx.qp_at(mid, edge - 1);
+    let qp_q = ctx.qp_at(mid, edge);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
     let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 + ctx.tc_offset).clamp(0, 53);
+    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
     let beta = BETA[beta_prime as usize];
     let tc = TC[tc_prime as usize];
     if tc == 0 {
         return None;
     }
-
-    let at = |buf: &[u16], gy: usize, x: usize| -> i32 { buf[(gy - row0) * w + x] as i32 };
-    let mut d_total = 0i32;
-    for c in scan..scan + 4 {
-        let p = |o: usize| at(y, edge - 1 - o, c);
-        let q = |o: usize| at(y, edge + o, c);
-        d_total += (p(2) - 2 * p(1) + p(0)).abs() + (q(0) - 2 * q(1) + q(2)).abs();
-    }
-    (d_total < beta).then_some((beta, tc))
+    let dec = luma_decision(beta, tc, |line, tap| {
+        let row = (edge as i32 + tap) as usize - row0;
+        y[row * w + (scan + line)] as i32
+    });
+    (dec != LumaDecision::Skip).then_some((dec, tc))
 }
 
 /// Luma vertical edges for the global rows `[row0, row1)`. Writes and reads only
@@ -194,6 +363,9 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
     let mut edge = 8;
     while edge <= last_full_edge {
         let mut s = row0;
+        // The per-4-line decision (§8.7.2.5.3) is computed scalar from lines 0
+        // and 3; the chosen filter is then applied — vectorized when SIMD is
+        // available — uniformly to all 4 lines.
         while s + 4 <= row1 {
             if let Some(pair_filter) = pair_filter
                 && s + 8 <= row1
@@ -201,8 +373,8 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
                 let first = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s);
                 let second = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s + 4);
                 match (first, second) {
-                    (Some((beta0, tc0)), Some((beta1, tc1))) => {
-                        pair_filter(y, w, edge, s, row0, beta0, tc0, beta1, tc1, maxv);
+                    (Some((d0, tc0)), Some((d1, tc1))) => {
+                        pair_filter(y, w, edge, s, row0, d0, tc0, d1, tc1, maxv);
                         s += 8;
                         continue;
                     }
@@ -210,16 +382,15 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
                         s += 4;
                         continue;
                     }
-                    (Some((beta, tc)), None) => {
-                        filter(y, w, edge, s, row0, beta, tc, maxv);
+                    (Some((d0, tc0)), None) => {
+                        filter(y, w, edge, s, row0, d0, tc0, maxv);
                         s += 4;
                         continue;
                     }
                 }
             }
-
-            if let Some((beta, tc)) = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s) {
-                filter(y, w, edge, s, row0, beta, tc, maxv);
+            if let Some((dec, tc)) = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s) {
+                filter(y, w, edge, s, row0, dec, tc, maxv);
             }
             s += 4;
         }
@@ -252,8 +423,8 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
                 let first = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan);
                 let second = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan + 4);
                 match (first, second) {
-                    (Some((beta0, tc0)), Some((beta1, tc1))) => {
-                        pair_filter(y, w, edge, scan, row0, beta0, tc0, beta1, tc1, maxv);
+                    (Some((d0, tc0)), Some((d1, tc1))) => {
+                        pair_filter(y, w, edge, scan, row0, d0, tc0, d1, tc1, maxv);
                         scan += 8;
                         continue;
                     }
@@ -261,16 +432,15 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
                         scan += 4;
                         continue;
                     }
-                    (Some((beta, tc)), None) => {
-                        filter(y, w, edge, scan, row0, beta, tc, maxv);
+                    (Some((d0, tc0)), None) => {
+                        filter(y, w, edge, scan, row0, d0, tc0, maxv);
                         scan += 4;
                         continue;
                     }
                 }
             }
-
-            if let Some((beta, tc)) = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan) {
-                filter(y, w, edge, scan, row0, beta, tc, maxv);
+            if let Some((dec, tc)) = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan) {
+                filter(y, w, edge, scan, row0, dec, tc, maxv);
             }
             scan += 4;
         }
@@ -279,10 +449,11 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) type LumaDeblockPlaneFn = fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32);
+pub(crate) type LumaDeblockPlaneFn =
+    fn(&mut [u16], usize, usize, usize, usize, LumaDecision, i32, i32);
 #[allow(clippy::too_many_arguments)]
 pub(crate) type LumaDeblockPairFn =
-    fn(&mut [u16], usize, usize, usize, usize, i32, i32, i32, i32, i32);
+    fn(&mut [u16], usize, usize, usize, usize, LumaDecision, i32, LumaDecision, i32, i32);
 
 static LUMA_VERTICAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
 static LUMA_HORIZONTAL_PLANE: std::sync::OnceLock<LumaDeblockPlaneFn> = std::sync::OnceLock::new();
@@ -308,7 +479,7 @@ pub(crate) fn resolve_luma_vertical_plane() -> LumaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::luma_vertical_plane_avx2;
@@ -324,7 +495,7 @@ pub(crate) fn resolve_luma_vertical_pair() -> Option<LumaDeblockPairFn> {
     *LUMA_VERTICAL_PAIR.get_or_init(|| {
         let mut _f: Option<LumaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::luma_vertical_plane_pair_avx2);
@@ -352,7 +523,7 @@ pub(crate) fn resolve_luma_horizontal_plane() -> LumaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::luma_horizontal_plane_avx2;
@@ -368,7 +539,7 @@ pub(crate) fn resolve_luma_horizontal_pair() -> Option<LumaDeblockPairFn> {
     *LUMA_HORIZONTAL_PAIR.get_or_init(|| {
         let mut _f: Option<LumaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::luma_horizontal_plane_pair_avx2);
@@ -380,38 +551,82 @@ pub(crate) fn resolve_luma_horizontal_pair() -> Option<LumaDeblockPairFn> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Apply a precomputed per-segment `decision` uniformly to the 4 lines of a luma
+/// edge segment. `at(line, tap)` gives the flat index (see `luma_decision`).
+#[inline]
+pub(crate) fn apply_luma_decision(
+    plane: &mut [u16],
+    decision: LumaDecision,
+    tc: i32,
+    max_val: i32,
+    at: impl Fn(usize, i32) -> usize,
+) {
+    let (strong, do_p1, do_q1) = match decision {
+        LumaDecision::Skip => return,
+        LumaDecision::Strong => (true, false, false),
+        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
+    };
+    let tc2 = tc >> 1;
+    let g = |plane: &[u16], line: usize, tap: i32| plane[at(line, tap)] as i32;
+    for line in 0..4 {
+        let p0 = g(plane, line, -1);
+        let p1 = g(plane, line, -2);
+        let p2 = g(plane, line, -3);
+        let p3 = g(plane, line, -4);
+        let q0 = g(plane, line, 0);
+        let q1 = g(plane, line, 1);
+        let q2 = g(plane, line, 2);
+        let q3 = g(plane, line, 3);
+        if strong {
+            // §8.7.2.5.4: each strongly-filtered sample is additionally clipped
+            // to ±2·tc around its original value.
+            let c = |orig: i32, v: i32| -> u16 {
+                v.clamp(orig - 2 * tc, orig + 2 * tc).clamp(0, max_val) as u16
+            };
+            plane[at(line, -1)] = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            plane[at(line, -2)] = c(p1, (p2 + p1 + p0 + q0 + 2) >> 2);
+            plane[at(line, -3)] = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+            plane[at(line, 0)] = c(q0, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+            plane[at(line, 1)] = c(q1, (p0 + q0 + q1 + q2 + 2) >> 2);
+            plane[at(line, 2)] = c(q2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+        } else {
+            let delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+            if delta0.abs() < tc * 10 {
+                let delta = delta0.clamp(-tc, tc);
+                plane[at(line, -1)] = (p0 + delta).clamp(0, max_val) as u16;
+                plane[at(line, 0)] = (q0 - delta).clamp(0, max_val) as u16;
+                if do_p1 {
+                    let dp1 = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-tc2, tc2);
+                    plane[at(line, -2)] = (p1 + dp1).clamp(0, max_val) as u16;
+                }
+                if do_q1 {
+                    let dq1 = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-tc2, tc2);
+                    plane[at(line, 1)] = (q1 + dq1).clamp(0, max_val) as u16;
+                }
+            }
+        }
+    }
+}
+
+/// Scalar reference: apply `decision` to a vertical-edge segment (4 rows).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn luma_vertical_plane_scalar(
     pix: &mut [u16],
     w: usize,
     edge: usize,
     s: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
-    for r in s..s + 4 {
-        let lr = r - row0;
-        let base_p = lr * w + edge - 1;
-        let base_q = lr * w + edge;
-        let (p0, p1, p2, p3) = (
-            pix[base_p] as i32,
-            pix[base_p - 1] as i32,
-            pix[base_p - 2] as i32,
-            pix[base_p - 3] as i32,
-        );
-        let (q0, q1, q2, q3) = (
-            pix[base_q] as i32,
-            pix[base_q + 1] as i32,
-            pix[base_q + 2] as i32,
-            pix[base_q + 3] as i32,
-        );
-        luma_filter_lane_vertical(
-            pix, w, lr, edge, p0, p1, p2, p3, q0, q1, q2, q3, beta, tc, maxv,
-        );
-    }
+    apply_luma_decision(pix, decision, tc, maxv, |line, tap| {
+        let col = (edge as i32 + tap) as usize;
+        (s + line - row0) * w + col
+    });
 }
 
+/// Scalar reference: apply `decision` to a horizontal-edge segment (4 cols).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn luma_horizontal_plane_scalar(
     pix: &mut [u16],
@@ -419,133 +634,14 @@ pub(crate) fn luma_horizontal_plane_scalar(
     edge: usize,
     scan: usize,
     row0: usize,
-    beta: i32,
+    decision: LumaDecision,
     tc: i32,
     maxv: i32,
 ) {
-    for c in scan..scan + 4 {
-        let at = |buf: &[u16], gy: usize, x: usize| -> i32 { buf[(gy - row0) * w + x] as i32 };
-        let (p0, p1, p2, p3) = (
-            at(pix, edge - 1, c),
-            at(pix, edge - 2, c),
-            at(pix, edge - 3, c),
-            at(pix, edge - 4, c),
-        );
-        let (q0, q1, q2, q3) = (
-            at(pix, edge, c),
-            at(pix, edge + 1, c),
-            at(pix, edge + 2, c),
-            at(pix, edge + 3, c),
-        );
-        luma_filter_lane_horizontal(
-            pix, w, edge, c, row0, p0, p1, p2, p3, q0, q1, q2, q3, beta, tc, maxv,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn luma_filter_lane_vertical(
-    pix: &mut [u16],
-    w: usize,
-    lr: usize,
-    edge: usize,
-    p0: i32,
-    p1: i32,
-    p2: i32,
-    p3: i32,
-    q0: i32,
-    q1: i32,
-    q2: i32,
-    q3: i32,
-    beta: i32,
-    tc: i32,
-    maxv: i32,
-) {
-    let base_p = lr * w + edge - 1;
-    let base_q = lr * w + edge;
-    let put = |dst: &mut [u16], idx: usize, val: i32| {
-        dst[idx] = val.clamp(0, maxv) as u16;
-    };
-    let dp = (p2 - 2 * p1 + p0).abs();
-    let dq = (q2 - 2 * q1 + q0).abs();
-    let d = dp + dq;
-    let strong = d < (beta >> 2)
-        && (p0 - q0).abs() < (5 * tc + 1) >> 1
-        && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
-    if strong {
-        put(pix, base_p, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-        put(pix, base_p - 1, (p2 + p1 + p0 + q0 + 2) >> 2);
-        put(pix, base_p - 2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-        put(pix, base_q, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-        put(pix, base_q + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
-        put(pix, base_q + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
-    } else {
-        let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-        put(pix, base_p, p0 + delta);
-        put(pix, base_q, q0 - delta);
-        let thres = (tc * 10 + 1) >> 1;
-        if (2 * (p0 - p1) - delta).abs() < thres {
-            let dp1 = (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-            put(pix, base_p - 1, p1 + dp1);
-        }
-        if (2 * (q0 - q1) + delta).abs() < thres {
-            let dq1 = (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-            put(pix, base_q + 1, q1 + dq1);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn luma_filter_lane_horizontal(
-    pix: &mut [u16],
-    w: usize,
-    edge: usize,
-    c: usize,
-    row0: usize,
-    p0: i32,
-    p1: i32,
-    p2: i32,
-    p3: i32,
-    q0: i32,
-    q1: i32,
-    q2: i32,
-    q3: i32,
-    beta: i32,
-    tc: i32,
-    maxv: i32,
-) {
-    let put = |dst: &mut [u16], gy: usize, val: i32| {
-        dst[(gy - row0) * w + c] = val.clamp(0, maxv) as u16;
-    };
-    let dp = (p2 - 2 * p1 + p0).abs();
-    let dq = (q2 - 2 * q1 + q0).abs();
-    let d = dp + dq;
-    let strong = d < (beta >> 2)
-        && (p0 - q0).abs() < (5 * tc + 1) >> 1
-        && (p3 - p0).abs() + (q0 - q3).abs() < (beta * 3) >> 3;
-    if strong {
-        put(pix, edge - 1, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-        put(pix, edge - 2, (p2 + p1 + p0 + q0 + 2) >> 2);
-        put(pix, edge - 3, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-        put(pix, edge, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-        put(pix, edge + 1, (p0 + q0 + q1 + q2 + 2) >> 2);
-        put(pix, edge + 2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
-    } else {
-        let delta = ((9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4).clamp(-tc, tc);
-        put(pix, edge - 1, p0 + delta);
-        put(pix, edge, q0 - delta);
-        let thres = (tc * 10 + 1) >> 1;
-        if (2 * (p0 - p1) - delta).abs() < thres {
-            let dp1 = (((p2 + p0 + 1) >> 1) - p1 + (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-            put(pix, edge - 2, p1 + dp1);
-        }
-        if (2 * (q0 - q1) + delta).abs() < thres {
-            let dq1 = (((q2 + q0 + 1) >> 1) - q1 - (delta >> 1)).clamp(-(tc >> 1), tc >> 1);
-            put(pix, edge + 1, q1 + dq1);
-        }
-    }
+    apply_luma_decision(pix, decision, tc, maxv, |line, tap| {
+        let row = (edge as i32 + tap) as usize - row0;
+        row * w + (scan + line)
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -579,7 +675,7 @@ pub(crate) fn resolve_chroma_vertical_plane() -> ChromaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::chroma_vertical_plane_avx2;
@@ -595,7 +691,7 @@ pub(crate) fn resolve_chroma_vertical_pair() -> Option<ChromaDeblockPairFn> {
     *CHROMA_VERTICAL_PAIR.get_or_init(|| {
         let mut _f: Option<ChromaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::chroma_vertical_plane_pair_avx2);
@@ -623,7 +719,7 @@ pub(crate) fn resolve_chroma_horizontal_plane() -> ChromaDeblockPlaneFn {
             }
         }
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::avx::chroma_horizontal_plane_avx2;
@@ -639,7 +735,7 @@ pub(crate) fn resolve_chroma_horizontal_pair() -> Option<ChromaDeblockPairFn> {
     *CHROMA_HORIZONTAL_PAIR.get_or_init(|| {
         let mut _f: Option<ChromaDeblockPairFn> = None;
 
-        #[cfg(all(feature = "sse", target_arch = "x86_64"))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = Some(crate::avx::chroma_horizontal_plane_pair_avx2);
@@ -703,17 +799,14 @@ fn chroma_vertical_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, s: usize) -> Op
     let mid = s + 1;
     let qlx = edge * ctx.sub_w;
     let qly = mid * ctx.sub_h;
+    // Chroma filters only where the co-located luma edge has Bs == 2.
+    if ctx.bs_v_at(qlx, qly) < 2 {
+        return None;
+    }
     let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
     let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
     let tc_c = TC[tc_prime_c as usize];
     if tc_c == 0 {
-        return None;
-    }
-    let px_p = (edge - 1) * ctx.sub_w;
-    let py_p = mid * ctx.sub_h;
-    let px_q = edge * ctx.sub_w;
-    let py_q = mid * ctx.sub_h;
-    if ctx.tqb_at(px_p, py_p) || ctx.tqb_at(px_q, py_q) {
         return None;
     }
     Some(tc_c)
@@ -724,17 +817,13 @@ fn chroma_horizontal_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, scan: usize) 
     let mid = scan + 1;
     let qlx = mid * ctx.sub_w;
     let qly = edge * ctx.sub_h;
+    if ctx.bs_h_at(qlx, qly) < 2 {
+        return None;
+    }
     let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
     let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
     let tc_c = TC[tc_prime_c as usize];
     if tc_c == 0 {
-        return None;
-    }
-    let px_p = mid * ctx.sub_w;
-    let py_p = (edge - 1) * ctx.sub_h;
-    let px_q = mid * ctx.sub_w;
-    let py_q = edge * ctx.sub_h;
-    if ctx.tqb_at(px_p, py_p) || ctx.tqb_at(px_q, py_q) {
         return None;
     }
     Some(tc_c)
@@ -979,4 +1068,123 @@ pub(crate) fn apply_deblocking_parallel(
     }
 
     DeblockPlanes { y, cb, cr }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::ExecContext;
+
+    /// Build a 2×2-CTB-worth 8×8-pixel grid (gw=gh=2) DeblockCtx with the given
+    /// per-4×4 edge/Bs/slice arrays and no tiles.
+    fn ctx<'a>(
+        edge_v: &'a [bool],
+        edge_h: &'a [bool],
+        bs_v: &'a [u8],
+        bs_h: &'a [u8],
+        tqb: &'a [bool],
+        pcm: &'a [bool],
+        slice_idx: &'a [u16],
+        across_slices: bool,
+        pcm_lf_disabled: bool,
+    ) -> DeblockCtx<'a> {
+        DeblockCtx {
+            exec: ExecContext::new(),
+            w: 8,
+            h: 8,
+            cw: 4,
+            ch: 4,
+            gw: 2,
+            gh: 2,
+            sub_w: 2,
+            sub_h: 2,
+            bd: 8,
+            bd_c: 8,
+            beta_offset: 0,
+            tc_offset: 0,
+            qp_bd_offset_y: 0,
+            qp_bd_offset_c: 0,
+            default_qp: 26,
+            log2_ctb: 6,
+            qp_y_map: &[],
+            tqb,
+            edge_v,
+            edge_h,
+            bs_v,
+            bs_h,
+            pcm,
+            slice_idx,
+            pcm_loop_filter_disabled: pcm_lf_disabled,
+            loop_filter_across_slices: across_slices,
+            tile_grid: None,
+        }
+    }
+
+    #[test]
+    fn bs_zero_when_not_a_real_edge() {
+        // No edge flags set → nothing filtered even with a Bs value present.
+        let edge = [false; 4];
+        let bs = [2u8; 4];
+        let no = [false; 4];
+        let s = [0u16; 4];
+        let c = ctx(&edge, &edge, &bs, &bs, &no, &no, &s, true, false);
+        assert_eq!(c.bs_v_at(4, 0), 0);
+        assert_eq!(c.bs_h_at(0, 4), 0);
+    }
+
+    #[test]
+    fn bs_reported_at_real_edge() {
+        // Mark the 4×4 cell at grid (1,0) (pixel col 4) as a vertical edge, Bs 2.
+        let mut edge_v = [false; 4];
+        let mut bs_v = [0u8; 4];
+        edge_v[1] = true; // grid idx (gy=0,gx=1)
+        bs_v[1] = 2;
+        let z = [false; 4];
+        let zb = [0u8; 4];
+        let s = [0u16; 4];
+        let c = ctx(&edge_v, &z, &bs_v, &zb, &z, &z, &s, true, false);
+        assert_eq!(c.bs_v_at(4, 0), 2);
+    }
+
+    #[test]
+    fn tqb_and_pcm_suppress_filtering() {
+        let mut edge_v = [false; 4];
+        let mut bs_v = [0u8; 4];
+        edge_v[1] = true;
+        bs_v[1] = 2;
+        let z = [false; 4];
+        let zb = [0u8; 4];
+        let s = [0u16; 4];
+        // P side (pixel col 3 → grid 0) is transquant-bypass → suppressed.
+        let mut tqb = [false; 4];
+        tqb[0] = true;
+        let c = ctx(&edge_v, &z, &bs_v, &zb, &tqb, &z, &s, true, false);
+        assert_eq!(c.bs_v_at(4, 0), 0);
+        // PCM with loop filter disabled likewise suppresses.
+        let mut pcm = [false; 4];
+        pcm[1] = true;
+        let c2 = ctx(&edge_v, &z, &bs_v, &zb, &z, &pcm, &s, true, true);
+        assert_eq!(c2.bs_v_at(4, 0), 0);
+        // PCM present but pcm_loop_filter_disabled=false → still filtered.
+        let c3 = ctx(&edge_v, &z, &bs_v, &zb, &z, &pcm, &s, true, false);
+        assert_eq!(c3.bs_v_at(4, 0), 2);
+    }
+
+    #[test]
+    fn cross_slice_gate() {
+        let mut edge_v = [false; 4];
+        let mut bs_v = [0u8; 4];
+        edge_v[1] = true;
+        bs_v[1] = 2;
+        let z = [false; 4];
+        let zb = [0u8; 4];
+        // P (grid 0) in slice 0, Q (grid 1) in slice 1.
+        let s = [0u16, 1, 0, 1];
+        // across_slices = false → different slices suppress.
+        let c = ctx(&edge_v, &z, &bs_v, &zb, &z, &z, &s, false, false);
+        assert_eq!(c.bs_v_at(4, 0), 0);
+        // across_slices = true → filtered.
+        let c2 = ctx(&edge_v, &z, &bs_v, &zb, &z, &z, &s, true, false);
+        assert_eq!(c2.bs_v_at(4, 0), 2);
+    }
 }

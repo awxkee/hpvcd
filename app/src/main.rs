@@ -1,10 +1,28 @@
-use hpvcd::ImageBuffer;
+use hpvcd::{ImageBuffer, VideoDecoder};
 use image::{DynamicImage, RgbImage};
 use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
+    // let bytes = fs::read("./assets/file_example_MP4_480_1_5MG.265").unwrap();
+    // let mut video_decoder = VideoDecoder::new();
+    // let instant = Instant::now();
+    // let decoded_frame = video_decoder
+    //     .decode_frame_at_fps(&bytes, 1., 24.)
+    //     .unwrap()
+    //     .unwrap();
+    // let elapsed = instant.elapsed();
+    // println!("Video {:?}", elapsed);
+    // let rgb_image = decoded_frame.to_rgb8();
+    // let iamge = RgbImage::from_vec(
+    //     decoded_frame.width() as u32,
+    //     decoded_frame.height() as u32,
+    //     rgb_image.to_vec(),
+    // )
+    // .unwrap();
+    // iamge.save("./out_v.jpg").unwrap();
+
+    let bytes = fs::read("./assets/Zero_and_One_Palette_Size_A_Canon_2.heic").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
@@ -51,4 +69,15 @@ fn main() {
         .unwrap(),
     );
     img.save("./out.jpg").unwrap();
+
+    let bytes1 = fs::read("./assets/Zero_and_One_Palette_Size_A_Canon_2.bit").unwrap();
+    let decoded = hpvcd::decode_hevc(&bytes1).unwrap();
+    let rgb_image = decoded[0].to_rgb8();
+    let iamge = RgbImage::from_vec(
+        decoded[0].width() as u32,
+        decoded[0].height() as u32,
+        rgb_image.to_vec(),
+    )
+    .unwrap();
+    iamge.save("./out_v.jpg").unwrap();
 }
