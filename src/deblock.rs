@@ -367,25 +367,25 @@ fn luma_vertical(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize) 
         // and 3; the chosen filter is then applied — vectorized when SIMD is
         // available — uniformly to all 4 lines.
         while s + 4 <= row1 {
-            if let Some(pair_filter) = pair_filter {
-                if s + 8 <= row1 {
-                    let first = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s);
-                    let second = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s + 4);
-                    match (first, second) {
-                        (Some((d0, tc0)), Some((d1, tc1))) => {
-                            pair_filter(y, w, edge, s, row0, d0, tc0, d1, tc1, maxv);
-                            s += 8;
-                            continue;
-                        }
-                        (None, _) => {
-                            s += 4;
-                            continue;
-                        }
-                        (Some((d0, tc0)), None) => {
-                            filter(y, w, edge, s, row0, d0, tc0, maxv);
-                            s += 4;
-                            continue;
-                        }
+            if let Some(pair_filter) = pair_filter
+                && s + 8 <= row1
+            {
+                let first = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s);
+                let second = luma_vertical_segment_params(ctx, y, w, row0, row1, edge, s + 4);
+                match (first, second) {
+                    (Some((d0, tc0)), Some((d1, tc1))) => {
+                        pair_filter(y, w, edge, s, row0, d0, tc0, d1, tc1, maxv);
+                        s += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        s += 4;
+                        continue;
+                    }
+                    (Some((d0, tc0)), None) => {
+                        filter(y, w, edge, s, row0, d0, tc0, maxv);
+                        s += 4;
+                        continue;
                     }
                 }
             }
@@ -417,25 +417,25 @@ fn luma_horizontal(ctx: &DeblockCtx<'_>, y: &mut [u16], row0: usize, row1: usize
         }
         let mut scan = 0;
         while scan + 4 <= w {
-            if let Some(pair_filter) = pair_filter {
-                if scan + 8 <= w {
-                    let first = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan);
-                    let second = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan + 4);
-                    match (first, second) {
-                        (Some((d0, tc0)), Some((d1, tc1))) => {
-                            pair_filter(y, w, edge, scan, row0, d0, tc0, d1, tc1, maxv);
-                            scan += 8;
-                            continue;
-                        }
-                        (None, _) => {
-                            scan += 4;
-                            continue;
-                        }
-                        (Some((d0, tc0)), None) => {
-                            filter(y, w, edge, scan, row0, d0, tc0, maxv);
-                            scan += 4;
-                            continue;
-                        }
+            if let Some(pair_filter) = pair_filter
+                && scan + 8 <= w
+            {
+                let first = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan);
+                let second = luma_horizontal_segment_params(ctx, y, w, row0, edge, scan + 4);
+                match (first, second) {
+                    (Some((d0, tc0)), Some((d1, tc1))) => {
+                        pair_filter(y, w, edge, scan, row0, d0, tc0, d1, tc1, maxv);
+                        scan += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        scan += 4;
+                        continue;
+                    }
+                    (Some((d0, tc0)), None) => {
+                        filter(y, w, edge, scan, row0, d0, tc0, maxv);
+                        scan += 4;
+                        continue;
                     }
                 }
             }
@@ -848,27 +848,27 @@ fn chroma_vertical(
     while edge <= last_full_chroma_edge {
         let mut s = crow0;
         while s + 4 <= crow1 {
-            if let Some(pair_filter) = pair_filter {
-                if s + 8 <= crow1 {
-                    let first = chroma_vertical_segment_tc(ctx, edge, s);
-                    let second = chroma_vertical_segment_tc(ctx, edge, s + 4);
-                    match (first, second) {
-                        (Some(tc0), Some(tc1)) => {
-                            pair_filter(cb, cw, edge, s, crow0, tc0, tc1, maxv_c);
-                            pair_filter(cr, cw, edge, s, crow0, tc0, tc1, maxv_c);
-                            s += 8;
-                            continue;
-                        }
-                        (None, _) => {
-                            s += 4;
-                            continue;
-                        }
-                        (Some(tc_c), None) => {
-                            filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
-                            filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
-                            s += 4;
-                            continue;
-                        }
+            if let Some(pair_filter) = pair_filter
+                && s + 8 <= crow1
+            {
+                let first = chroma_vertical_segment_tc(ctx, edge, s);
+                let second = chroma_vertical_segment_tc(ctx, edge, s + 4);
+                match (first, second) {
+                    (Some(tc0), Some(tc1)) => {
+                        pair_filter(cb, cw, edge, s, crow0, tc0, tc1, maxv_c);
+                        pair_filter(cr, cw, edge, s, crow0, tc0, tc1, maxv_c);
+                        s += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        s += 4;
+                        continue;
+                    }
+                    (Some(tc_c), None) => {
+                        filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
+                        filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
+                        s += 4;
+                        continue;
                     }
                 }
             }
@@ -906,27 +906,27 @@ fn chroma_horizontal(
         }
         let mut scan = 0;
         while scan + 4 <= cw {
-            if let Some(pair_filter) = pair_filter {
-                if scan + 8 <= cw {
-                    let first = chroma_horizontal_segment_tc(ctx, edge, scan);
-                    let second = chroma_horizontal_segment_tc(ctx, edge, scan + 4);
-                    match (first, second) {
-                        (Some(tc0), Some(tc1)) => {
-                            pair_filter(cb, cw, edge, scan, crow0, tc0, tc1, maxv_c);
-                            pair_filter(cr, cw, edge, scan, crow0, tc0, tc1, maxv_c);
-                            scan += 8;
-                            continue;
-                        }
-                        (None, _) => {
-                            scan += 4;
-                            continue;
-                        }
-                        (Some(tc_c), None) => {
-                            filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
-                            filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
-                            scan += 4;
-                            continue;
-                        }
+            if let Some(pair_filter) = pair_filter
+                && scan + 8 <= cw
+            {
+                let first = chroma_horizontal_segment_tc(ctx, edge, scan);
+                let second = chroma_horizontal_segment_tc(ctx, edge, scan + 4);
+                match (first, second) {
+                    (Some(tc0), Some(tc1)) => {
+                        pair_filter(cb, cw, edge, scan, crow0, tc0, tc1, maxv_c);
+                        pair_filter(cr, cw, edge, scan, crow0, tc0, tc1, maxv_c);
+                        scan += 8;
+                        continue;
+                    }
+                    (None, _) => {
+                        scan += 4;
+                        continue;
+                    }
+                    (Some(tc_c), None) => {
+                        filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
+                        filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
+                        scan += 4;
+                        continue;
                     }
                 }
             }

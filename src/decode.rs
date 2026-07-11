@@ -70,6 +70,23 @@ struct SaoCtb {
     eo_class: [u8; 3],
 }
 
+#[inline]
+fn sao_offset_abs_max(bit_depth: u8) -> i32 {
+    (1i32 << (bit_depth.min(10) - 5)) - 1
+}
+
+#[inline]
+fn sao_offset_scale_is_valid(bit_depth: u8, log2_scale: u32) -> bool {
+    log2_scale <= u32::from(bit_depth.saturating_sub(10))
+}
+
+#[inline]
+fn scale_sao_offsets(offsets: &mut [i32; 4], log2_scale: u32) {
+    for offset in offsets {
+        *offset <<= log2_scale;
+    }
+}
+
 /// Per-slice deblocking parameters, captured for each independent slice so the
 /// single post-picture deblocking pass can apply the correct values per edge
 /// (§7.4.7.1, §8.7.2). Slice indices start at 1; owner 0 aliases slice 1
@@ -252,7 +269,8 @@ pub(crate) struct FullDecoder<'cab> {
     /// Pre-allocated scratch memory reused every TU to avoid per-block
     /// heap allocations on the hot path (~4–6 allocs per TU eliminated).
     scratch: intra::IntraScratch,
-    /// Dequantised coefficient scratch (max 32×32 = 1024 values, clamped to ±32768 → i32)
+    /// Dequantised coefficient scratch (max 32×32 = 1024 values). RExt extended
+    /// precision can require up to ±2^(BitDepth+6), so storage remains i32.
     deq_scratch: Box<[i32; 1024]>,
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
     res_scratch: Box<[i32; 1024]>,
@@ -352,6 +370,20 @@ impl FullDecoder<'static> {
         match sps.bit_depth_chroma {
             8 | 10 | 12 => {}
             n => return Err(DecodeError::UnsupportedBitDepth(n)),
+        }
+        if !sao_offset_scale_is_valid(sps.bit_depth_luma, pps.log2_sao_offset_scale_luma) {
+            return Err(DecodeError::Bitstream(format!(
+                "log2_sao_offset_scale_luma {} exceeds bit-depth limit {}",
+                pps.log2_sao_offset_scale_luma,
+                sps.bit_depth_luma.saturating_sub(10)
+            )));
+        }
+        if !sao_offset_scale_is_valid(sps.bit_depth_chroma, pps.log2_sao_offset_scale_chroma) {
+            return Err(DecodeError::Bitstream(format!(
+                "log2_sao_offset_scale_chroma {} exceeds bit-depth limit {}",
+                pps.log2_sao_offset_scale_chroma,
+                sps.bit_depth_chroma.saturating_sub(10)
+            )));
         }
 
         let slice_qp = clamp_qpy(hdr_slice_qp, sps.bit_depth_luma);
@@ -1102,14 +1134,12 @@ impl<'cab> FullDecoder<'cab> {
         // available.
         let seek = |dec: &mut Self, substream: usize| {
             let mut seeked = false;
-            if let Some((cabac, _)) = cabac_and_starts {
-                if let Some(&off) = sub_starts.get(substream) {
-                    if off <= cabac.len() {
-                        if dec.cab.reset_with(&cabac[off..]).is_ok() {
-                            seeked = true;
-                        }
-                    }
-                }
+            if let Some((cabac, _)) = cabac_and_starts
+                && let Some(&off) = sub_starts.get(substream)
+                && off <= cabac.len()
+                && dec.cab.reset_with(&cabac[off..]).is_ok()
+            {
+                seeked = true;
             }
             if !seeked {
                 dec.cab.reinit_engine();
@@ -1150,20 +1180,20 @@ impl<'cab> FullDecoder<'cab> {
                         && (self.cur_slice_idx <= 1
                             || self.slice_idx_at((rx + 1) * ctb, (ry - 1) * ctb)
                                 == self.cur_slice_idx);
-                    if ur_ok {
-                        if let (Some(ctx), Some(ictx)) = (
+                    if ur_ok
+                        && let (Some(ctx), Some(ictx)) = (
                             self.wpp_ctx_snap[ry - 1].clone(),
                             self.wpp_ictx_snap[ry - 1],
-                        ) {
-                            self.ctx = ctx;
-                            self.ictx = ictx;
-                            // Palette predictor is part of the WPP sync state.
-                            if let Some(pal) = self.wpp_palette_snap[ry - 1].clone() {
-                                self.palette_predictor = pal;
-                            }
-                            if let Some(pc) = self.wpp_pctx_snap[ry - 1] {
-                                self.pctx = pc;
-                            }
+                        )
+                    {
+                        self.ctx = ctx;
+                        self.ictx = ictx;
+                        // Palette predictor is part of the WPP sync state.
+                        if let Some(pal) = self.wpp_palette_snap[ry - 1].clone() {
+                            self.palette_predictor = pal;
+                        }
+                        if let Some(pc) = self.wpp_pctx_snap[ry - 1] {
+                            self.pctx = pc;
                         }
                     }
                 }
@@ -1386,7 +1416,6 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             3
         };
-        let cmax = (1i32 << (self.bd.min(10) - 5)) - 1;
         for c in 0..ncomp {
             let enabled = if c == 0 {
                 self.sao_luma
@@ -1414,7 +1443,15 @@ impl<'cab> FullDecoder<'cab> {
             if type_idx == 0 {
                 continue;
             }
-            // 4 offset magnitudes (TR, bypass, cMax)
+            let (bit_depth, log2_offset_scale) = if c == 0 {
+                (self.bd, self.pps.log2_sao_offset_scale_luma)
+            } else {
+                (self.bd_c, self.pps.log2_sao_offset_scale_chroma)
+            };
+            let cmax = sao_offset_abs_max(bit_depth);
+            // 4 offset magnitudes (TR, bypass, cMax). The syntax magnitude
+            // limit is component-specific; RExt then scales the signed values
+            // into the component's reconstructed-sample domain.
             let mut absv = [0i32; 4];
             for v in absv.iter_mut() {
                 let mut m = 0;
@@ -1449,6 +1486,7 @@ impl<'cab> FullDecoder<'cab> {
                     s.eo_class[2] = s.eo_class[1];
                 }
             }
+            scale_sao_offsets(&mut absv, log2_offset_scale);
             s.offsets[c] = absv;
         }
         self.sao[idx] = s;
@@ -1575,14 +1613,14 @@ impl<'cab> FullDecoder<'cab> {
         }
         // Cross-tile filtering: if disabled and the two sides are in different
         // tiles, do not filter.
-        if let Some(g) = &self.tiles {
-            if !g.loop_filter_across_tiles {
-                let ctb = self.log2_ctb;
-                let tp = g.tile_id_at(pxp >> ctb, pyp >> ctb);
-                let tq = g.tile_id_at(pxq >> ctb, pyq >> ctb);
-                if tp != tq {
-                    return false;
-                }
+        if let Some(g) = &self.tiles
+            && !g.loop_filter_across_tiles
+        {
+            let ctb = self.log2_ctb;
+            let tp = g.tile_id_at(pxp >> ctb, pyp >> ctb);
+            let tq = g.tile_id_at(pxq >> ctb, pyq >> ctb);
+            if tp != tq {
+                return false;
             }
         }
         true
@@ -1988,10 +2026,10 @@ impl<'cab> FullDecoder<'cab> {
         if !self.pps.loop_filter_across_slices {
             return true;
         }
-        if let Some(g) = &self.tiles {
-            if !g.loop_filter_across_tiles {
-                return true;
-            }
+        if let Some(g) = &self.tiles
+            && !g.loop_filter_across_tiles
+        {
+            return true;
         }
         if self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b) {
             return true;
@@ -2226,31 +2264,23 @@ impl<'cab> FullDecoder<'cab> {
 
     fn split_cu_ctx(&self, x0: usize, y0: usize, depth: u8) -> usize {
         let mut inc = 0;
-        if x0 >= 4 {
-            if self.same_tile(x0 - 1, y0) {
-                if self.same_slice(x0 - 1, y0) {
-                    if let Some(g) = self.grid_idx(x0 - 1, y0) {
-                        if self.decoded[g] {
-                            if self.ct_depth[g] as usize > depth as usize {
-                                inc += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        if x0 >= 4
+            && self.same_tile(x0 - 1, y0)
+            && self.same_slice(x0 - 1, y0)
+            && let Some(g) = self.grid_idx(x0 - 1, y0)
+            && self.decoded[g]
+            && self.ct_depth[g] as usize > depth as usize
+        {
+            inc += 1;
         }
-        if y0 >= 4 {
-            if self.same_tile(x0, y0 - 1) {
-                if self.same_slice(x0, y0 - 1) {
-                    if let Some(g) = self.grid_idx(x0, y0 - 1) {
-                        if self.decoded[g] {
-                            if self.ct_depth[g] as usize > depth as usize {
-                                inc += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        if y0 >= 4
+            && self.same_tile(x0, y0 - 1)
+            && self.same_slice(x0, y0 - 1)
+            && let Some(g) = self.grid_idx(x0, y0 - 1)
+            && self.decoded[g]
+            && self.ct_depth[g] as usize > depth as usize
+        {
+            inc += 1;
         }
         inc
     }
@@ -2258,12 +2288,11 @@ impl<'cab> FullDecoder<'cab> {
     fn set_ct_depth(&mut self, x0: usize, y0: usize, size: usize, depth: u8) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w {
-                    if yy < self.h {
-                        if let Some(g) = self.grid_idx(xx, yy) {
-                            self.ct_depth[g] = depth;
-                        }
-                    }
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.ct_depth[g] = depth;
                 }
             }
         }
@@ -2537,12 +2566,11 @@ impl<'cab> FullDecoder<'cab> {
     fn set_pcm(&mut self, x0: usize, y0: usize, size: usize) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w {
-                    if yy < self.h {
-                        if let Some(g) = self.grid_idx(xx, yy) {
-                            self.pcm[g] = true;
-                        }
-                    }
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.pcm[g] = true;
                 }
             }
         }
@@ -2813,12 +2841,11 @@ impl<'cab> FullDecoder<'cab> {
         let qp = clamp_qpy(qp, self.bd) as i16;
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w {
-                    if yy < self.h {
-                        if let Some(g) = self.grid_idx(xx, yy) {
-                            self.qp_y_map[g] = qp;
-                        }
-                    }
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.qp_y_map[g] = qp;
                 }
             }
         }
@@ -2827,12 +2854,11 @@ impl<'cab> FullDecoder<'cab> {
     fn set_mode(&mut self, x0: usize, y0: usize, size: usize, mode: u8) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w {
-                    if yy < self.h {
-                        if let Some(g) = self.grid_idx(xx, yy) {
-                            self.mode_y[g] = mode;
-                        }
-                    }
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.mode_y[g] = mode;
                 }
             }
         }
@@ -2843,17 +2869,16 @@ impl<'cab> FullDecoder<'cab> {
         let s = self.cur_slice_idx;
         for yy in (y0..y0 + height).step_by(4) {
             for xx in (x0..x0 + width).step_by(4) {
-                if xx < self.w {
-                    if yy < self.h {
-                        if let Some(g) = self.grid_idx(xx, yy) {
-                            self.decoded[g] = true;
-                            // Keep ownership in lock-step for alternate/PU-granular
-                            // decode paths too. The normal CTB path has already pre-tagged
-                            // the whole CTB before parsing any CU syntax.
-                            if mark_slice {
-                                self.slice_idx[g] = s;
-                            }
-                        }
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.decoded[g] = true;
+                    // Keep ownership in lock-step for alternate/PU-granular
+                    // decode paths too. The normal CTB path has already pre-tagged
+                    // the whole CTB before parsing any CU syntax.
+                    if mark_slice {
+                        self.slice_idx[g] = s;
                     }
                 }
             }
@@ -2868,12 +2893,11 @@ impl<'cab> FullDecoder<'cab> {
     fn set_tqb(&mut self, x0: usize, y0: usize, size: usize) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w {
-                    if yy < self.h {
-                        if let Some(g) = self.grid_idx(xx, yy) {
-                            self.tqb[g] = true;
-                        }
-                    }
+                if xx < self.w
+                    && yy < self.h
+                    && let Some(g) = self.grid_idx(xx, yy)
+                {
+                    self.tqb[g] = true;
                 }
             }
         }
@@ -3470,6 +3494,8 @@ impl<'cab> FullDecoder<'cab> {
             self.sps.scaling_list.as_ref(),
             component,
             n,
+            self.cur_cu_inter,
+            transform_skip,
         );
 
         let exec = &self.exec;
@@ -3480,6 +3506,7 @@ impl<'cab> FullDecoder<'cab> {
                 n,
                 qp_prime_c,
                 bd,
+                self.sps.extended_precision_processing,
                 max_abs_level,
                 scaling,
                 out,
@@ -3493,14 +3520,29 @@ impl<'cab> FullDecoder<'cab> {
                 n,
                 qp_prime_c,
                 bd,
+                self.sps.extended_precision_processing,
                 max_abs_level,
                 scaling,
                 &mut deq[..n * n],
             );
             if n == 4 && is_luma && !self.cur_cu_inter {
-                (exec.inv_transform_dst4)(&deq[..n * n], bd, out);
+                inverse_transform_dst4_into_i32(
+                    exec,
+                    &deq[..n * n],
+                    bd,
+                    self.sps.extended_precision_processing,
+                    out,
+                );
             } else {
-                (exec.inv_transform)(&deq[..n * n], n, bd, n, out);
+                inverse_transform_into_i32(
+                    exec,
+                    &deq[..n * n],
+                    n,
+                    bd,
+                    n,
+                    self.sps.extended_precision_processing,
+                    out,
+                );
             }
         }
         self.coeff_scratch = coeffs;
@@ -3517,14 +3559,13 @@ impl<'cab> FullDecoder<'cab> {
         let valid_w = self.w.saturating_sub(x0).min(n);
         let valid_h = self.h.saturating_sub(y0).min(n);
         let pred = &self.scratch.pred[..n * n];
-        if valid_w != 0 {
-            if valid_h != 0 {
-                if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
-                    add_residual_into_i32(
-                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
-                    );
-                }
-            }
+        if valid_w != 0
+            && valid_h != 0
+            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+        {
+            add_residual_into_i32(
+                &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+            );
         }
     }
 
@@ -3552,14 +3593,13 @@ impl<'cab> FullDecoder<'cab> {
         let valid_h = self.ch.saturating_sub(y0).min(n);
         let pred = &self.scratch.pred[..n * n];
         let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-        if valid_w != 0 {
-            if valid_h != 0 {
-                if let Some(dst) = plane_tail_mut(plane, stride, x0, y0) {
-                    add_residual_into_i32(
-                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
-                    );
-                }
-            }
+        if valid_w != 0
+            && valid_h != 0
+            && let Some(dst) = plane_tail_mut(plane, stride, x0, y0)
+        {
+            add_residual_into_i32(
+                &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+            );
         }
     }
 
@@ -3655,8 +3695,8 @@ impl<'cab> FullDecoder<'cab> {
         for (k, &r) in reused.iter().enumerate() {
             if r {
                 let mut e = [0u16; crate::palette::MAX_COMPONENTS];
-                for c in 0..num_comps {
-                    e[c] = self.palette_predictor.entries[c][k];
+                for (c, dst) in e[..num_comps].iter_mut().enumerate() {
+                    *dst = self.palette_predictor.entries[c][k];
                 }
                 palette.push(e);
             }
@@ -3674,8 +3714,8 @@ impl<'cab> FullDecoder<'cab> {
             } else {
                 self.bd_c as u32
             };
-            for j in 0..num_signalled {
-                palette[new_start + j][c] = self.cab.decode_bypass_bits(nbits) as u16;
+            for dst in palette[new_start..new_start + num_signalled].iter_mut() {
+                dst[c] = self.cab.decode_bypass_bits(nbits) as u16;
             }
         }
 
@@ -3738,6 +3778,7 @@ impl<'cab> FullDecoder<'cab> {
         let mut escapes = vec![[0u16; crate::palette::MAX_COMPONENTS]; size * size];
         if escape_present {
             let (qp_y, qp_cb, qp_cr) = self.palette_escape_qps();
+            #[allow(clippy::needless_range_loop)]
             for c in 0..num_comps {
                 let (qp, bd) = match c {
                     0 => (qp_y, self.bd),
@@ -4175,10 +4216,10 @@ impl<'cab> FullDecoder<'cab> {
         if self.tiles.is_none() && self.cur_slice_idx <= 1 {
             return true;
         }
-        if let Some(g) = &self.tiles {
-            if g.tile_id_at(nrx, nry) != g.tile_id_at(rx, ry) {
-                return false;
-            }
+        if let Some(g) = &self.tiles
+            && g.tile_id_at(nrx, nry) != g.tile_id_at(rx, ry)
+        {
+            return false;
         }
         // Same slice: the neighbor must belong to the slice currently being
         // decoded. Multi-slice CTBs are pre-tagged before SAO/CU syntax; with a
@@ -4399,7 +4440,7 @@ impl<'cab> FullDecoder<'cab> {
         let valid_h = self.h.saturating_sub(y0).min(n);
 
         // 8-bit depth: residuals fit i16, halving memory traffic and widening SIMD.
-        if self.bd <= 8 {
+        if self.bd <= 8 && !self.sps.extended_precision_processing {
             if self.cu_tqb {
                 (self.exec.narrow_i32_to_i16)(levels, &mut self.res_scratch16[..n * n]);
                 apply_rext_residual_ops(&mut self.res_scratch16[..n * n], n, rext_rot, rext_rdpcm);
@@ -4410,6 +4451,8 @@ impl<'cab> FullDecoder<'cab> {
                     self.sps.scaling_list.as_ref(),
                     0,
                     n,
+                    self.cur_cu_inter,
+                    transform_skip,
                 );
                 if transform_skip {
                     dequantize_transform_skip_scaled_into_i16(
@@ -4466,14 +4509,13 @@ impl<'cab> FullDecoder<'cab> {
             }
             let pred = &self.scratch.pred[..n * n];
             let res = &self.res_scratch16[..n * n];
-            if valid_w != 0 {
-                if valid_h != 0 {
-                    if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
-                        add_residual_into_i16(
-                            &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
-                        );
-                    }
-                }
+            if valid_w != 0
+                && valid_h != 0
+                && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+            {
+                add_residual_into_i16(
+                    &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+                );
             }
             self.mark_decoded(x0, y0, n);
             return;
@@ -4491,6 +4533,8 @@ impl<'cab> FullDecoder<'cab> {
                 self.sps.scaling_list.as_ref(),
                 0,
                 n,
+                self.cur_cu_inter,
+                transform_skip,
             );
             if transform_skip {
                 dequantize_transform_skip_scaled_into_i32(
@@ -4499,6 +4543,7 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime_y,
                     self.bd,
+                    self.sps.extended_precision_processing,
                     max_abs_level,
                     scaling,
                     &mut self.res_scratch[..n * n],
@@ -4511,22 +4556,27 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime_y,
                     self.bd,
+                    self.sps.extended_precision_processing,
                     max_abs_level,
                     scaling,
                     &mut self.deq_scratch[..n * n],
                 );
                 if n == 4 && !self.cur_cu_inter {
-                    (self.exec.inv_transform_dst4)(
+                    inverse_transform_dst4_into_i32(
+                        &self.exec,
                         &self.deq_scratch[..n * n],
                         self.bd,
+                        self.sps.extended_precision_processing,
                         &mut self.res_scratch[..n * n],
                     );
                 } else {
-                    (self.exec.inv_transform)(
+                    inverse_transform_into_i32(
+                        &self.exec,
                         &self.deq_scratch[..n * n],
                         n,
                         self.bd,
                         nx,
+                        self.sps.extended_precision_processing,
                         &mut self.res_scratch[..n * n],
                     );
                 }
@@ -4537,14 +4587,13 @@ impl<'cab> FullDecoder<'cab> {
         }
         let pred = &self.scratch.pred[..n * n];
         let res = &self.res_scratch[..n * n];
-        if valid_w != 0 {
-            if valid_h != 0 {
-                if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
-                    add_residual_into_i32(
-                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
-                    );
-                }
-            }
+        if valid_w != 0
+            && valid_h != 0
+            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+        {
+            add_residual_into_i32(
+                &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+            );
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -4556,12 +4605,11 @@ impl<'cab> FullDecoder<'cab> {
         let stride = self.w;
         let valid_w = self.w.saturating_sub(x0).min(n);
         let valid_h = self.h.saturating_sub(y0).min(n);
-        if valid_w != 0 {
-            if valid_h != 0 {
-                if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
-                    copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
-                }
-            }
+        if valid_w != 0
+            && valid_h != 0
+            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
+        {
+            copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -4623,6 +4671,7 @@ impl<'cab> FullDecoder<'cab> {
             n,
             mode,
             true,
+            !self.sps.intra_smoothing_disabled,
             strong,
             self.bd,
             &mut sc.fa,
@@ -4646,6 +4695,7 @@ impl<'cab> FullDecoder<'cab> {
         self.scratch.raw_left = left;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_chroma(
         &mut self,
         lx: usize,
@@ -4885,7 +4935,8 @@ impl<'cab> FullDecoder<'cab> {
                 &sc.left[..2 * n + 1],
                 n,
                 mode,
-                true,  // apply the luma [1 2 1] filtering decision
+                true, // apply the luma [1 2 1] filtering decision
+                !self.sps.intra_smoothing_disabled,
                 false, // no strong intra smoothing for chroma
                 self.bd_c,
                 &mut sc.fa,
@@ -4945,13 +4996,15 @@ impl<'cab> FullDecoder<'cab> {
             self.sps.scaling_list.as_ref(),
             component,
             n,
+            self.cur_cu_inter,
+            transform_skip,
         );
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
         // Cross-component prediction can grow an otherwise 8-bit residual
         // beyond i16, so retain the i16 fast path only when no scaling is used.
-        if self.bd_c <= 8 && res_scale == 0 {
+        if self.bd_c <= 8 && res_scale == 0 && !self.sps.extended_precision_processing {
             if self.cu_tqb {
                 (self.exec.narrow_i32_to_i16)(levels, &mut self.res_scratch16[..n2]);
                 apply_rext_residual_ops(&mut self.res_scratch16[..n2], n, rext_rot, rext_rdpcm);
@@ -5012,6 +5065,7 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime,
                     self.bd_c,
+                    self.sps.extended_precision_processing,
                     max_abs_level,
                     scaling,
                     &mut self.res_scratch[..n2],
@@ -5024,15 +5078,18 @@ impl<'cab> FullDecoder<'cab> {
                     n,
                     qp_prime,
                     self.bd_c,
+                    self.sps.extended_precision_processing,
                     max_abs_level,
                     scaling,
                     &mut self.deq_scratch[..n2],
                 );
-                (self.exec.inv_transform)(
+                inverse_transform_into_i32(
+                    &self.exec,
                     &self.deq_scratch[..n2],
                     n,
                     self.bd_c,
                     nx,
+                    self.sps.extended_precision_processing,
                     &mut self.res_scratch[..n2],
                 );
             }
@@ -5509,12 +5566,25 @@ fn scaling_matrix_from_lists<'a>(
     sps_scaling_list: Option<&'a ScalingList>,
     component: usize,
     n: usize,
+    is_inter: bool,
+    transform_skip: bool,
 ) -> Option<transform::ScalingMatrix<'a>> {
+    // HM getUseScalingList(): scaling lists apply to transform skip only for
+    // 4x4 TUs. RExt permits larger transform-skip blocks, but those use the
+    // neutral inverse-quantisation scale rather than the signalled 8x8/16x16/
+    // 32x32 matrices.
+    if transform_skip && n != 4 {
+        return None;
+    }
+
     let lists = pps_scaling_list.or(sps_scaling_list)?;
     let size_id = (n as u32).trailing_zeros().saturating_sub(2) as usize;
-    let matrix_id = component.min(2);
-    let (coeffs, dc, flat_16) = lists.matrix(size_id, matrix_id);
-    Some(transform::ScalingMatrix::new(coeffs, dc, n, flat_16))
+    // Scaling-list IDs are [Intra Y, Cb, Cr, Inter Y, Cb, Cr].
+    let matrix_id = component.min(2) + usize::from(is_inter) * 3;
+    let (coeffs, dc, flat_16, max_coeff) = lists.matrix(size_id, matrix_id);
+    Some(transform::ScalingMatrix::new_with_max(
+        coeffs, dc, n, flat_16, max_coeff,
+    ))
 }
 
 #[inline]
@@ -5525,11 +5595,26 @@ fn dequantize_scaled_into_i32(
     n: usize,
     qp_prime: i32,
     bit_depth: u8,
+    extended_precision: bool,
     max_abs_level: i32,
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i32],
 ) {
-    let params = transform::dequant_params(n, qp_prime, bit_depth);
+    let params = transform::dequant_params(n, qp_prime, bit_depth, extended_precision);
+    if extended_precision {
+        match scaling {
+            Some(scaling) if !scaling.is_flat_16() => transform::dequantize_scaled_into_scalar_i32(
+                levels,
+                n,
+                params,
+                scaling,
+                max_abs_level,
+                out,
+            ),
+            _ => transform::dequantize_into_scalar_i32(levels, n, params, max_abs_level, out),
+        }
+        return;
+    }
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
             (exec.dequant_scaled)(levels, n, params, scaling, max_abs_level, out)
@@ -5550,7 +5635,7 @@ fn dequantize_scaled_into_i16(
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i16],
 ) {
-    let params = transform::dequant_params(n, qp_prime, bit_depth);
+    let params = transform::dequant_params(n, qp_prime, bit_depth, false);
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
             (exec.dequant_scaled16)(levels, n, params, scaling, max_abs_level, out)
@@ -5567,15 +5652,34 @@ fn dequantize_transform_skip_scaled_into_i32(
     n: usize,
     qp_prime: i32,
     bit_depth: u8,
+    extended_precision: bool,
     max_abs_level: i32,
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i32],
 ) {
-    debug_assert!(
-        n == 4,
-        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
-    );
-    let params = transform::transform_skip_params(n, qp_prime, bit_depth);
+    let params = transform::transform_skip_params(n, qp_prime, bit_depth, extended_precision);
+    if extended_precision {
+        match scaling {
+            Some(scaling) if !scaling.is_flat_16() => {
+                transform::dequantize_transform_skip_scaled_into_scalar_i32(
+                    levels,
+                    n,
+                    params,
+                    scaling,
+                    max_abs_level,
+                    out,
+                )
+            }
+            _ => transform::dequantize_transform_skip_into_scalar_i32(
+                levels,
+                n,
+                params,
+                max_abs_level,
+                out,
+            ),
+        }
+        return;
+    }
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
             (exec.dequant_skip_scaled)(levels, n, params, scaling, max_abs_level, out)
@@ -5596,16 +5700,44 @@ fn dequantize_transform_skip_scaled_into_i16(
     scaling: Option<transform::ScalingMatrix<'_>>,
     out: &mut [i16],
 ) {
-    debug_assert!(
-        n == 4,
-        "HEVC transform_skip_flag is only signalled for 4x4 TUs"
-    );
-    let params = transform::transform_skip_params(n, qp_prime, bit_depth);
+    let params = transform::transform_skip_params(n, qp_prime, bit_depth, false);
     match scaling {
         Some(scaling) if !scaling.is_flat_16() => {
             (exec.dequant_skip_scaled16)(levels, n, params, scaling, max_abs_level, out)
         }
         _ => (exec.dequant_skip16)(levels, n, params, max_abs_level, out),
+    }
+}
+
+#[inline]
+fn inverse_transform_into_i32(
+    exec: &ExecContext,
+    coeff: &[i32],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    extended_precision: bool,
+    out: &mut [i32],
+) {
+    if extended_precision {
+        transform::inv_transform_into_scalar_extended(coeff, n, bit_depth, nx, out);
+    } else {
+        (exec.inv_transform)(coeff, n, bit_depth, nx, out);
+    }
+}
+
+#[inline]
+fn inverse_transform_dst4_into_i32(
+    exec: &ExecContext,
+    coeff: &[i32],
+    bit_depth: u8,
+    extended_precision: bool,
+    out: &mut [i32],
+) {
+    if extended_precision {
+        transform::inv_transform_dst_into_scalar_extended(coeff, bit_depth, out);
+    } else {
+        (exec.inv_transform_dst4)(coeff, bit_depth, out);
     }
 }
 
@@ -5846,31 +5978,23 @@ impl<'cab> FullDecoder<'cab> {
         // §6.4.1 process: a left/above neighbor in a different slice or tile is
         // unavailable and must not contribute to the context increment.
         let mut inc = 0usize;
-        if x0 >= 4 {
-            if self.same_tile(x0 - 1, y0) {
-                if self.same_slice(x0 - 1, y0) {
-                    if let Some(g) = self.grid_idx(x0 - 1, y0) {
-                        if self.decoded[g] {
-                            if self.motion_is_skip(g) {
-                                inc += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        if x0 >= 4
+            && self.same_tile(x0 - 1, y0)
+            && self.same_slice(x0 - 1, y0)
+            && let Some(g) = self.grid_idx(x0 - 1, y0)
+            && self.decoded[g]
+            && self.motion_is_skip(g)
+        {
+            inc += 1;
         }
-        if y0 >= 4 {
-            if self.same_tile(x0, y0 - 1) {
-                if self.same_slice(x0, y0 - 1) {
-                    if let Some(g) = self.grid_idx(x0, y0 - 1) {
-                        if self.decoded[g] {
-                            if self.motion_is_skip(g) {
-                                inc += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        if y0 >= 4
+            && self.same_tile(x0, y0 - 1)
+            && self.same_slice(x0, y0 - 1)
+            && let Some(g) = self.grid_idx(x0, y0 - 1)
+            && self.decoded[g]
+            && self.motion_is_skip(g)
+        {
+            inc += 1;
         }
         self.cab.decode_bin(&mut self.ctx.cu_skip_flag[inc]) != 0
     }
@@ -5896,10 +6020,10 @@ impl<'cab> FullDecoder<'cab> {
         self.mark_motion_bs(x0, y0, w, h, &mi);
         for yy in (y0..y0 + h).step_by(4) {
             for xx in (x0..x0 + w).step_by(4) {
-                if let Some(g) = self.grid_idx(xx, yy) {
-                    if g < self.motion.len() {
-                        self.motion[g] = mi;
-                    }
+                if let Some(g) = self.grid_idx(xx, yy)
+                    && g < self.motion.len()
+                {
+                    self.motion[g] = mi;
                 }
             }
         }
@@ -5917,35 +6041,33 @@ impl<'cab> FullDecoder<'cab> {
     ) {
         let gw = self.grid_w;
         // Left edge at x0 (vertical boundary), on the 8×8 deblock grid.
-        if x0 > 0 && ((x0) % (8) == 0) {
+        if x0 > 0 && (x0).is_multiple_of(8) {
             let gx = x0 / 4;
             let mut yy = y0;
             while yy < (y0 + h).min(self.h) {
                 let g = (yy / 4) * gw + gx;
-                if let Some(gl) = self.grid_idx(x0 - 1, yy) {
-                    if self.motion_differs(gl, mi) {
-                        if self.bs_v[g] < 1 {
-                            self.bs_v[g] = 1;
-                            self.edge_v[g] = true;
-                        }
-                    }
+                if let Some(gl) = self.grid_idx(x0 - 1, yy)
+                    && self.motion_differs(gl, mi)
+                    && self.bs_v[g] < 1
+                {
+                    self.bs_v[g] = 1;
+                    self.edge_v[g] = true;
                 }
                 yy += 4;
             }
         }
         // Top edge at y0 (horizontal boundary).
-        if y0 > 0 && ((y0) % (8) == 0) {
+        if y0 > 0 && (y0).is_multiple_of(8) {
             let base = (y0 / 4) * gw;
             let mut xx = x0;
             while xx < (x0 + w).min(self.w) {
                 let g = base + xx / 4;
-                if let Some(gt) = self.grid_idx(xx, y0 - 1) {
-                    if self.motion_differs(gt, mi) {
-                        if self.bs_h[g] < 1 {
-                            self.bs_h[g] = 1;
-                            self.edge_h[g] = true;
-                        }
-                    }
+                if let Some(gt) = self.grid_idx(xx, y0 - 1)
+                    && self.motion_differs(gt, mi)
+                    && self.bs_h[g] < 1
+                {
+                    self.bs_h[g] = 1;
+                    self.edge_h[g] = true;
                 }
                 xx += 4;
             }
@@ -5976,10 +6098,10 @@ impl<'cab> FullDecoder<'cab> {
         self.mark_tu_edges(x0, y0, cb);
         for yy in (y0..y0 + cb).step_by(4) {
             for xx in (x0..x0 + cb).step_by(4) {
-                if let Some(g) = self.grid_idx(xx, yy) {
-                    if g < self.cu_skip_map.len() {
-                        self.cu_skip_map[g] = skip;
-                    }
+                if let Some(g) = self.grid_idx(xx, yy)
+                    && g < self.cu_skip_map.len()
+                {
+                    self.cu_skip_map[g] = skip;
                 }
             }
         }
@@ -6340,8 +6462,6 @@ impl<'cab> FullDecoder<'cab> {
             pu_y: py,
             pu_w: pw,
             pu_h: ph,
-            pb_span_w: _,
-            pb_span_h: _,
             ..
         } = geom;
         let cuh = cuw;
@@ -7364,7 +7484,7 @@ pub(crate) fn parse_slice_header_full(
             }
         }
         r.read_bit().map_err(|_| e("alignment_bit"))?;
-        while !((r.bit_pos()) % (8) == 0) {
+        while !(r.bit_pos()).is_multiple_of(8) {
             r.read_bit().map_err(|_| e("alignment_pad"))?;
         }
         return Ok(SliceHeader {
@@ -7622,6 +7742,7 @@ pub(crate) fn parse_slice_header_full(
                 !sps.chroma.is_monochrome(),
                 sps.bit_depth_luma,
                 sps.bit_depth_chroma,
+                sps.high_precision_offsets_enabled,
                 [&mask0, &mask1],
             )?);
         }
@@ -7707,7 +7828,7 @@ pub(crate) fn parse_slice_header_full(
         }
     }
     r.read_bit().map_err(|_| e("alignment_bit"))?;
-    while !((r.bit_pos()) % (8) == 0) {
+    while !(r.bit_pos()).is_multiple_of(8) {
         r.read_bit().map_err(|_| e("alignment_pad"))?;
     }
     Ok(SliceHeader {
@@ -7772,8 +7893,10 @@ mod tests {
     use super::{
         ceil_log2, clamp_qpy, combine_mvp_mvd, derive_qpy_from_delta, fill_slice_owner_rect,
         inter_motion_differs, load_plane_block_clipped, peek_slice_pps_id,
-        promote_first_slice_owners, qp_prime, qpc, qpy_min,
+        promote_first_slice_owners, qp_prime, qpc, qpy_min, sao_offset_abs_max,
+        sao_offset_scale_is_valid, scale_sao_offsets, scaling_matrix_from_lists,
     };
+    use crate::config::ScalingList;
     use crate::inter::{MotionInfo, Mv, PredFlags};
 
     // Build a slice-header prefix: 2-byte NAL header, first_slice flag,
@@ -7830,6 +7953,43 @@ mod tests {
         assert_eq!(ceil_log2(1023), 10);
         assert_eq!(ceil_log2(1024), 10);
         assert_eq!(ceil_log2(1025), 11);
+    }
+
+    #[test]
+    fn scaling_list_selection_uses_prediction_mode_and_ts_size() {
+        let lists = ScalingList::test_constant_lists([10, 20, 30, 40, 50, 60]);
+
+        let intra_cb = scaling_matrix_from_lists(None, Some(&lists), 1, 8, false, false).unwrap();
+        let inter_cb = scaling_matrix_from_lists(None, Some(&lists), 1, 8, true, false).unwrap();
+        assert_eq!(intra_cb.coeff(0), 20);
+        assert_eq!(inter_cb.coeff(0), 50);
+        assert_eq!(intra_cb.max_coeff(), 20);
+        assert_eq!(inter_cb.max_coeff(), 50);
+
+        assert!(scaling_matrix_from_lists(None, Some(&lists), 0, 4, false, true).is_some());
+        assert!(scaling_matrix_from_lists(None, Some(&lists), 0, 8, false, true).is_none());
+        assert!(scaling_matrix_from_lists(None, Some(&lists), 0, 32, true, true).is_none());
+    }
+
+    #[test]
+    fn sao_rext_offset_scaling_uses_component_bit_depth() {
+        assert_eq!(sao_offset_abs_max(8), 7);
+        assert_eq!(sao_offset_abs_max(10), 31);
+        assert_eq!(sao_offset_abs_max(12), 31);
+
+        let mut offsets = [31, -31, 1, -1];
+        scale_sao_offsets(&mut offsets, 2);
+        assert_eq!(offsets, [124, -124, 4, -4]);
+    }
+
+    #[test]
+    fn sao_rext_offset_scale_range_tracks_each_component() {
+        assert!(sao_offset_scale_is_valid(8, 0));
+        assert!(!sao_offset_scale_is_valid(8, 1));
+        assert!(sao_offset_scale_is_valid(10, 0));
+        assert!(!sao_offset_scale_is_valid(10, 1));
+        assert!(sao_offset_scale_is_valid(12, 2));
+        assert!(!sao_offset_scale_is_valid(12, 3));
     }
 
     #[test]

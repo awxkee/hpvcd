@@ -46,25 +46,21 @@ fn mul_i32_safe_from_max(max_abs_level: i32, params: DequantParams) -> bool {
         return false;
     }
     let limit = ((i32::MAX as i64 - params.add) / params.factor).max(0);
-    i64::from(max_abs_level) <= limit
+    params.clipped_max_abs(max_abs_level) <= limit
 }
 
 #[inline]
-fn scaled_mul_i32_safe_from_max(
-    max_abs_level: i32,
-    params: DequantParams,
-    scaling: ScalingMatrix<'_>,
-) -> bool {
+fn scaled_mul_i32_safe_from_max(max_abs_level: i32, params: DequantParams, max_coeff: i64) -> bool {
     let base_factor = params.factor / 16;
     if base_factor <= 0 || params.add > i32::MAX as i64 {
         return false;
     }
-    let max_factor = base_factor * scaling.max_coeff();
+    let max_factor = base_factor * max_coeff;
     if max_factor <= 0 || max_factor > i32::MAX as i64 {
         return false;
     }
     let limit = ((i32::MAX as i64 - params.add) / max_factor).max(0);
-    i64::from(max_abs_level) <= limit
+    params.clipped_max_abs(max_abs_level) <= limit
 }
 
 #[inline]
@@ -73,9 +69,9 @@ fn neon_i64_factor_ok(params: DequantParams) -> bool {
 }
 
 #[inline]
-fn neon_scaled_i64_factor_ok(params: DequantParams, scaling: ScalingMatrix<'_>) -> bool {
+fn neon_scaled_i64_factor_ok(params: DequantParams, max_coeff: i64) -> bool {
     let base_factor = params.factor / 16;
-    base_factor > 0 && base_factor * scaling.max_coeff() <= i32::MAX as i64
+    base_factor > 0 && base_factor * max_coeff <= i32::MAX as i64
 }
 
 #[inline]
@@ -109,6 +105,14 @@ fn clip_i16_s32x4_with(v: int32x4_t, lo: int32x4_t, hi: int32x4_t) -> int32x4_t 
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn load_dequant_levels4(src: &[i32; 4], clip_lo: int32x4_t, clip_hi: int32x4_t) -> int32x4_t {
+    // HEVC clips the coefficient level before inverse quantisation. This is
+    // observable with scaling-list coefficients below the neutral value 16.
+    clip_i16_s32x4_with(load_i32x4(src), clip_lo, clip_hi)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn dequant4_neon_const(
     levels: &[i32; 4],
     factor: i32,
@@ -117,7 +121,7 @@ fn dequant4_neon_const(
     clip_lo: int32x4_t,
     clip_hi: int32x4_t,
 ) -> int32x4_t {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
 
     let lo = vshlq_s64(vaddq_s64(vmull_n_s32(vget_low_s32(v), factor), add), shift);
     let hi = vshlq_s64(vaddq_s64(vmull_n_s32(vget_high_s32(v), factor), add), shift);
@@ -138,7 +142,7 @@ fn dequant4_scaled_neon_const(
     clip_lo: int32x4_t,
     clip_hi: int32x4_t,
 ) -> int32x4_t {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let f = load_i32x4(factors);
 
     let lo = vshlq_s64(
@@ -166,7 +170,7 @@ fn dequant4_neon_i32_const(
     clip_lo: int32x4_t,
     clip_hi: int32x4_t,
 ) -> int32x4_t {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let v = vmulq_s32(v, factor);
     let v = vaddq_s32(v, add);
     clip_i16_s32x4_with(vshlq_s32(v, shift), clip_lo, clip_hi)
@@ -182,7 +186,7 @@ fn dequant4_scaled_neon_i32_const(
     clip_lo: int32x4_t,
     clip_hi: int32x4_t,
 ) -> int32x4_t {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let f = load_i32x4(factors);
     let v = vmulq_s32(v, f);
     let v = vaddq_s32(v, add);
@@ -1001,7 +1005,7 @@ pub(crate) fn dequantize_into_neon(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         crate::transform::dequantize_into_scalar_i32(levels, n, params, max_abs_level, out);
         return;
     }
@@ -1021,7 +1025,7 @@ pub(crate) fn dequantize_into_neon16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         crate::transform::dequantize_into_scalar_i16(levels, n, params, max_abs_level, out);
         return;
     }
@@ -1041,7 +1045,7 @@ pub(crate) fn dequantize_transform_skip_into_neon(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         crate::transform::dequantize_transform_skip_into_scalar_i32(
             levels,
             n,
@@ -1073,7 +1077,7 @@ pub(crate) fn dequantize_transform_skip_into_neon16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         crate::transform::dequantize_transform_skip_into_scalar_i16(
             levels,
             n,
@@ -1106,13 +1110,14 @@ pub(crate) fn dequantize_scaled_into_neon(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
         return;
     }
-    if scaled_mul_i32_safe_from_max(max_abs_level, params, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mul_i32_safe_from_max(max_abs_level, params, max_coeff) {
         unsafe { dequantize_scaled_into_neon_i32_impl(levels, n, params, scaling, out) }
-    } else if neon_scaled_i64_factor_ok(params, scaling) {
+    } else if neon_scaled_i64_factor_ok(params, max_coeff) {
         unsafe { dequantize_scaled_into_neon_impl(levels, n, params, scaling, out) }
     } else {
         dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
@@ -1127,13 +1132,14 @@ pub(crate) fn dequantize_scaled_into_neon16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
         return;
     }
-    if scaled_mul_i32_safe_from_max(max_abs_level, params, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mul_i32_safe_from_max(max_abs_level, params, max_coeff) {
         unsafe { dequantize_scaled_into_neon16_i32_impl(levels, n, params, scaling, out) }
-    } else if neon_scaled_i64_factor_ok(params, scaling) {
+    } else if neon_scaled_i64_factor_ok(params, max_coeff) {
         unsafe { dequantize_scaled_into_neon16_impl(levels, n, params, scaling, out) }
     } else {
         dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
@@ -1148,7 +1154,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into_neon(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         dequantize_transform_skip_scaled_into_scalar_i32(
             levels,
             n,
@@ -1159,11 +1165,12 @@ pub(crate) fn dequantize_transform_skip_scaled_into_neon(
         );
         return;
     }
-    if scaled_mul_i32_safe_from_max(max_abs_level, params.dequant, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mul_i32_safe_from_max(max_abs_level, params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_neon_i32_impl(levels, n, params, scaling, out)
         }
-    } else if neon_scaled_i64_factor_ok(params.dequant, scaling) {
+    } else if neon_scaled_i64_factor_ok(params.dequant, max_coeff) {
         unsafe { dequantize_transform_skip_scaled_into_neon_impl(levels, n, params, scaling, out) }
     } else {
         dequantize_transform_skip_scaled_into_scalar_i32(
@@ -1185,7 +1192,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into_neon16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         dequantize_transform_skip_scaled_into_scalar_i16(
             levels,
             n,
@@ -1196,11 +1203,12 @@ pub(crate) fn dequantize_transform_skip_scaled_into_neon16(
         );
         return;
     }
-    if scaled_mul_i32_safe_from_max(max_abs_level, params.dequant, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mul_i32_safe_from_max(max_abs_level, params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_neon16_i32_impl(levels, n, params, scaling, out)
         }
-    } else if neon_scaled_i64_factor_ok(params.dequant, scaling) {
+    } else if neon_scaled_i64_factor_ok(params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_neon16_impl(levels, n, params, scaling, out)
         }

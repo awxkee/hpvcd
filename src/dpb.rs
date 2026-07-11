@@ -224,6 +224,7 @@ impl Dpb {
 
     /// Build RefPicList0/1 (§8.3.4) from the marked references. `list_mod_*` are
     /// the explicit reorder indices (empty = default order).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_ref_lists(
         &self,
         pocs: &RpsPocs,
@@ -302,10 +303,12 @@ impl Dpb {
         let mut list0 = finalize_list(&temp0, num_l0, list_mod_l0)?;
         // With implicit L0 ordering and more temp entries than active entries,
         // SCC forces the current picture into the final active L0 slot (8-9).
-        if let Some(curr) = current {
-            if list_mod_l0.is_empty() && num_l0 != 0 && temp0.len() > num_l0 {
-                list0[num_l0 - 1] = curr;
-            }
+        if let Some(curr) = current
+            && list_mod_l0.is_empty()
+            && num_l0 != 0
+            && temp0.len() > num_l0
+        {
+            list0[num_l0 - 1] = curr;
         }
         let list1 = if is_b {
             finalize_list(&temp1, num_l1, list_mod_l1)?
@@ -333,7 +336,7 @@ impl Dpb {
             // Output the lowest-POC frame still needing output.
             let mut best: Option<usize> = None;
             for (i, f) in self.frames.iter().enumerate() {
-                if f.needed_for_output && best.map_or(true, |b| f.poc < self.frames[b].poc) {
+                if f.needed_for_output && best.is_none_or(|b| f.poc < self.frames[b].poc) {
                     best = Some(i);
                 }
             }

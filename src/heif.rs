@@ -485,30 +485,30 @@ fn parse_iprp(
                 });
             }
         }
-        if &b.fourcc == b"ipma" {
-            if let Some((_, _, rest)) = fullbox_header(b.payload) {
-                let entry_count = read_u32(rest, 0).unwrap_or(0);
-                let mut pos = 4usize;
-                for _ in 0..entry_count {
-                    if pos + 3 > rest.len() {
+        if &b.fourcc == b"ipma"
+            && let Some((_, _, rest)) = fullbox_header(b.payload)
+        {
+            let entry_count = read_u32(rest, 0).unwrap_or(0);
+            let mut pos = 4usize;
+            for _ in 0..entry_count {
+                if pos + 3 > rest.len() {
+                    break;
+                }
+                let item_id = read_u16(rest, pos).unwrap_or(0);
+                pos += 2;
+                let assoc_count = rest[pos] as usize;
+                pos += 1;
+                let mut indices = Vec::with_capacity(assoc_count);
+                for _ in 0..assoc_count {
+                    if pos >= rest.len() {
                         break;
                     }
-                    let item_id = read_u16(rest, pos).unwrap_or(0);
-                    pos += 2;
-                    let assoc_count = rest[pos] as usize;
+                    let raw = rest[pos];
                     pos += 1;
-                    let mut indices = Vec::with_capacity(assoc_count);
-                    for _ in 0..assoc_count {
-                        if pos >= rest.len() {
-                            break;
-                        }
-                        let raw = rest[pos];
-                        pos += 1;
-                        let idx = raw & 0x7F;
-                        indices.push(idx);
-                    }
-                    assoc.insert(item_id, indices);
+                    let idx = raw & 0x7F;
+                    indices.push(idx);
                 }
+                assoc.insert(item_id, indices);
             }
         }
     }

@@ -167,6 +167,16 @@ pub struct Cicp {
 }
 
 impl Cicp {
+    /// No CICP color description was signaled.
+    pub const fn unspecified() -> Self {
+        Self {
+            primaries: Primaries::Unspecified,
+            transfer: TransferFunction::Unspecified,
+            matrix: MatrixCoefficients::Unspecified,
+            full_range: false,
+        }
+    }
+
     pub const fn srgb() -> Self {
         Self {
             primaries: Primaries::Bt709,
@@ -206,7 +216,7 @@ impl Cicp {
 
 impl Default for Cicp {
     fn default() -> Self {
-        Self::srgb()
+        Self::unspecified()
     }
 }
 
@@ -266,6 +276,11 @@ mod tests {
         assert_eq!(e.primaries as u8, 9);
         assert_eq!(e.transfer as u8, 16);
         assert_eq!(e.matrix as u8, 9);
+    }
+
+    #[test]
+    fn default_cicp_is_not_falsely_signalled_as_bt709() {
+        assert_eq!(Cicp::default(), Cicp::unspecified());
     }
 
     #[test]

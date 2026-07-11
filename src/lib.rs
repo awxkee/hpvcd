@@ -1352,7 +1352,9 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -
     match o {
         Orientation::Normal => px.to_vec(),
         Orientation::Rotate180 => px
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .rev()
             .flat_map(|c| c.iter().copied())
             .collect(),
@@ -1360,9 +1362,11 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -
             let mut out = vec![T::default(); px.len()];
             for (src_row, dst_row) in px.chunks_exact(w * 3).zip(out.chunks_exact_mut(w * 3)) {
                 for (src, dst) in src_row
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .rev()
-                    .zip(dst_row.chunks_exact_mut(3))
+                    .zip(dst_row.as_chunks_mut::<3>().0.iter_mut())
                 {
                     dst.copy_from_slice(src);
                 }

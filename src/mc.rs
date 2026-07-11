@@ -626,6 +626,7 @@ pub(crate) fn bi_mc_scalar(
 }
 
 /// Explicit weighted uni-prediction motion-compensation write.
+/// `offset` is already expressed in reconstructed-sample units.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uni_mc_weighted_scalar(
     src: &[i16],
@@ -657,7 +658,6 @@ pub(crate) fn uni_mc_weighted_scalar(
     let log2_wd = log2_denom as i32 + shift1;
     let max = sample_max(bd);
     let round = if log2_wd >= 1 { 1 << (log2_wd - 1) } else { 0 };
-    let off = offset << (bd as i32 - 8);
     let src = &src[..pred_w * pred_h];
 
     for (src_row, dst_row) in src
@@ -667,9 +667,9 @@ pub(crate) fn uni_mc_weighted_scalar(
     {
         for (&s, out) in src_row.iter().zip(dst_row.iter_mut()).take(valid_w) {
             let v = if log2_wd >= 1 {
-                ((s as i32 * weight + round) >> log2_wd) + off
+                ((s as i32 * weight + round) >> log2_wd) + offset
             } else {
-                s as i32 * weight + off
+                s as i32 * weight + offset
             };
             *out = clip(v, max);
         }
@@ -677,6 +677,7 @@ pub(crate) fn uni_mc_weighted_scalar(
 }
 
 /// Explicit weighted bi-prediction motion-compensation write.
+/// `o0` and `o1` are already expressed in reconstructed-sample units.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bi_mc_weighted_scalar(
     s0: &[i16],
@@ -711,10 +712,7 @@ pub(crate) fn bi_mc_weighted_scalar(
     let shift1 = 14 - bd as i32;
     let log2_wd = log2_denom as i32 + shift1;
     let max = sample_max(bd);
-    let bd_off = bd as i32 - 8;
-    let o0 = o0 << bd_off;
-    let o1 = o1 << bd_off;
-    let rnd = ((o0 + o1 + 1) as i64) << log2_wd;
+    let rnd = (o0 as i64 + o1 as i64 + 1) << log2_wd;
     let s0 = &s0[..pred_w * pred_h];
     let s1 = &s1[..pred_w * pred_h];
 
@@ -733,5 +731,29 @@ pub(crate) fn bi_mc_weighted_scalar(
             let v = ((a as i64 * w0 as i64 + b as i64 * w1 as i64 + rnd) >> (log2_wd + 1)) as i32;
             *out = clip(v, max);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bi_mc_weighted_scalar, uni_mc_weighted_scalar};
+
+    #[test]
+    fn weighted_uni_consumes_sample_domain_offset() {
+        // Interpolation buffers use 14-bit internal precision. At 10-bit,
+        // sample 100 is represented as 100 << 4.
+        let src = [100i16 << 4];
+        let mut dst = [0u16; 1];
+        uni_mc_weighted_scalar(&src, 1, 1, 1, 1, 10, 1, 7, 0, &mut dst, 1);
+        assert_eq!(dst[0], 107);
+    }
+
+    #[test]
+    fn weighted_bi_consumes_sample_domain_offsets() {
+        let src0 = [100i16 << 4];
+        let src1 = [200i16 << 4];
+        let mut dst = [0u16; 1];
+        bi_mc_weighted_scalar(&src0, &src1, 1, 1, 1, 1, 10, 1, 7, 1, -3, 0, &mut dst, 1);
+        assert_eq!(dst[0], 152);
     }
 }

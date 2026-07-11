@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::color::Cicp;
+use crate::color::{Cicp, MatrixCoefficients};
 use crate::config::{Pps, Sps, parse_pps, parse_sps};
 use crate::decode::{FullDecoder, SliceHeader, parse_slice_header_full};
 use crate::demux::{Framing, Nal, detect_framing, for_each_nal, nal};
@@ -52,6 +52,7 @@ struct FrameMeta {
     chroma: ChromaFormat,
     bit_depth: BitDepth,
     color: Cicp,
+    color_description_present: bool,
     /// VUI frame-rate as time_scale / num_units_in_tick (0 = not signalled).
     time_scale: u32,
     num_units_in_tick: u32,
@@ -66,7 +67,8 @@ impl Default for FrameMeta {
             disp_h: 0,
             chroma: ChromaFormat::Yuv420,
             bit_depth: BitDepth::Eight,
-            color: Cicp::srgb(),
+            color: Cicp::unspecified(),
+            color_description_present: false,
             time_scale: 0,
             num_units_in_tick: 0,
         }
@@ -117,8 +119,31 @@ impl VideoFrame {
         self.frame_rate().map(|fps| self.poc as f64 / fps)
     }
 
+    /// Colour metadata from the active SPS VUI. Unsignalled code points are
+    /// returned as `Unspecified`, never fabricated as BT.709.
+    pub fn color(&self) -> Cicp {
+        self.meta.color
+    }
+
+    /// Complete CICP colour description, only when `colour_description_present_flag`
+    /// was set in the active SPS VUI.
+    pub fn signalled_color(&self) -> Option<Cicp> {
+        self.meta
+            .color_description_present
+            .then_some(self.meta.color)
+    }
+
     /// Convert to tightly-packed 8-bit interleaved RGB at the display size.
     pub fn to_rgb8(&self) -> Vec<u8> {
+        self.to_rgb8_with_color(self.meta.color)
+    }
+
+    /// Convert to RGB using an explicit colour description instead of the SPS VUI.
+    ///
+    /// This is needed for elementary/conformance streams that carry GBR component
+    /// planes but omit VUI colour signalling. For HEVC identity-matrix coding the
+    /// stored component order is G, B, R.
+    pub fn to_rgb8_with_color(&self, color: Cicp) -> Vec<u8> {
         let (dw, dh) = (self.meta.disp_w.max(1), self.meta.disp_h.max(1));
         let img = crate::yuv::yuv_to_rgb_window_with_color(
             &self.planes,
@@ -126,11 +151,11 @@ impl VideoFrame {
             dh,
             self.meta.crop_left,
             self.meta.crop_top,
-            &self.meta.color,
+            &color,
         );
         match img {
             ImageBuffer::Rgb8(v) => v,
-            ImageBuffer::Rgb16(v) => v.iter().map(|&s| (s >> (self.shift())) as u8).collect(),
+            ImageBuffer::Rgb16(v) => v.iter().map(|&s| (s >> self.shift()) as u8).collect(),
             ImageBuffer::Luma8(v) => v.iter().flat_map(|&g| [g, g, g]).collect(),
             ImageBuffer::Luma16(v) => v
                 .iter()
@@ -142,11 +167,40 @@ impl VideoFrame {
         }
     }
 
+    /// Interpret the decoded 4:4:4 component planes as full-range HEVC GBR.
+    ///
+    /// Use this for untagged HM/RExt RGB conformance streams. Tagged streams with
+    /// `matrix_coefficients == 0` are handled automatically by [`Self::to_rgb8`].
+    pub fn to_rgb8_gbr(&self) -> Vec<u8> {
+        let mut color = self.meta.color;
+        color.matrix = MatrixCoefficients::Identity;
+        color.full_range = true;
+        self.to_rgb8_with_color(color)
+    }
+
     /// Convert to 8-bit interleaved RGBA (opaque alpha) at the display size.
     pub fn to_rgba8(&self) -> Vec<u8> {
-        let rgb = self.to_rgb8();
+        Self::rgb_to_rgba(self.to_rgb8())
+    }
+
+    /// Convert to RGBA using an explicit colour description instead of the SPS VUI.
+    pub fn to_rgba8_with_color(&self, color: Cicp) -> Vec<u8> {
+        Self::rgb_to_rgba(self.to_rgb8_with_color(color))
+    }
+
+    /// Interpret the decoded component planes as full-range HEVC GBR and emit RGBA.
+    pub fn to_rgba8_gbr(&self) -> Vec<u8> {
+        Self::rgb_to_rgba(self.to_rgb8_gbr())
+    }
+
+    fn rgb_to_rgba(rgb: Vec<u8>) -> Vec<u8> {
         let mut out = vec![0u8; (rgb.len() / 3) * 4];
-        for (dst, px) in out.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
+        for (dst, px) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(rgb.as_chunks::<3>().0.iter())
+        {
             dst[0] = px[0];
             dst[1] = px[1];
             dst[2] = px[2];
@@ -641,10 +695,10 @@ impl VideoDecoder {
         // Fast path: the target's GOP is (partly) decoded and the frame is
         // already cached — scrubbing within a GOP costs nothing after the first
         // frame that reaches this far.
-        if self.seek_cache.gop_start == Some(start) {
-            if let Some(f) = self.seek_cache.gop_frames.get(&target_poc) {
-                return Ok(Some(f.clone()));
-            }
+        if self.seek_cache.gop_start == Some(start)
+            && let Some(f) = self.seek_cache.gop_frames.get(&target_poc)
+        {
+            return Ok(Some(f.clone()));
         }
 
         // If we're entering a *different* GOP than the cached one, restart the
@@ -708,13 +762,11 @@ impl VideoDecoder {
         for_each_nal(data, framing, |n: Nal| {
             if n.nal_type == nal::SPS && rate.is_none() {
                 let rbsp = crate::bitreader::unescape_rbsp(&n.bytes[2..]);
-                if let Ok(sps) = parse_sps(&rbsp) {
-                    if sps.vui_time_scale > 0 {
-                        if sps.vui_num_units_in_tick > 0 {
-                            rate =
-                                Some(sps.vui_time_scale as f64 / sps.vui_num_units_in_tick as f64);
-                        }
-                    }
+                if let Ok(sps) = parse_sps(&rbsp)
+                    && sps.vui_time_scale > 0
+                    && sps.vui_num_units_in_tick > 0
+                {
+                    rate = Some(sps.vui_time_scale as f64 / sps.vui_num_units_in_tick as f64);
                 }
             }
             Ok(())
@@ -1410,6 +1462,7 @@ fn frame_meta_from_sps(sps: &Sps) -> FrameMeta {
         chroma: sps.chroma,
         bit_depth,
         color,
+        color_description_present: sps.colour_description_present,
         time_scale: sps.vui_time_scale,
         num_units_in_tick: sps.vui_num_units_in_tick,
     }
@@ -1424,5 +1477,37 @@ mod tests {
         let mut d = VideoDecoder::new();
         let out = d.decode_all(&[0, 0, 0, 1, 0x40, 0x01]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn untagged_gbr_override_uses_hevc_component_order() {
+        let frame = VideoFrame {
+            planes: YuvPlanes {
+                y: vec![20],
+                cb: vec![30],
+                cr: vec![10],
+                width: 1,
+                height: 1,
+                chroma: ChromaFormat::Yuv444,
+                bit_depth: BitDepth::Eight,
+            },
+            poc: 0,
+            meta: FrameMeta {
+                crop_left: 0,
+                crop_top: 0,
+                disp_w: 1,
+                disp_h: 1,
+                chroma: ChromaFormat::Yuv444,
+                bit_depth: BitDepth::Eight,
+                color: Cicp::unspecified(),
+                color_description_present: false,
+                time_scale: 0,
+                num_units_in_tick: 0,
+            },
+        };
+        assert_eq!(frame.color(), Cicp::unspecified());
+        assert_eq!(frame.signalled_color(), None);
+        assert_eq!(frame.to_rgb8_gbr(), vec![10, 20, 30]);
+        assert_eq!(frame.to_rgba8_gbr(), vec![10, 20, 30, 255]);
     }
 }

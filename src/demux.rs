@@ -147,10 +147,10 @@ where
         } else {
             data.len()
         };
-        if s < end {
-            if let Some(n) = Nal::parse(trim_trailing_zeros(&data[s..end])) {
-                f(n)?;
-            }
+        if s < end
+            && let Some(n) = Nal::parse(trim_trailing_zeros(&data[s..end]))
+        {
+            f(n)?;
         }
     }
     Ok(())
@@ -215,7 +215,7 @@ pub(crate) mod nal {
     /// Sub-layer non-reference (`_N`) VCL types are the even values 0..=14.
     #[inline]
     pub(crate) fn is_sub_layer_non_ref(t: u8) -> bool {
-        t <= 14 && ((t) % (2) == 0)
+        t <= 14 && (t).is_multiple_of(2)
     }
     /// Reference picture flag: `_R` VCL types and all IRAP are reference.
     #[inline]

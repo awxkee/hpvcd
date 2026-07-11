@@ -858,7 +858,7 @@ fn uni_mc_weighted_sse41_impl(
     let src = &src[..pred_w * pred_h];
     let log2_wd = log2_denom as i32 + 14 - bd as i32;
     let round = if log2_wd >= 1 { 1 << (log2_wd - 1) } else { 0 };
-    let off = offset << (bd as i32 - 8);
+    let off = offset;
     let weight = _mm_set1_epi32(weight);
     let round = _mm_set1_epi32(round);
     let off = _mm_set1_epi32(off);
@@ -895,10 +895,7 @@ fn bi_mc_weighted_sse41_impl(
     let s0 = &s0[..len];
     let s1 = &s1[..len];
     let log2_wd = log2_denom as i32 + 14 - bd as i32;
-    let bd_off = bd as i32 - 8;
-    let o0 = o0 << bd_off;
-    let o1 = o1 << bd_off;
-    let rnd = ((o0 + o1 + 1) as i64) << log2_wd;
+    let rnd = (o0 as i64 + o1 as i64 + 1) << log2_wd;
     let w0 = _mm_set1_epi32(w0);
     let w1 = _mm_set1_epi32(w1);
     let rnd = _mm_set1_epi32(rnd as i32);
@@ -1024,11 +1021,8 @@ pub(crate) fn bi_mc_weighted_sse41(
     dst_stride: usize,
 ) {
     let log2_wd = log2_denom as i32 + 14 - bd as i32;
-    let bd_off = bd as i32 - 8;
     let rnd = if bd >= 8 && (0..31).contains(&log2_wd) {
-        let o0s = o0 << bd_off;
-        let o1s = o1 << bd_off;
-        Some(((o0s + o1s + 1) as i64) << log2_wd)
+        Some((o0 as i64 + o1 as i64 + 1) << log2_wd)
     } else {
         None
     };

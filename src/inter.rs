@@ -38,6 +38,46 @@ fn e(s: &'static str) -> DecodeError {
     DecodeError::Bitstream(s.into())
 }
 
+#[inline]
+fn wp_offset_range(bit_depth: u8, high_precision: bool) -> i32 {
+    if high_precision {
+        1i32 << bit_depth.saturating_sub(1)
+    } else {
+        128
+    }
+}
+
+#[inline]
+fn wp_offset_scale(bit_depth: u8, high_precision: bool) -> i32 {
+    if high_precision {
+        1
+    } else {
+        1i32 << bit_depth.saturating_sub(8)
+    }
+}
+
+#[inline]
+fn normalize_luma_offset(offset: i32, bit_depth: u8, high_precision: bool) -> i32 {
+    let range = wp_offset_range(bit_depth, high_precision);
+    offset
+        .clamp(-range, range - 1)
+        .saturating_mul(wp_offset_scale(bit_depth, high_precision))
+}
+
+#[inline]
+fn derive_chroma_offset(
+    delta: i32,
+    weight: i32,
+    log2_denom: u8,
+    bit_depth: u8,
+    high_precision: bool,
+) -> i32 {
+    let range = wp_offset_range(bit_depth, high_precision) as i64;
+    let pred = range - ((range * weight as i64) >> log2_denom);
+    let offset = (delta as i64 + pred).clamp(-range, range - 1) as i32;
+    offset.saturating_mul(wp_offset_scale(bit_depth, high_precision))
+}
+
 /// A quarter-pel motion vector.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) struct Mv {
@@ -101,10 +141,12 @@ impl MotionInfo {
 pub(crate) struct PredWeightTable {
     pub(crate) luma_log2_denom: u8,
     pub(crate) chroma_log2_denom: u8,
-    /// [list][ref] weight/offset. Luma.
+    /// [list][ref] weight/offset. Offsets are normalized to reconstructed-
+    /// sample units while parsing: legacy offsets are scaled by
+    /// `1 << (bit_depth - 8)`, high-precision offsets are left unscaled.
     pub(crate) luma_weight: [Vec<i32>; 2],
     pub(crate) luma_offset: [Vec<i32>; 2],
-    /// [list][ref][cb=0/cr=1].
+    /// [list][ref][cb=0/cr=1], with offsets in reconstructed-sample units.
     pub(crate) chroma_weight: [Vec<[i32; 2]>; 2],
     pub(crate) chroma_offset: [Vec<[i32; 2]>; 2],
     /// Whether an explicit weight was signalled for each entry.
@@ -115,6 +157,7 @@ pub(crate) struct PredWeightTable {
 impl PredWeightTable {
     /// Parse `pred_weight_table()`. `num_ref` = active ref counts per list;
     /// `has_l1` false for P slices. `bd_*` are luma/chroma bit depths.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn parse(
         r: &mut BitReader,
         num_ref: [usize; 2],
@@ -122,6 +165,7 @@ impl PredWeightTable {
         chroma: bool,
         bd_luma: u8,
         bd_chroma: u8,
+        high_precision_offsets: bool,
         // SCC (§7.3.6.3): per-list mask of entries whose reference picture is
         // the current picture — their weight flags are NOT coded and the
         // neutral weight is inferred.
@@ -136,8 +180,6 @@ impl PredWeightTable {
         };
         let default_luma_w = 1i32 << luma_log2_denom;
         let default_chroma_w = 1i32 << chroma_log2_denom;
-        let wp_off_half_luma = 1i32 << (bd_luma - 1);
-        let wp_off_half_chroma = 1i32 << (bd_chroma - 1);
 
         let mut t = PredWeightTable {
             luma_log2_denom,
@@ -176,7 +218,11 @@ impl PredWeightTable {
                     let dw = r.read_se().map_err(|_| e("delta_luma_weight"))?;
                     let o = r.read_se().map_err(|_| e("luma_offset"))?;
                     t.luma_weight[list].push(default_luma_w + dw);
-                    t.luma_offset[list].push(o);
+                    t.luma_offset[list].push(normalize_luma_offset(
+                        o,
+                        bd_luma,
+                        high_precision_offsets,
+                    ));
                 } else {
                     t.luma_weight[list].push(default_luma_w);
                     t.luma_offset[list].push(0);
@@ -188,10 +234,13 @@ impl PredWeightTable {
                         let dw = r.read_se().map_err(|_| e("delta_chroma_weight"))?;
                         let doff = r.read_se().map_err(|_| e("delta_chroma_offset"))?;
                         w[c] = default_chroma_w + dw;
-                        // offset reconstruction per spec.
-                        let pred =
-                            wp_off_half_chroma - ((wp_off_half_chroma * w[c]) >> chroma_log2_denom);
-                        o[c] = (pred + doff).clamp(-wp_off_half_chroma, wp_off_half_chroma - 1);
+                        o[c] = derive_chroma_offset(
+                            doff,
+                            w[c],
+                            chroma_log2_denom,
+                            bd_chroma,
+                            high_precision_offsets,
+                        );
                     }
                     t.chroma_weight[list].push(w);
                     t.chroma_offset[list].push(o);
@@ -203,7 +252,6 @@ impl PredWeightTable {
             t.luma_flag[list] = luma_flags;
             t.chroma_flag[list] = chroma_flags;
         }
-        let _ = wp_off_half_luma;
         Ok(t)
     }
 
@@ -245,6 +293,34 @@ impl PredWeightTable {
             .map(|p| p[plane])
             .unwrap_or(0);
         (w, o)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{derive_chroma_offset, normalize_luma_offset};
+
+    #[test]
+    fn legacy_offsets_are_scaled_from_eight_bit_units() {
+        assert_eq!(normalize_luma_offset(7, 8, false), 7);
+        assert_eq!(normalize_luma_offset(7, 10, false), 28);
+        assert_eq!(normalize_luma_offset(-128, 12, false), -2048);
+    }
+
+    #[test]
+    fn high_precision_offsets_stay_in_native_sample_units() {
+        assert_eq!(normalize_luma_offset(7, 10, true), 7);
+        assert_eq!(normalize_luma_offset(511, 10, true), 511);
+        assert_eq!(normalize_luma_offset(-512, 10, true), -512);
+    }
+
+    #[test]
+    fn chroma_offset_uses_the_mode_specific_prediction_range() {
+        // denom=2, weight=5, delta=3:
+        // legacy range 128 -> (128 - 160 + 3) * 4 = -116 at 10-bit;
+        // high-precision range 512 -> 512 - 640 + 3 = -125.
+        assert_eq!(derive_chroma_offset(3, 5, 2, 10, false), -116);
+        assert_eq!(derive_chroma_offset(3, 5, 2, 10, true), -125);
     }
 }
 

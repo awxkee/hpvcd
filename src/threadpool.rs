@@ -251,10 +251,10 @@ impl Shared {
     }
 
     fn find_job_inner(&self, me: usize) -> Option<Job> {
-        if let Some(d) = self.deques.get(me) {
-            if let Some(j) = d.pop() {
-                return Some(j);
-            }
+        if let Some(d) = self.deques.get(me)
+            && let Some(j) = d.pop()
+        {
+            return Some(j);
         }
         let n = self.deques.len();
         for off in 1..=n {

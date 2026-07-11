@@ -98,14 +98,17 @@ impl PalettePredictor {
                 if new_cols[0].len() >= max_pred_size {
                     break;
                 }
-                for c in 0..num_comps {
-                    new_cols[c].push(self.entries[c][k]);
+                for (c, dst) in new_cols[..num_comps].iter_mut().enumerate() {
+                    dst.push(self.entries[c][k]);
                 }
             }
         }
-        for c in 0..MAX_COMPONENTS {
-            self.entries[c] = std::mem::take(&mut new_cols[c]);
-            self.entries[c].truncate(max_pred_size);
+        for (entry, new_col) in self.entries[..MAX_COMPONENTS]
+            .iter_mut()
+            .zip(new_cols[..MAX_COMPONENTS].iter_mut())
+        {
+            *entry = std::mem::take(new_col);
+            entry.truncate(max_pred_size);
         }
     }
 }

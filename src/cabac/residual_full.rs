@@ -388,6 +388,7 @@ pub(crate) struct RextResidual {
 /// 1=vertical residual DPCM.
 pub(crate) type RdpcmDir = Option<u8>;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_coding(
     dec: &mut CabacDecoder<'_>,
     ctx: &mut ContextSet,
@@ -408,11 +409,11 @@ pub(crate) fn residual_coding(
 
     // transform_skip_flag
     let mut transform_skip = false;
-    if let Some(_ci) = transform_skip_ctx {
-        if !transquant_bypass {
-            let idx = if is_luma { 0 } else { 1 };
-            transform_skip = dec.decode_bin(&mut ctx.transform_skip_flag[idx]) != 0;
-        }
+    if let Some(_ci) = transform_skip_ctx
+        && !transquant_bypass
+    {
+        let idx = if is_luma { 0 } else { 1 };
+        transform_skip = dec.decode_bin(&mut ctx.transform_skip_flag[idx]) != 0;
     }
 
     // explicit_rdpcm_flag / dir (§7.3.8.11): inter TUs with transform skip or
@@ -421,7 +422,7 @@ pub(crate) fn residual_coding(
     if rext.explicit_rdpcm && rext.is_inter && (transform_skip || transquant_bypass) {
         let ci = if is_luma { 0 } else { 1 };
         if dec.decode_bin(&mut ctx.explicit_rdpcm_flag[ci]) != 0 {
-            let dir = dec.decode_bin(&mut ctx.explicit_rdpcm_dir[ci]) as u8;
+            let dir = dec.decode_bin(&mut ctx.explicit_rdpcm_dir[ci]);
             rdpcm = Some(dir);
         }
     }

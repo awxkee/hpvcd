@@ -753,10 +753,10 @@ pub(crate) fn apply_sao_plane_banded_scalar(
                         4 => offsets[3],
                         _ => 0,
                     };
-                    if offset != 0 {
-                        if let Some(dst) = dst_band.get_mut(dst_base + x) {
-                            *dst = (s + offset).clamp(0, max_val) as u16;
-                        }
+                    if offset != 0
+                        && let Some(dst) = dst_band.get_mut(dst_base + x)
+                    {
+                        *dst = (s + offset).clamp(0, max_val) as u16;
                     }
                 }
             }

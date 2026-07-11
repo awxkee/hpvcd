@@ -84,6 +84,14 @@ pub(crate) struct Sps {
     pub(crate) log2_max_pcm_cb: u32,
     pub(crate) pcm_loop_filter_disabled: bool,
     pub(crate) strong_intra_smoothing: bool,
+    /// Whether the SPS carried a VUI and its nested colour signalling fields.
+    /// These are retained separately from the code-point defaults so callers can
+    /// distinguish “unspecified/absent” from an explicitly signalled value.
+    #[allow(dead_code)]
+    pub(crate) vui_parameters_present: bool,
+    #[allow(dead_code)]
+    pub(crate) video_signal_type_present: bool,
+    pub(crate) colour_description_present: bool,
     pub(crate) video_full_range: bool,
     pub(crate) color_primaries: u8, // ISO/IEC 23091-2 Table 2; 2 = unspecified
     pub(crate) transfer_characteristics: u8, // ISO/IEC 23091-2 Table 3; 2 = unspecified
@@ -358,6 +366,7 @@ pub(crate) struct ScalingList {
     matrices: [[[u8; 64]; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
     dc: [[u8; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
     flat_16: [[bool; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+    max_coeff: [[u8; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
 }
 
 impl Default for ScalingList {
@@ -366,11 +375,12 @@ impl Default for ScalingList {
             matrices: [[[16; 64]; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
             dc: [[SCALING_LIST_DC; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
             flat_16: [[true; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
+            max_coeff: [[16; SCALING_LIST_NUM_LISTS]; SCALING_LIST_NUM_SIZES],
         };
 
         for list_id in 0..SCALING_LIST_NUM_LISTS {
             out.matrices[0][list_id][..16].copy_from_slice(&QUANT_TS_DEFAULT_4X4);
-            out.refresh_flat_16(0, list_id);
+            out.refresh_stats(0, list_id);
             let default_8x8 = if list_id < 3 {
                 &QUANT_INTRA_DEFAULT_8X8
             } else {
@@ -378,7 +388,7 @@ impl Default for ScalingList {
             };
             for size_id in 1..SCALING_LIST_NUM_SIZES {
                 out.matrices[size_id][list_id].copy_from_slice(default_8x8);
-                out.refresh_flat_16(size_id, list_id);
+                out.refresh_stats(size_id, list_id);
             }
         }
 
@@ -388,16 +398,30 @@ impl Default for ScalingList {
 
 impl ScalingList {
     #[inline]
-    fn refresh_flat_16(&mut self, size_id: usize, matrix_id: usize) {
-        self.flat_16[size_id][matrix_id] = self.dc[size_id][matrix_id] == SCALING_LIST_DC
-            && self.matrices[size_id][matrix_id].iter().all(|&v| v == 16);
+    fn refresh_stats(&mut self, size_id: usize, matrix_id: usize) {
+        let used = if size_id == 0 { 16 } else { 64 };
+        self.flat_16[size_id][matrix_id] = (size_id < 2
+            || self.dc[size_id][matrix_id] == SCALING_LIST_DC)
+            && self.matrices[size_id][matrix_id][..used]
+                .iter()
+                .all(|&v| v == 16);
+
+        let mut max_coeff = self.matrices[size_id][matrix_id][..used]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        if size_id >= 2 {
+            max_coeff = max_coeff.max(self.dc[size_id][matrix_id]);
+        }
+        self.max_coeff[size_id][matrix_id] = max_coeff;
     }
 
     #[inline]
     fn set_matrix(&mut self, size_id: usize, matrix_id: usize, matrix: [u8; 64], dc: u8) {
         self.matrices[size_id][matrix_id] = matrix;
         self.dc[size_id][matrix_id] = dc;
-        self.refresh_flat_16(size_id, matrix_id);
+        self.refresh_stats(size_id, matrix_id);
     }
 
     #[inline]
@@ -405,17 +429,32 @@ impl ScalingList {
         self.matrices[size_id][matrix_id] = self.matrices[size_id][pred_id];
         self.dc[size_id][matrix_id] = self.dc[size_id][pred_id];
         self.flat_16[size_id][matrix_id] = self.flat_16[size_id][pred_id];
+        self.max_coeff[size_id][matrix_id] = self.max_coeff[size_id][pred_id];
     }
 
     #[inline]
-    pub(crate) fn matrix(&self, size_id: usize, matrix_id: usize) -> (&[u8; 64], u8, bool) {
+    pub(crate) fn matrix(&self, size_id: usize, matrix_id: usize) -> (&[u8; 64], u8, bool, u8) {
         let size_id = size_id.min(SCALING_LIST_NUM_SIZES - 1);
         let matrix_id = matrix_id.min(SCALING_LIST_NUM_LISTS - 1);
         (
             &self.matrices[size_id][matrix_id],
             self.dc[size_id][matrix_id],
             self.flat_16[size_id][matrix_id],
+            self.max_coeff[size_id][matrix_id],
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_constant_lists(values: [u8; 6]) -> Self {
+        let mut out = Self::default();
+        for size_id in 0..SCALING_LIST_NUM_SIZES {
+            for (matrix_id, &value) in values.iter().enumerate() {
+                out.matrices[size_id][matrix_id].fill(value);
+                out.dc[size_id][matrix_id] = value;
+                out.refresh_stats(size_id, matrix_id);
+            }
+        }
+        out
     }
 }
 
@@ -484,20 +523,23 @@ fn parse_scaling_list_data(r: &mut BitReader) -> Result<ScalingList, DecodeError
                 let mut next_coef = 8i32;
                 if size_id > 1 {
                     next_coef = r.read_se().map_err(|_| e("scaling_list_dc_coef"))? + 8;
-                    out.dc[size_id][matrix_id] = next_coef.clamp(1, 255) as u8;
-                    out.refresh_flat_16(size_id, matrix_id);
+                    if !(0..=255).contains(&next_coef) {
+                        return Err(e("scaling_list_dc_coef range"));
+                    }
+                    out.dc[size_id][matrix_id] = next_coef as u8;
                 } else {
                     out.dc[size_id][matrix_id] = SCALING_LIST_DC;
-                    out.refresh_flat_16(size_id, matrix_id);
                 }
 
                 for scan_idx in 0..coef_num {
                     let delta_coef = r.read_se().map_err(|_| e("scaling_list_delta_coef"))?;
                     next_coef = (next_coef + delta_coef + 256) & 255;
                     let pos = scaling_list_scan_pos(scan_size, scan_idx);
-                    out.matrices[size_id][matrix_id][pos] = next_coef.clamp(1, 255) as u8;
+                    // Zero is a legal 8-bit scaling-list entry. Clamping it to
+                    // one changes the inverse-quantisation matrix.
+                    out.matrices[size_id][matrix_id][pos] = next_coef as u8;
                 }
-                out.refresh_flat_16(size_id, matrix_id);
+                out.refresh_stats(size_id, matrix_id);
             }
             matrix_id += if size_id == 3 { 3 } else { 1 };
         }
@@ -507,6 +549,7 @@ fn parse_scaling_list_data(r: &mut BitReader) -> Result<ScalingList, DecodeError
         out.matrices[3][matrix_id] = out.matrices[2][matrix_id];
         out.dc[3][matrix_id] = out.dc[2][matrix_id];
         out.flat_16[3][matrix_id] = out.flat_16[2][matrix_id];
+        out.max_coeff[3][matrix_id] = out.max_coeff[2][matrix_id];
     }
 
     Ok(out)
@@ -658,7 +701,10 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let mut matrix_coefficients = 2u8; // unspecified
     let mut vui_num_units_in_tick = 0u32;
     let mut vui_time_scale = 0u32;
-    if r.read_flag().map_err(|_| e("vui_present"))? {
+    let vui_parameters_present = r.read_flag().map_err(|_| e("vui_present"))?;
+    let mut video_signal_type_present = false;
+    let mut colour_description_present = false;
+    if vui_parameters_present {
         // aspect_ratio_info_present_flag
         if r.read_flag().map_err(|_| e("ar_present"))? {
             let ar_idc = r.read_bits(8).map_err(|_| e("ar_idc"))?;
@@ -673,11 +719,13 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
             r.read_flag().map_err(|_| e("overscan"))?;
         }
         // video_signal_type_present_flag
-        if r.read_flag().map_err(|_| e("vst_present"))? {
+        video_signal_type_present = r.read_flag().map_err(|_| e("vst_present"))?;
+        if video_signal_type_present {
             r.read_bits(3).map_err(|_| e("video_format"))?; // video_format
             video_full_range = r.read_flag().map_err(|_| e("full_range"))?;
             // color_description_present_flag
-            if r.read_flag().map_err(|_| e("color_desc"))? {
+            colour_description_present = r.read_flag().map_err(|_| e("color_desc"))?;
+            if colour_description_present {
                 color_primaries = r.read_bits(8).map_err(|_| e("color_primaries"))? as u8;
                 transfer_characteristics = r.read_bits(8).map_err(|_| e("transfer_char"))? as u8;
                 matrix_coefficients = r.read_bits(8).map_err(|_| e("matrix_coeff"))? as u8;
@@ -809,6 +857,9 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         log2_max_pcm_cb,
         pcm_loop_filter_disabled,
         strong_intra_smoothing,
+        vui_parameters_present,
+        video_signal_type_present,
+        colour_description_present,
         video_full_range,
         color_primaries,
         transfer_characteristics,

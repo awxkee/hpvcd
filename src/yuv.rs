@@ -82,8 +82,10 @@ struct Cvt<'a> {
     y0: usize,
     max_val: i64,
     y_black: i64,
+    c_black: i64,
     neutral: i64,
     k_y: i64,
+    k_c: i64,
     cr_to_r: i64,
     cb_to_g: i64,
     cr_to_g: i64,
@@ -92,7 +94,6 @@ struct Cvt<'a> {
     sub_h: usize,
     cw: usize,
     ch: usize,
-    identity: bool,
 }
 
 impl Cvt<'_> {
@@ -125,8 +126,10 @@ impl Cvt<'_> {
             y0,
             max_val: yuv.bit_depth.max_val() as i64,
             y_black: if color.full_range { 0 } else { 16 * scale },
+            c_black: if color.full_range { 0 } else { 16 * scale },
             neutral: 128 * scale,
             k_y,
+            k_c: k_uv,
             // Fold the chroma range scale into the matrix once, staying in Q0.13.
             cr_to_r: (cr_r0 * k_uv + Q13_ROUND) >> Q13,
             cb_to_g: (cb_g0 * k_uv + Q13_ROUND) >> Q13,
@@ -136,7 +139,6 @@ impl Cvt<'_> {
             sub_h,
             cw: yuv.width.div_ceil(sub_w),
             ch: yuv.height.div_ceil(sub_h),
-            identity: color.matrix == MatrixCoefficients::Identity,
         }
     }
 
@@ -150,21 +152,15 @@ impl Cvt<'_> {
         let c_col = (src_x / self.sub_w).min(self.cw - 1);
 
         let luma_raw = yuv.y[y_row * yuv.width + x_col] as i64;
-
-        if self.identity {
-            let y_scaled = (self.k_y * (luma_raw - self.y_black) + Q13_ROUND) >> Q13;
-            (y_scaled, y_scaled, y_scaled)
-        } else {
-            let cb_raw = yuv.cb[c_row * self.cw + c_col] as i64;
-            let cr_raw = yuv.cr[c_row * self.cw + c_col] as i64;
-            let y_term = self.k_y * (luma_raw - self.y_black);
-            let cb_c = cb_raw - self.neutral;
-            let cr_c = cr_raw - self.neutral;
-            let r = (y_term + self.cr_to_r * cr_c + Q13_ROUND) >> Q13;
-            let g = (y_term + self.cb_to_g * cb_c + self.cr_to_g * cr_c + Q13_ROUND) >> Q13;
-            let b = (y_term + self.cb_to_b * cb_c + Q13_ROUND) >> Q13;
-            (r, g, b)
-        }
+        let cb_raw = yuv.cb[c_row * self.cw + c_col] as i64;
+        let cr_raw = yuv.cr[c_row * self.cw + c_col] as i64;
+        let y_term = self.k_y * (luma_raw - self.y_black);
+        let cb_c = cb_raw - self.neutral;
+        let cr_c = cr_raw - self.neutral;
+        let r = (y_term + self.cr_to_r * cr_c + Q13_ROUND) >> Q13;
+        let g = (y_term + self.cb_to_g * cb_c + self.cr_to_g * cr_c + Q13_ROUND) >> Q13;
+        let b = (y_term + self.cb_to_b * cb_c + Q13_ROUND) >> Q13;
+        (r, g, b)
     }
 }
 
@@ -203,6 +199,42 @@ impl Cvt<'_> {
         }
     }
 
+    /// MatrixCoefficients 0 is the identity transform used by HEVC for GBR.
+    /// The coded component order is G, B, R, i.e. Y -> G, Cb -> B, Cr -> R.
+    fn gbr_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
+        let yuv = self.yuv;
+        let full_range = self.y_black == 0 && self.c_black == 0;
+        for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
+            let src_y = self.y0.saturating_add(y0 + dy);
+            let y_row = src_y.min(yuv.height - 1);
+            let c_row = (src_y / self.sub_h).min(self.ch - 1);
+            let g_row = &yuv.y[y_row * yuv.width..][..yuv.width];
+            let b_row = &yuv.cb[c_row * self.cw..][..self.cw];
+            let r_row = &yuv.cr[c_row * self.cw..][..self.cw];
+            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let src_x = self.x0.saturating_add(x_pix);
+                let x_col = src_x.min(yuv.width - 1);
+                let c_col = (src_x / self.sub_w).min(self.cw - 1);
+                let (r, g, b) = if full_range {
+                    (
+                        r_row[c_col] as i64,
+                        g_row[x_col] as i64,
+                        b_row[c_col] as i64,
+                    )
+                } else {
+                    (
+                        (self.k_c * (r_row[c_col] as i64 - self.c_black) + Q13_ROUND) >> Q13,
+                        (self.k_y * (g_row[x_col] as i64 - self.y_black) + Q13_ROUND) >> Q13,
+                        (self.k_c * (b_row[c_col] as i64 - self.c_black) + Q13_ROUND) >> Q13,
+                    )
+                };
+                dst[0] = T::cast(r.clamp(0, cmax));
+                dst[1] = T::cast(g.clamp(0, cmax));
+                dst[2] = T::cast(b.clamp(0, cmax));
+            }
+        }
+    }
+
     /// Non-identity fast path: requires the requested visible window to fit inside
     /// the coded planes.
     fn fast_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
@@ -214,8 +246,12 @@ impl Cvt<'_> {
             let luma_row = &yuv.y[luma_base..][..self.dw];
             let cb_row = &yuv.cb[c_base..][..self.cw];
             let cr_row = &yuv.cr[c_base..][..self.cw];
-            for (x_pix, (dst, &luma_raw)) in
-                row_out.chunks_exact_mut(3).zip(luma_row.iter()).enumerate()
+            for (x_pix, (dst, &luma_raw)) in row_out
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(luma_row.iter())
+                .enumerate()
             {
                 let c_col = (self.x0 + x_pix) / self.sub_w;
                 let cb_c = cb_row[c_col] as i64 - self.neutral;
@@ -233,7 +269,7 @@ impl Cvt<'_> {
 
     fn slow_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
         for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
-            for (x_pix, dst) in row_out.chunks_exact_mut(3).enumerate() {
+            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let (r, g, b) = self.pixel(y0 + dy, x_pix);
                 dst[0] = T::cast(r.clamp(0, cmax));
                 dst[1] = T::cast(g.clamp(0, cmax));
@@ -251,7 +287,7 @@ impl Cvt<'_> {
             let l_row = &yuv.y[y_row * yuv.width..][..yuv.width];
             let cb_row = &yuv.cb[c_row * self.cw..][..self.cw];
             let cr_row = &yuv.cr[c_row * self.cw..][..self.cw];
-            for (x_pix, dst) in row_out.chunks_exact_mut(3).enumerate() {
+            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let src_x = self.x0.saturating_add(x_pix);
                 let x_col = src_x.min(yuv.width - 1);
                 let c_col = (src_x / self.sub_w).min(self.cw - 1);
@@ -276,19 +312,18 @@ where
 {
     let total = dw * dh * chn;
     if let Some(p) = pool {
-        if p.threads() > 1 {
-            if dh > 1 {
-                let band_rows = dh.div_ceil((p.threads() * 4).min(dh));
-                let bands = dh.div_ceil(band_rows);
-                let dm = DisjointMut::new(vec![T::default(); total]);
-                parallel_for(p, bands, |b| {
-                    let y0 = b * band_rows;
-                    let nr = band_rows.min(dh - y0);
-                    let mut band = dm.slice_mut(y0 * dw * chn..(y0 + nr) * dw * chn);
-                    f(y0, &mut band);
-                });
-                return dm.into_inner();
-            }
+        let threads = p.threads();
+        if threads > 1 && dh > 1 {
+            let band_rows = dh.div_ceil((threads * 4).min(dh));
+            let bands = dh.div_ceil(band_rows);
+            let dm = DisjointMut::new(vec![T::default(); total]);
+            parallel_for(p, bands, |b| {
+                let y0 = b * band_rows;
+                let nr = band_rows.min(dh - y0);
+                let mut band = dm.slice_mut(y0 * dw * chn..(y0 + nr) * dw * chn);
+                f(y0, &mut band);
+            });
+            return dm.into_inner();
         }
     }
     let mut v = vec![T::default(); total];
@@ -346,6 +381,18 @@ pub(crate) fn yuv_to_rgb_window_with_color_pool(
         };
     }
 
+    if color.matrix == MatrixCoefficients::Identity {
+        return if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+                cvt.gbr_rows::<u8>(y0, out, 255)
+            }))
+        } else {
+            ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
+                cvt.gbr_rows::<u16>(y0, out, cvt.max_val)
+            }))
+        };
+    }
+
     if color.matrix == MatrixCoefficients::YCgCo {
         return if yuv.bit_depth == BitDepth::Eight {
             ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
@@ -361,7 +408,7 @@ pub(crate) fn yuv_to_rgb_window_with_color_pool(
     // Fast path assumes the visible window fits inside the coded planes, making
     // the per-pixel edge clamps in `pixel` provably no-ops; output is bit-exact.
     let fast = dw <= yuv.width - crop_left && dh <= yuv.height - crop_top;
-    if fast && !cvt.identity {
+    if fast {
         return if yuv.bit_depth == BitDepth::Eight {
             ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
                 cvt.fast_rows::<u8>(y0, out, 255)
@@ -381,5 +428,72 @@ pub(crate) fn yuv_to_rgb_window_with_color_pool(
         ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
             cvt.slow_rows::<u16>(y0, out, cvt.max_val)
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gbr_cicp(full_range: bool) -> Cicp {
+        Cicp {
+            matrix: MatrixCoefficients::Identity,
+            full_range,
+            ..Cicp::srgb()
+        }
+    }
+
+    #[test]
+    fn identity_matrix_maps_hevc_gbr_to_rgb() {
+        let yuv = YuvPlanes {
+            y: vec![20, 21],
+            cb: vec![30, 31],
+            cr: vec![10, 11],
+            width: 2,
+            height: 1,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: BitDepth::Eight,
+        };
+        let out = yuv_to_rgb_window_with_color(&yuv, 2, 1, 0, 0, &gbr_cicp(true));
+        match out {
+            ImageBuffer::Rgb8(rgb) => assert_eq!(rgb, vec![10, 20, 30, 11, 21, 31]),
+            _ => panic!("expected 8-bit RGB"),
+        }
+    }
+
+    #[test]
+    fn identity_matrix_preserves_high_bit_depth_components() {
+        let yuv = YuvPlanes {
+            y: vec![0x123],
+            cb: vec![0x234],
+            cr: vec![0x345],
+            width: 1,
+            height: 1,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: BitDepth::Twelve,
+        };
+        let out = yuv_to_rgb_window_with_color(&yuv, 1, 1, 0, 0, &gbr_cicp(true));
+        match out {
+            ImageBuffer::Rgb16(rgb) => assert_eq!(rgb, vec![0x345, 0x123, 0x234]),
+            _ => panic!("expected high-bit-depth RGB"),
+        }
+    }
+
+    #[test]
+    fn identity_matrix_expands_limited_range_per_component() {
+        let yuv = YuvPlanes {
+            y: vec![16, 235],
+            cb: vec![16, 240],
+            cr: vec![16, 240],
+            width: 2,
+            height: 1,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: BitDepth::Eight,
+        };
+        let out = yuv_to_rgb_window_with_color(&yuv, 2, 1, 0, 0, &gbr_cicp(false));
+        match out {
+            ImageBuffer::Rgb8(rgb) => assert_eq!(rgb, vec![0, 0, 0, 255, 255, 255]),
+            _ => panic!("expected 8-bit RGB"),
+        }
     }
 }

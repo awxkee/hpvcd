@@ -51,25 +51,21 @@ fn mullo_safe_from_max(max_abs_level: i32, params: DequantParams) -> bool {
         return false;
     }
     let limit = ((i32::MAX as i64 - params.add) / params.factor).max(0);
-    i64::from(max_abs_level) <= limit
+    params.clipped_max_abs(max_abs_level) <= limit
 }
 
 #[inline]
-fn scaled_mullo_safe_from_max(
-    max_abs_level: i32,
-    params: DequantParams,
-    scaling: ScalingMatrix<'_>,
-) -> bool {
+fn scaled_mullo_safe_from_max(max_abs_level: i32, params: DequantParams, max_coeff: i64) -> bool {
     let base_factor = params.factor / 16;
     if base_factor <= 0 || params.add > i32::MAX as i64 {
         return false;
     }
-    let max_factor = base_factor * scaling.max_coeff();
+    let max_factor = base_factor * max_coeff;
     if max_factor <= 0 || max_factor > i32::MAX as i64 {
         return false;
     }
     let limit = ((i32::MAX as i64 - params.add) / max_factor).max(0);
-    i64::from(max_abs_level) <= limit
+    params.clipped_max_abs(max_abs_level) <= limit
 }
 
 #[inline]
@@ -78,11 +74,9 @@ fn sse_i64_factor_ok(params: DequantParams) -> bool {
 }
 
 #[inline]
-fn sse_scaled_i64_factor_ok(params: DequantParams, scaling: ScalingMatrix<'_>) -> bool {
+fn sse_scaled_i64_factor_ok(params: DequantParams, max_coeff: i64) -> bool {
     let base_factor = params.factor / 16;
-    base_factor > 0
-        && base_factor * scaling.max_coeff() <= i32::MAX as i64
-        && params.add <= i32::MAX as i64
+    base_factor > 0 && base_factor * max_coeff <= i32::MAX as i64 && params.add <= i32::MAX as i64
 }
 
 #[inline]
@@ -128,6 +122,14 @@ fn clip_i16_s32x4_with(v: __m128i, lo: __m128i, hi: __m128i) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn load_dequant_levels4(src: &[i32; 4], clip_lo: __m128i, clip_hi: __m128i) -> __m128i {
+    // HEVC clips the coefficient level before inverse quantisation. This is
+    // observable with scaling-list coefficients below the neutral value 16.
+    clip_i16_s32x4_with(load_i32x4(src), clip_lo, clip_hi)
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 fn dequant4_sse41_const(
     levels: &[i32; 4],
     factor: __m128i,
@@ -136,7 +138,7 @@ fn dequant4_sse41_const(
     clip_lo: __m128i,
     clip_hi: __m128i,
 ) -> __m128i {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let v = _mm_mullo_epi32(v, factor);
     let v = _mm_add_epi32(v, add);
     clip_i16_s32x4_with(sra_epi32_count(v, shift), clip_lo, clip_hi)
@@ -152,7 +154,7 @@ fn dequant4_scaled_sse41_const(
     clip_lo: __m128i,
     clip_hi: __m128i,
 ) -> __m128i {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let f = load_i32x4(factors);
     let v = _mm_mullo_epi32(v, f);
     let v = _mm_add_epi32(v, add);
@@ -224,7 +226,7 @@ fn dequant4_sse41_saturating_const(
     clip_lo: __m128i,
     clip_hi: __m128i,
 ) -> __m128i {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let over_hi = _mm_cmpgt_epi32(v, pos_cut_minus_one);
     let over_lo = _mm_cmpgt_epi32(neg_keep_min, v);
     let safe = _mm_max_epi32(_mm_min_epi32(v, pos_cut_minus_one), neg_keep_min);
@@ -248,7 +250,7 @@ fn dequant4_scaled_sse41_saturating_const(
     clip_lo: __m128i,
     clip_hi: __m128i,
 ) -> __m128i {
-    let v = load_i32x4(levels);
+    let v = load_dequant_levels4(levels, clip_lo, clip_hi);
     let f = load_i32x4(factors);
     let pos_cut_minus_one = load_i32x4(pos_cut_minus_one);
     let neg_keep_min = load_i32x4(neg_keep_min);
@@ -1281,7 +1283,7 @@ pub(crate) fn dequantize_into_sse41(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         dequantize_into_scalar_i32(levels, n, params, max_abs_level, out);
         return;
     }
@@ -1301,7 +1303,7 @@ pub(crate) fn dequantize_into_sse41_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         dequantize_into_scalar_i16(levels, n, params, max_abs_level, out);
         return;
     }
@@ -1321,7 +1323,7 @@ pub(crate) fn dequantize_transform_skip_into_sse41(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         dequantize_transform_skip_into_scalar_i32(levels, n, params, max_abs_level, out);
         return;
     }
@@ -1341,7 +1343,7 @@ pub(crate) fn dequantize_transform_skip_into_sse41_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         dequantize_transform_skip_into_scalar_i16(levels, n, params, max_abs_level, out);
         return;
     }
@@ -1362,13 +1364,14 @@ pub(crate) fn dequantize_scaled_into_sse41(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
         return;
     }
-    if scaled_mullo_safe_from_max(max_abs_level, params, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mullo_safe_from_max(max_abs_level, params, max_coeff) {
         unsafe { dequantize_scaled_into_sse41_impl(levels, n, params, scaling, out) }
-    } else if sse_scaled_i64_factor_ok(params, scaling) {
+    } else if sse_scaled_i64_factor_ok(params, max_coeff) {
         unsafe { dequantize_scaled_into_sse41_i64_impl(levels, n, params, scaling, out) }
     } else {
         dequantize_scaled_into_scalar_i32(levels, n, params, scaling, max_abs_level, out);
@@ -1383,13 +1386,14 @@ pub(crate) fn dequantize_scaled_into_sse41_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if !supported_n(n) {
+    if !supported_n(n) || !params.simd_i16_range() {
         dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
         return;
     }
-    if scaled_mullo_safe_from_max(max_abs_level, params, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mullo_safe_from_max(max_abs_level, params, max_coeff) {
         unsafe { dequantize_scaled_into_sse41_16_impl(levels, n, params, scaling, out) }
-    } else if sse_scaled_i64_factor_ok(params, scaling) {
+    } else if sse_scaled_i64_factor_ok(params, max_coeff) {
         unsafe { dequantize_scaled_into_sse41_16_i64_impl(levels, n, params, scaling, out) }
     } else {
         dequantize_scaled_into_scalar_i16(levels, n, params, scaling, max_abs_level, out);
@@ -1404,7 +1408,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into_sse41(
     max_abs_level: i32,
     out: &mut [i32],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         dequantize_transform_skip_scaled_into_scalar_i32(
             levels,
             n,
@@ -1415,9 +1419,10 @@ pub(crate) fn dequantize_transform_skip_scaled_into_sse41(
         );
         return;
     }
-    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, max_coeff) {
         unsafe { dequantize_transform_skip_scaled_into_sse41_impl(levels, n, params, scaling, out) }
-    } else if sse_scaled_i64_factor_ok(params.dequant, scaling) {
+    } else if sse_scaled_i64_factor_ok(params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_sse41_i64_impl(levels, n, params, scaling, out)
         }
@@ -1441,7 +1446,7 @@ pub(crate) fn dequantize_transform_skip_scaled_into_sse41_16(
     max_abs_level: i32,
     out: &mut [i16],
 ) {
-    if n != 4 {
+    if n != 4 || !params.dequant.simd_i16_range() {
         dequantize_transform_skip_scaled_into_scalar_i16(
             levels,
             n,
@@ -1452,11 +1457,12 @@ pub(crate) fn dequantize_transform_skip_scaled_into_sse41_16(
         );
         return;
     }
-    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, scaling) {
+    let max_coeff = scaling.max_coeff();
+    if scaled_mullo_safe_from_max(max_abs_level, params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_sse41_16_impl(levels, n, params, scaling, out)
         }
-    } else if sse_scaled_i64_factor_ok(params.dequant, scaling) {
+    } else if sse_scaled_i64_factor_ok(params.dequant, max_coeff) {
         unsafe {
             dequantize_transform_skip_scaled_into_sse41_16_i64_impl(levels, n, params, scaling, out)
         }

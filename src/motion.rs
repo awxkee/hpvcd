@@ -172,39 +172,39 @@ pub(crate) fn derive_merge<N: Neighbors>(
     }
     // B1: top-right (x+w-1, y-1).
     let b1 = spatial(nb, x + w - 1, y - 1, pu, SpatialPos::B1);
-    if let Some(c) = b1 {
-        if a1.map_or(true, |a| !a.same_motion(&c)) {
-            push_unique(&mut cands, c, max_cand);
-        }
+    if let Some(c) = b1
+        && a1.is_none_or(|a| !a.same_motion(&c))
+    {
+        push_unique(&mut cands, c, max_cand);
     }
     // B0: top-right corner (x+w, y-1).
-    if let Some(c) = spatial(nb, x + w, y - 1, pu, SpatialPos::B0) {
-        if b1.map_or(true, |b| !b.same_motion(&c)) {
-            push_unique(&mut cands, c, max_cand);
-        }
+    if let Some(c) = spatial(nb, x + w, y - 1, pu, SpatialPos::B0)
+        && b1.is_none_or(|b| !b.same_motion(&c))
+    {
+        push_unique(&mut cands, c, max_cand);
     }
     // A0: left-bottom corner (x-1, y+h).
-    if let Some(c) = spatial(nb, x - 1, y + h, pu, SpatialPos::A0) {
-        if a1.map_or(true, |a| !a.same_motion(&c)) {
-            push_unique(&mut cands, c, max_cand);
-        }
+    if let Some(c) = spatial(nb, x - 1, y + h, pu, SpatialPos::A0)
+        && a1.is_none_or(|a| !a.same_motion(&c))
+    {
+        push_unique(&mut cands, c, max_cand);
     }
     // B2: top-left corner (x-1, y-1) — only if fewer than 4 spatial so far.
-    if cands.len() < 4 {
-        if let Some(c) = spatial(nb, x - 1, y - 1, pu, SpatialPos::B2) {
-            let dup =
-                a1.is_some_and(|a| a.same_motion(&c)) || b1.is_some_and(|b| b.same_motion(&c));
-            if !dup {
-                push_unique(&mut cands, c, max_cand);
-            }
+    if cands.len() < 4
+        && let Some(c) = spatial(nb, x - 1, y - 1, pu, SpatialPos::B2)
+    {
+        let dup = a1.is_some_and(|a| a.same_motion(&c)) || b1.is_some_and(|b| b.same_motion(&c));
+        if !dup {
+            push_unique(&mut cands, c, max_cand);
         }
     }
 
     // Temporal candidate (§8.5.3.2.7): collocated bottom-right then center.
-    if temporal_enabled && cands.len() < max_cand {
-        if let Some(tc) = temporal_merge(nb, pu, list0, list1) {
-            cands.push(tc);
-        }
+    if temporal_enabled
+        && cands.len() < max_cand
+        && let Some(tc) = temporal_merge(nb, pu, list0, list1)
+    {
+        cands.push(tc);
     }
 
     // Combined bi-predictive candidates (B slices).
@@ -480,10 +480,10 @@ pub(crate) fn derive_amvp<N: Neighbors>(
     if let Some(mv) = a {
         preds.push(mv);
     }
-    if let Some(mv) = b {
-        if a != Some(mv) {
-            preds.push(mv);
-        }
+    if let Some(mv) = b
+        && a != Some(mv)
+    {
+        preds.push(mv);
     }
 
     // Temporal predictor.
