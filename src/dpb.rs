@@ -230,6 +230,7 @@ impl Dpb {
         num_l0: usize,
         num_l1: usize,
         is_b: bool,
+        current: Option<RefEntry>,
         list_mod_l0: &[u32],
         list_mod_l1: &[u32],
     ) -> Result<(Vec<RefEntry>, Vec<RefEntry>), DecodeError> {
@@ -289,7 +290,23 @@ impl Dpb {
             }
         }
 
-        let list0 = finalize_list(&temp0, num_l0, list_mod_l0)?;
+        // SCC current-picture referencing is part of RefPicListTemp0/1, not an
+        // extra entry appended after list construction (§8.3.4, equations 8-8
+        // and 8-10). During picture decoding the current picture is treated as
+        // a long-term reference.
+        if let Some(curr) = current {
+            temp0.push(curr);
+            temp1.push(curr);
+        }
+
+        let mut list0 = finalize_list(&temp0, num_l0, list_mod_l0)?;
+        // With implicit L0 ordering and more temp entries than active entries,
+        // SCC forces the current picture into the final active L0 slot (8-9).
+        if let Some(curr) = current {
+            if list_mod_l0.is_empty() && num_l0 != 0 && temp0.len() > num_l0 {
+                list0[num_l0 - 1] = curr;
+            }
+        }
         let list1 = if is_b {
             finalize_list(&temp1, num_l1, list_mod_l1)?
         } else {
@@ -316,7 +333,7 @@ impl Dpb {
             // Output the lowest-POC frame still needing output.
             let mut best: Option<usize> = None;
             for (i, f) in self.frames.iter().enumerate() {
-                if f.needed_for_output && best.is_none_or(|b| f.poc < self.frames[b].poc) {
+                if f.needed_for_output && best.map_or(true, |b| f.poc < self.frames[b].poc) {
                     best = Some(i);
                 }
             }
@@ -423,5 +440,34 @@ impl Clone for YuvPlanes {
             chroma: self.chroma,
             bit_depth: self.bit_depth,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_picture_is_an_active_long_term_reference() {
+        let dpb = Dpb::new(1);
+        let pocs = RpsPocs {
+            before: Vec::new(),
+            after: Vec::new(),
+            lt: Vec::new(),
+        };
+        let current = RefEntry {
+            _dpb_index: usize::MAX,
+            poc: 17,
+            long_term: true,
+        };
+
+        let (l0, l1) = dpb
+            .build_ref_lists(&pocs, 1, 1, true, Some(current), &[], &[])
+            .unwrap();
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l0[0].poc, 17);
+        assert_eq!(l1[0].poc, 17);
+        assert!(l0[0].long_term && l1[0].long_term);
     }
 }

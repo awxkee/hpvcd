@@ -26,7 +26,6 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 use crate::cabac::CabacDecoder;
 use crate::cabac::{ContextSet, IntraModeContexts};
 use crate::cabac::{SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding};
@@ -39,6 +38,7 @@ use crate::inter::MotionInfo;
 use crate::intra;
 use crate::transform;
 use crate::yuv::YuvPlanes;
+use std::ops::DerefMut;
 
 const MODE_PLANAR: u8 = 0;
 const MODE_DC: u8 = 1;
@@ -87,6 +87,10 @@ pub(crate) struct FullDecoder<'cab> {
     cab: CabacDecoder<'cab>,
     ctx: ContextSet,
     ictx: IntraModeContexts,
+    /// Palette-mode contexts and the persistent predictor table (reset per slice
+    /// / tile / WPP row).
+    pctx: crate::cabac::PaletteContexts,
+    palette_predictor: crate::palette::PalettePredictor,
     sps: Sps,
     pps: Pps,
     exec: ExecContext,
@@ -156,7 +160,28 @@ pub(crate) struct FullDecoder<'cab> {
     /// that owns the q-side sample (§8.7.2), not a single global copy. Indexed
     /// by slice_idx like `slice_lf_across`; index 0 is unused.
     slice_deblock: Vec<SliceDeblock>,
-    cu_tqb: bool,  // current CU's cu_transquant_bypass_flag
+    cu_tqb: bool, // current CU's cu_transquant_bypass_flag
+    /// For the current intra CU, whether each coded intra_chroma_pred_mode
+    /// syntax value was 4 (derived mode). ACT syntax is TU-local and its
+    /// presence condition depends on these raw syntax values, not on the
+    /// resolved directional mode.
+    cu_chroma_dm: [bool; 4],
+    /// Whether the current intra CU uses PART_NxN. Needed by the exact
+    /// tu_residual_act_flag presence condition in transform_unit().
+    cu_intra_nxn: bool,
+    /// Current intra CU's chroma prediction modes. One per PU: index 0 for
+    /// 2Nx2N (or 4:2:0/4:2:2 NxN, where a single mode covers the CU), indices
+    /// 0..3 for a 4:4:4 NxN CU whose four PUs each code their own
+    /// intra_chroma_pred_mode (§7.3.8.5, ChromaArrayType==3).
+    cu_chroma_modes: [u8; 4],
+    /// Origin and PU size of the current intra CU, for selecting the chroma
+    /// mode of a TU by position within the CU.
+    cu_intra_x0: usize,
+    cu_intra_y0: usize,
+    cu_intra_pu: usize,
+    /// Explicit RDPCM direction parsed for the TU being reconstructed
+    /// (§7.3.8.11); consumed by the residual materialization below.
+    cur_tu_rdpcm: Option<u8>,
     grid_w: usize, // ceil(w/4), one entry for every covered 4×4 luma grid cell
     #[allow(dead_code)]
     grid_h: usize, // ceil(h/4)
@@ -168,7 +193,18 @@ pub(crate) struct FullDecoder<'cab> {
     qp_y_map: crate::plane::Plane<i16>, // per 4×4 luma (QpY ∈ -QpBdOffsetY..=51, fits i16)
     cu_qp_delta_val: i32,
     is_cu_qp_delta_coded: bool,
+    /// cu_chroma_qp_offset state (range-extension): whether coded for the current
+    /// quantization group, and the resolved (cb, cr) offsets applied.
+    is_cu_chroma_qp_offset_coded: bool,
+    cu_chroma_qp_offset_cb: i32,
+    cu_chroma_qp_offset_cr: i32,
+    /// Slice-level gate for chroma_qp_offset() syntax. PPS list presence only
+    /// makes this flag available in the slice header; it does not enable CU bins.
+    cu_chroma_qp_offset_enabled: bool,
     log2_qg: u32,
+    /// Minimum CU size at which the range-extension chroma-QP-offset state
+    /// is reset. This depth is independent from the luma delta-QP group size.
+    log2_chroma_qp_offset: u32,
     cur_qp: i32,
 
     sao: crate::plane::Plane<SaoCtb>,
@@ -185,6 +221,10 @@ pub(crate) struct FullDecoder<'cab> {
     // derivation (§8.6.1).
     slice_cb_qp_offset: i32,
     slice_cr_qp_offset: i32,
+    /// slice_act_y/cb/cr_qp_offset (§7.4.7.1), used only under ACT.
+    slice_act_y_qp_offset: i32,
+    slice_act_cb_qp_offset: i32,
+    slice_act_cr_qp_offset: i32,
 
     // Effective per-slice deblocking state (PPS values unless the slice header
     // overrode them).
@@ -197,6 +237,12 @@ pub(crate) struct FullDecoder<'cab> {
     // WPP context snapshots
     wpp_ctx_snap: Vec<Option<ContextSet>>,
     wpp_ictx_snap: Vec<Option<IntraModeContexts>>,
+    /// WPP palette-predictor snapshot per CTB row (§9.3.2.3): the row below
+    /// inherits the predictor as it stood after the 2nd CTB of the row above.
+    wpp_palette_snap: Vec<Option<crate::palette::PalettePredictor>>,
+    /// WPP palette CABAC context snapshot per CTB row (§9.3.2): palette contexts
+    /// must sync across WPP rows like the ordinary/intra context sets.
+    wpp_pctx_snap: Vec<Option<crate::cabac::PaletteContexts>>,
 
     /// TileId of the CTB currently being decoded (0 when tiles are disabled).
     /// Used to reject intra reference neighbors that lie in a different tile
@@ -210,6 +256,11 @@ pub(crate) struct FullDecoder<'cab> {
     deq_scratch: Box<[i32; 1024]>,
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
     res_scratch: Box<[i32; 1024]>,
+    /// Luma residual retained across Cb/Cr decoding when RExt
+    /// cross-component residual prediction is active.  Chroma residual coding
+    /// follows luma in the bitstream and reuses the co-located luma residual,
+    /// while `res_scratch` itself is reused for each chroma component.
+    cross_comp_luma: Box<[i32; 1024]>,
     /// i16 dequant/residual scratch, used on the 8-bit-depth path (half the width).
     deq_scratch16: Box<[i16; 1024]>,
     res_scratch16: Box<[i16; 1024]>,
@@ -237,9 +288,16 @@ pub(crate) struct FullDecoder<'cab> {
     mvd_l1_zero: bool,
     temporal_mvp: bool,
     max_num_merge_cand: usize,
+    /// use_integer_mv_flag for the current independent slice. Current-picture
+    /// references are integer regardless of this flag.
+    use_integer_mv: bool,
     /// True while decoding an inter CU: the residual reconstruction must not
     /// re-run intra prediction (the MC prediction is already in the planes).
     cur_cu_inter: bool,
+    /// curr_pic_ref: IBC is enabled for this picture (SPS+PPS both set). When
+    /// true, an intra picture also decodes cu_skip/pred_mode and may carry IBC
+    /// coding units referencing the current, partially-reconstructed picture.
+    _curr_pic_ref_active: bool,
     /// Whether the most recently decoded PU used merge mode (for the 2Nx2N
     /// merge rqt_root_cbf inference, §7.3.8.5).
     last_pu_merge: bool,
@@ -340,11 +398,16 @@ impl FullDecoder<'static> {
         let ctb_cols = w.div_ceil(ctb);
         let ctb_rows = h.div_ceil(ctb);
         let tiles = crate::tiles::TileGrid::from_pps(&pps, ctb_cols, ctb_rows);
-        let log2_qg = sps.log2_ctb - pps.diff_cu_qp_delta_depth;
+        let log2_qg = sps.log2_ctb.saturating_sub(pps.diff_cu_qp_delta_depth);
+        let log2_chroma_qp_offset = sps
+            .log2_ctb
+            .saturating_sub(pps.diff_cu_chroma_qp_offset_depth);
         Ok(FullDecoder {
             cab,
             ctx: qp,
             ictx,
+            pctx: crate::cabac::PaletteContexts::init(slice_qp.clamp(0, 51) as u8),
+            palette_predictor: initial_palette_predictor(&sps, &pps),
             exec: ExecContext::new(),
             bd: sps.bit_depth_luma,
             bd_c: sps.bit_depth_chroma,
@@ -404,6 +467,13 @@ impl FullDecoder<'static> {
                 },
             ],
             cu_tqb: false,
+            cu_chroma_dm: [false; 4],
+            cu_intra_nxn: false,
+            cu_chroma_modes: [MODE_DC; 4],
+            cu_intra_x0: 0,
+            cu_intra_y0: 0,
+            cu_intra_pu: 64,
+            cur_tu_rdpcm: None,
             ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
             grid_w,
             grid_h,
@@ -412,7 +482,12 @@ impl FullDecoder<'static> {
             qp_y_map: crate::plane::Plane::owned(vec![slice_qp as i16; grid_w * grid_h]),
             cu_qp_delta_val: 0,
             is_cu_qp_delta_coded: false,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_chroma_qp_offset_cb: 0,
+            cu_chroma_qp_offset_cr: 0,
+            cu_chroma_qp_offset_enabled: hdr.cu_chroma_qp_offset_enabled,
             log2_qg,
+            log2_chroma_qp_offset,
             cur_qp: slice_qp,
             sao: crate::plane::Plane::owned(vec![SaoCtb::default(); ctb_cols * ctb_rows]),
             ctb_cols,
@@ -422,15 +497,21 @@ impl FullDecoder<'static> {
             tiles,
             slice_cb_qp_offset: hdr.cb_qp_offset,
             slice_cr_qp_offset: hdr.cr_qp_offset,
+            slice_act_y_qp_offset: hdr.act_y_qp_offset,
+            slice_act_cb_qp_offset: hdr.act_cb_qp_offset,
+            slice_act_cr_qp_offset: hdr.act_cr_qp_offset,
             deblocking_disabled: hdr.deblocking_disabled,
             beta_offset_div2: hdr.beta_offset_div2,
             tc_offset_div2: hdr.tc_offset_div2,
             sign_hiding: pps.sign_data_hiding_enabled,
             wpp_ctx_snap: vec![None; ctb_rows],
             wpp_ictx_snap: vec![None; ctb_rows],
+            wpp_palette_snap: vec![None; ctb_rows],
+            wpp_pctx_snap: vec![None; ctb_rows],
             scratch: intra::IntraScratch::new(),
             deq_scratch: Box::new([0i32; 1024]),
             res_scratch: Box::new([0i32; 1024]),
+            cross_comp_luma: Box::new([0i32; 1024]),
             deq_scratch16: Box::new([0i16; 1024]),
             res_scratch16: Box::new([0i16; 1024]),
             coeff_scratch: vec![0i32; 1024],
@@ -446,7 +527,9 @@ impl FullDecoder<'static> {
             mvd_l1_zero: hdr.mvd_l1_zero,
             temporal_mvp: hdr.temporal_mvp,
             max_num_merge_cand: hdr.max_num_merge_cand.clamp(1, 5),
+            use_integer_mv: hdr.use_integer_mv,
             cur_cu_inter: false,
+            _curr_pic_ref_active: sps.curr_pic_ref_enabled && pps.curr_pic_ref_enabled,
             last_pu_merge: false,
             cu_skip_map: vec![false; grid_w * grid_h],
             collocated_from_l0: hdr.collocated_from_l0,
@@ -566,6 +649,7 @@ impl<'cab> FullDecoder<'cab> {
             self.mvd_l1_zero = hdr.mvd_l1_zero;
             self.temporal_mvp = hdr.temporal_mvp;
             self.max_num_merge_cand = hdr.max_num_merge_cand.clamp(1, 5);
+            self.use_integer_mv = hdr.use_integer_mv;
             self.collocated_from_l0 = hdr.collocated_from_l0;
             self.collocated_ref_idx = hdr.collocated_ref_idx;
             self.last_pu_merge = false;
@@ -585,6 +669,8 @@ impl<'cab> FullDecoder<'cab> {
             // in this slice merely because its absolute picture row aliases.
             self.wpp_ctx_snap.fill(None);
             self.wpp_ictx_snap.fill(None);
+            self.wpp_palette_snap.fill(None);
+            self.wpp_pctx_snap.fill(None);
             // Record this slice's loop_filter_across_slices flag so boundary
             // filtering can consult the owning slice (§8.7.1).
             let idx = self.cur_slice_idx as usize;
@@ -610,10 +696,17 @@ impl<'cab> FullDecoder<'cab> {
             self.cur_qp = slice_qp;
             self.cu_qp_delta_val = 0;
             self.is_cu_qp_delta_coded = false;
+            self.is_cu_chroma_qp_offset_coded = false;
+            self.cu_chroma_qp_offset_cb = 0;
+            self.cu_chroma_qp_offset_cr = 0;
             self.sao_luma = hdr.sao_luma;
             self.sao_chroma = hdr.sao_chroma;
             self.slice_cb_qp_offset = hdr.cb_qp_offset;
             self.slice_cr_qp_offset = hdr.cr_qp_offset;
+            self.cu_chroma_qp_offset_enabled = hdr.cu_chroma_qp_offset_enabled;
+            self.slice_act_y_qp_offset = hdr.act_y_qp_offset;
+            self.slice_act_cb_qp_offset = hdr.act_cb_qp_offset;
+            self.slice_act_cr_qp_offset = hdr.act_cr_qp_offset;
             self.deblocking_disabled = hdr.deblocking_disabled;
             self.beta_offset_div2 = hdr.beta_offset_div2;
             self.tc_offset_div2 = hdr.tc_offset_div2;
@@ -640,6 +733,14 @@ impl<'cab> FullDecoder<'cab> {
             };
             self.ctx = ContextSet::init(init_type, qp);
             self.ictx = IntraModeContexts::init(init_type, qp);
+            self.pctx = crate::cabac::PaletteContexts::init(qp);
+            let num_comps = if self.sps.chroma_idc == 0 { 1 } else { 3 };
+            let init = if self.pps.palette_predictor_initializer_present {
+                self.pps.palette_predictor_initializers.clone()
+            } else {
+                self.sps.palette_predictor_initializers.clone()
+            };
+            self.palette_predictor.reset_from(&init, num_comps);
         } else {
             // Dependent segment inherits contexts/state; only the QP predictor
             // resets at the segment's first quantization group (handled by the
@@ -700,6 +801,8 @@ impl<'cab> FullDecoder<'cab> {
         if store_snap && wpp && rx == 1 {
             self.wpp_ctx_snap[ry] = Some(self.ctx.clone());
             self.wpp_ictx_snap[ry] = Some(self.ictx);
+            self.wpp_palette_snap[ry] = Some(self.palette_predictor.clone());
+            self.wpp_pctx_snap[ry] = Some(self.pctx);
         }
 
         self.cab.decode_terminate() != 0
@@ -765,7 +868,14 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// I-slice initial entropy contexts for seeding wavefront row 0.
-    pub(crate) fn init_contexts_pub(&self) -> (ContextSet, IntraModeContexts) {
+    pub(crate) fn init_contexts_pub(
+        &self,
+    ) -> (
+        ContextSet,
+        IntraModeContexts,
+        crate::cabac::PaletteContexts,
+        crate::palette::PalettePredictor,
+    ) {
         let qp = self.slice_qp.clamp(0, 51) as u8;
         // CABAC init type (§9.3.2.2): I=0; P=1/2 and B=2/1, swapped by
         // cabac_init_flag. Must match the serial start-of-slice init so the
@@ -790,6 +900,8 @@ impl<'cab> FullDecoder<'cab> {
         (
             ContextSet::init(init_type, qp),
             IntraModeContexts::init(init_type, qp),
+            crate::cabac::PaletteContexts::init(qp),
+            initial_palette_predictor(&self.sps, &self.pps),
         )
     }
 
@@ -844,12 +956,17 @@ impl<'cab> FullDecoder<'cab> {
             grid_h: self.grid_h,
             slice_qp: self.slice_qp,
             log2_qg: self.log2_qg,
+            log2_chroma_qp_offset: self.log2_chroma_qp_offset,
             ctb_cols: self.ctb_cols,
             ctb_rows: self.ctb_rows,
             sao_luma: self.sao_luma,
             sao_chroma: self.sao_chroma,
             slice_cb_qp_offset: self.slice_cb_qp_offset,
             slice_cr_qp_offset: self.slice_cr_qp_offset,
+            cu_chroma_qp_offset_enabled: self.cu_chroma_qp_offset_enabled,
+            slice_act_y_qp_offset: self.slice_act_y_qp_offset,
+            slice_act_cb_qp_offset: self.slice_act_cb_qp_offset,
+            slice_act_cr_qp_offset: self.slice_act_cr_qp_offset,
             deblocking_disabled: self.deblocking_disabled,
             beta_offset_div2: self.beta_offset_div2,
             tc_offset_div2: self.tc_offset_div2,
@@ -862,6 +979,7 @@ impl<'cab> FullDecoder<'cab> {
             mvd_l1_zero: self.mvd_l1_zero,
             temporal_mvp: self.temporal_mvp,
             max_num_merge_cand: self.max_num_merge_cand,
+            use_integer_mv: self.use_integer_mv,
             collocated_from_l0: self.collocated_from_l0,
             collocated_ref_idx: self.collocated_ref_idx,
             ref_list0: self.ref_list0.clone(),
@@ -887,7 +1005,12 @@ impl<'cab> FullDecoder<'cab> {
         ry: usize,
         progress: &crate::threadpool::ProgressGate,
         above_progress: Option<&crate::threadpool::ProgressGate>,
-        snapshot_out: &std::sync::OnceLock<(ContextSet, IntraModeContexts)>,
+        snapshot_out: &std::sync::OnceLock<(
+            ContextSet,
+            IntraModeContexts,
+            crate::cabac::PaletteContexts,
+            crate::palette::PalettePredictor,
+        )>,
     ) -> Result<(), DecodeError> {
         let cols = self.ctb_cols;
         for rx in 0..cols {
@@ -900,7 +1023,12 @@ impl<'cab> FullDecoder<'cab> {
             // Publish the post-CTB-1 snapshot for the row below, straight from
             // the live contexts (no per-row snapshot array needed).
             if rx == 1 {
-                let _ = snapshot_out.set((self.ctx.clone(), self.ictx));
+                let _ = snapshot_out.set((
+                    self.ctx.clone(),
+                    self.ictx,
+                    self.pctx,
+                    self.palette_predictor.clone(),
+                ));
             }
 
             // Publish progress *after* the CTB is fully reconstructed so a waiter
@@ -914,7 +1042,12 @@ impl<'cab> FullDecoder<'cab> {
         // eligibility, but a mid-row end_of_slice could still occur on malformed
         // streams), make sure the row below gets *some* snapshot to avoid a hang.
         if snapshot_out.get().is_none() {
-            let _ = snapshot_out.set((self.ctx.clone(), self.ictx));
+            let _ = snapshot_out.set((
+                self.ctx.clone(),
+                self.ictx,
+                self.pctx,
+                self.palette_predictor.clone(),
+            ));
         }
         // Ensure the row below can always advance past our last column.
         progress.publish(cols + 2);
@@ -969,12 +1102,14 @@ impl<'cab> FullDecoder<'cab> {
         // available.
         let seek = |dec: &mut Self, substream: usize| {
             let mut seeked = false;
-            if let Some((cabac, _)) = cabac_and_starts
-                && let Some(&off) = sub_starts.get(substream)
-                && off <= cabac.len()
-                && dec.cab.reset_with(&cabac[off..]).is_ok()
-            {
-                seeked = true;
+            if let Some((cabac, _)) = cabac_and_starts {
+                if let Some(&off) = sub_starts.get(substream) {
+                    if off <= cabac.len() {
+                        if dec.cab.reset_with(&cabac[off..]).is_ok() {
+                            seeked = true;
+                        }
+                    }
+                }
             }
             if !seeked {
                 dec.cab.reinit_engine();
@@ -1015,14 +1150,21 @@ impl<'cab> FullDecoder<'cab> {
                         && (self.cur_slice_idx <= 1
                             || self.slice_idx_at((rx + 1) * ctb, (ry - 1) * ctb)
                                 == self.cur_slice_idx);
-                    if ur_ok
-                        && let (Some(ctx), Some(ictx)) = (
+                    if ur_ok {
+                        if let (Some(ctx), Some(ictx)) = (
                             self.wpp_ctx_snap[ry - 1].clone(),
                             self.wpp_ictx_snap[ry - 1],
-                        )
-                    {
-                        self.ctx = ctx;
-                        self.ictx = ictx;
+                        ) {
+                            self.ctx = ctx;
+                            self.ictx = ictx;
+                            // Palette predictor is part of the WPP sync state.
+                            if let Some(pal) = self.wpp_palette_snap[ry - 1].clone() {
+                                self.palette_predictor = pal;
+                            }
+                            if let Some(pc) = self.wpp_pctx_snap[ry - 1] {
+                                self.pctx = pc;
+                            }
+                        }
                     }
                 }
                 self.qp_y_prev = self.slice_qp;
@@ -1035,6 +1177,8 @@ impl<'cab> FullDecoder<'cab> {
             if wpp && rx == tile_col0 + 1 {
                 self.wpp_ctx_snap[ry] = Some(self.ctx.clone());
                 self.wpp_ictx_snap[ry] = Some(self.ictx);
+                self.wpp_palette_snap[ry] = Some(self.palette_predictor.clone());
+                self.wpp_pctx_snap[ry] = Some(self.pctx);
             }
 
             if terminated {
@@ -1068,6 +1212,16 @@ impl<'cab> FullDecoder<'cab> {
         };
         self.ctx = ContextSet::init(init_type, qp);
         self.ictx = IntraModeContexts::init(init_type, qp);
+        self.pctx = crate::cabac::PaletteContexts::init(qp);
+        // Palette predictor reset (§9.3.2.3): re-seed from SPS/PPS initialisers at
+        // every tile start / WPP row reset.
+        let num_comps = if self.sps.chroma_idc == 0 { 1 } else { 3 };
+        let init = if self.pps.palette_predictor_initializer_present {
+            self.pps.palette_predictor_initializers.clone()
+        } else {
+            self.sps.palette_predictor_initializers.clone()
+        };
+        self.palette_predictor.reset_from(&init, num_comps);
     }
 
     fn decode_slice_raster(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
@@ -1094,6 +1248,12 @@ impl<'cab> FullDecoder<'cab> {
                 ) {
                     self.ctx = ctx;
                     self.ictx = ictx;
+                    if let Some(pal) = self.wpp_palette_snap[ry - 1].take() {
+                        self.palette_predictor = pal;
+                    }
+                    if let Some(pc) = self.wpp_pctx_snap[ry - 1].take() {
+                        self.pctx = pc;
+                    }
                 }
                 self.cab.reinit_engine();
             }
@@ -1131,12 +1291,6 @@ impl<'cab> FullDecoder<'cab> {
             }
         }
         Ok(())
-    }
-
-    /// Apply in-loop filters (deblocking then SAO) over the fully-reconstructed
-    /// picture and return the planes. Call once, after all slice segments.
-    pub(crate) fn finish(&mut self, pool: Option<&crate::threadpool::ThreadPool>) -> YuvPlanes {
-        self.finish_with(pool, pool)
     }
 
     /// As [`Self::finish`], but with independent pools for deblocking and SAO so
@@ -1421,14 +1575,14 @@ impl<'cab> FullDecoder<'cab> {
         }
         // Cross-tile filtering: if disabled and the two sides are in different
         // tiles, do not filter.
-        if let Some(g) = &self.tiles
-            && !g.loop_filter_across_tiles
-        {
-            let ctb = self.log2_ctb;
-            let tp = g.tile_id_at(pxp >> ctb, pyp >> ctb);
-            let tq = g.tile_id_at(pxq >> ctb, pyq >> ctb);
-            if tp != tq {
-                return false;
+        if let Some(g) = &self.tiles {
+            if !g.loop_filter_across_tiles {
+                let ctb = self.log2_ctb;
+                let tp = g.tile_id_at(pxp >> ctb, pyp >> ctb);
+                let tq = g.tile_id_at(pxq >> ctb, pyq >> ctb);
+                if tp != tq {
+                    return false;
+                }
             }
         }
         true
@@ -1834,10 +1988,10 @@ impl<'cab> FullDecoder<'cab> {
         if !self.pps.loop_filter_across_slices {
             return true;
         }
-        if let Some(g) = &self.tiles
-            && !g.loop_filter_across_tiles
-        {
-            return true;
+        if let Some(g) = &self.tiles {
+            if !g.loop_filter_across_tiles {
+                return true;
+            }
         }
         if self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b) {
             return true;
@@ -2036,6 +2190,21 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             can_split && !in_pic
         };
+
+        // H.265 §7.3.8.4 resets the two CU-level QP syntax states at
+        // independent coding-quadtree depths, before descending into children.
+        // Treating chroma-QP offsets as if they shared diff_cu_qp_delta_depth
+        // keeps a stale flag across groups and skips a CABAC syntax element.
+        if self.pps.cu_qp_delta_enabled && log2_cb >= self.log2_qg {
+            self.is_cu_qp_delta_coded = false;
+            self.cu_qp_delta_val = 0;
+        }
+        if self.cu_chroma_qp_offset_enabled && log2_cb >= self.log2_chroma_qp_offset {
+            self.is_cu_chroma_qp_offset_coded = false;
+            self.cu_chroma_qp_offset_cb = 0;
+            self.cu_chroma_qp_offset_cr = 0;
+        }
+
         if split {
             let half = cb_size / 2;
             let d = depth + 1;
@@ -2057,23 +2226,31 @@ impl<'cab> FullDecoder<'cab> {
 
     fn split_cu_ctx(&self, x0: usize, y0: usize, depth: u8) -> usize {
         let mut inc = 0;
-        if x0 >= 4
-            && self.same_tile(x0 - 1, y0)
-            && self.same_slice(x0 - 1, y0)
-            && let Some(g) = self.grid_idx(x0 - 1, y0)
-            && self.decoded[g]
-            && self.ct_depth[g] as usize > depth as usize
-        {
-            inc += 1;
+        if x0 >= 4 {
+            if self.same_tile(x0 - 1, y0) {
+                if self.same_slice(x0 - 1, y0) {
+                    if let Some(g) = self.grid_idx(x0 - 1, y0) {
+                        if self.decoded[g] {
+                            if self.ct_depth[g] as usize > depth as usize {
+                                inc += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
-        if y0 >= 4
-            && self.same_tile(x0, y0 - 1)
-            && self.same_slice(x0, y0 - 1)
-            && let Some(g) = self.grid_idx(x0, y0 - 1)
-            && self.decoded[g]
-            && self.ct_depth[g] as usize > depth as usize
-        {
-            inc += 1;
+        if y0 >= 4 {
+            if self.same_tile(x0, y0 - 1) {
+                if self.same_slice(x0, y0 - 1) {
+                    if let Some(g) = self.grid_idx(x0, y0 - 1) {
+                        if self.decoded[g] {
+                            if self.ct_depth[g] as usize > depth as usize {
+                                inc += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
         inc
     }
@@ -2081,29 +2258,45 @@ impl<'cab> FullDecoder<'cab> {
     fn set_ct_depth(&mut self, x0: usize, y0: usize, size: usize, depth: u8) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.ct_depth[g] = depth;
+                if xx < self.w {
+                    if yy < self.h {
+                        if let Some(g) = self.grid_idx(xx, yy) {
+                            self.ct_depth[g] = depth;
+                        }
+                    }
                 }
             }
         }
     }
 
     fn coding_unit(&mut self, x0: usize, y0: usize, log2_cb: u32) {
-        // QG handling
+        // Initialize the luma QP predictor at the top-left CU of a QP group.
+        // The coded-state resets themselves happen at their normative, and
+        // potentially different, coding-quadtree depths in coding_quadtree().
         let qg_mask = !((1usize << self.log2_qg) - 1);
         let xqg = x0 & qg_mask;
         let yqg = y0 & qg_mask;
         if x0 == xqg && y0 == yqg {
-            self.is_cu_qp_delta_coded = false;
-            self.cu_qp_delta_val = 0;
             self.cur_qp = clamp_qpy(self.predict_qp(xqg, yqg), self.bd);
         }
 
-        // For P/B slices, cu_skip_flag then (if not skipped) pred_mode_flag select
-        // between inter and intra. I-slices are always intra (no flags coded).
+        // cu_transquant_bypass_flag (HEVC §7.3.8.5) is the first CU syntax
+        // element. It precedes cu_skip_flag / pred_mode_flag even for inter and
+        // SCC current-picture-reference CUs. Decoding it after those flags shifts
+        // the CABAC engine before either the residual or palette syntax is reached.
+        self.cu_tqb = if self.pps.transquant_bypass_enabled {
+            self.cab.decode_bin(&mut self.ctx.cu_transquant_bypass_flag) != 0
+        } else {
+            false
+        };
+        if self.cu_tqb {
+            let cb = 1usize << log2_cb;
+            self.set_tqb(x0, y0, cb);
+        }
+
+        // cu_skip_flag and pred_mode_flag are present only in P/B slices.
+        // SCC current-picture referencing changes the reference lists used by an
+        // inter CU; it does not add these syntax elements to an I slice.
         if self.slice_type != crate::inter::SLICE_I {
             let skip = self.decode_cu_skip_flag(x0, y0);
             if skip {
@@ -2115,26 +2308,32 @@ impl<'cab> FullDecoder<'cab> {
                 self.decode_inter_cu(x0, y0, log2_cb, false);
                 return;
             }
-            // else fall through to the intra CU path below.
         }
 
-        // cu_transquant_bypass_flag (HEVC §7.3.8.5): first CU element, present only
-        // when the PPS enables transquant bypass. When set, transform + quantization
-        // are skipped and the parsed residual is used verbatim (lossless coding).
-        self.cu_tqb = if self.pps.transquant_bypass_enabled {
-            self.cab.decode_bin(&mut self.ctx.cu_transquant_bypass_flag) != 0
+        // palette_mode_flag (§7.3.8.5, SCC): an intra CU coded as a palette
+        // block. Present when palette_mode_enabled_flag is set and
+        // log2CbSize <= MaxTbLog2SizeY (§7.3.8.5), i.e. the CU is no larger than
+        // the maximum transform block.
+        if self.sps.palette_mode_enabled
+            && log2_cb <= self.sps.log2_max_tb
+            && self.cab.decode_bin(&mut self.ictx.palette_mode_flag) != 0
+        {
+            self.decode_palette_cu(x0, y0, log2_cb);
+            return;
+        }
+
+        let cb_size = 1usize << log2_cb;
+        // For an intra CU at MinCbLog2SizeY, part_mode precedes pcm_flag.
+        // PART_NxN excludes PCM; larger intra CUs infer PART_2Nx2N.
+        let nxn = if log2_cb == self.log2_min_cb {
+            self.cab.decode_bin(&mut self.ctx.part_mode[0]) == 0
         } else {
             false
         };
-        if self.cu_tqb {
-            let cb = 1usize << log2_cb;
-            self.set_tqb(x0, y0, cb);
-        }
 
-        // pcm_flag (§7.3.8.5): present for an intra CU when I_PCM is enabled and
-        // the CB size is within [Log2MinIpcmCbSize, Log2MaxIpcmCbSize]. When set,
-        // the CU carries uncompressed samples instead of a prediction+residual.
-        if self.sps.pcm_enabled
+        // pcm_flag (§7.3.8.5) is present only for PART_2Nx2N after part_mode.
+        if !nxn
+            && self.sps.pcm_enabled
             && log2_cb >= self.sps.log2_min_pcm_cb
             && log2_cb <= self.sps.log2_max_pcm_cb
             && self.cab.decode_terminate() != 0
@@ -2142,14 +2341,6 @@ impl<'cab> FullDecoder<'cab> {
             self.decode_pcm_cu(x0, y0, log2_cb);
             return;
         }
-
-        let cb_size = 1usize << log2_cb;
-        // part_mode: NxN only at min CB
-        let nxn = if log2_cb == self.log2_min_cb {
-            self.cab.decode_bin(&mut self.ctx.part_mode[0]) == 0
-        } else {
-            false
-        };
 
         let npu = if nxn { 2 } else { 1 };
         let pu_size = cb_size / npu;
@@ -2195,12 +2386,34 @@ impl<'cab> FullDecoder<'cab> {
             self.set_mode(pux, puy, pu_size, mode);
         }
 
-        // intra_chroma_pred_mode (1 per CU for 4:2:0/4:2:2)
-        let chroma_mode = if self.sps.chroma.is_monochrome() {
-            MODE_DC
+        // intra_chroma_pred_mode (§7.3.8.5): one per CU, except ChromaArrayType
+        // == 3 (4:4:4) with NxN partitioning, which codes one per PU — each
+        // derived against its own PU's luma mode.
+        let n_chroma = if self.sps.chroma_idc == 3 && nxn {
+            4
         } else {
-            self.decode_chroma_mode(luma_modes[0])
+            1
         };
+        let mut chroma_modes = [MODE_DC; 4];
+        let mut chroma_dm = [false; 4];
+        if !self.sps.chroma.is_monochrome() {
+            for i in 0..n_chroma {
+                let (mode, derived_mode) = self.decode_chroma_mode(luma_modes[i]);
+                chroma_modes[i] = mode;
+                chroma_dm[i] = derived_mode;
+            }
+            if n_chroma == 1 {
+                chroma_modes = [chroma_modes[0]; 4];
+                chroma_dm = [chroma_dm[0]; 4];
+            }
+        }
+        let chroma_mode = chroma_modes[0];
+        self.cu_chroma_modes = chroma_modes;
+        self.cu_chroma_dm = chroma_dm;
+        self.cu_intra_nxn = nxn;
+        self.cu_intra_x0 = x0;
+        self.cu_intra_y0 = y0;
+        self.cu_intra_pu = pu_size.max(1);
 
         // transform_tree
         let intra_split = nxn;
@@ -2324,11 +2537,12 @@ impl<'cab> FullDecoder<'cab> {
     fn set_pcm(&mut self, x0: usize, y0: usize, size: usize) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.pcm[g] = true;
+                if xx < self.w {
+                    if yy < self.h {
+                        if let Some(g) = self.grid_idx(xx, yy) {
+                            self.pcm[g] = true;
+                        }
+                    }
                 }
             }
         }
@@ -2599,11 +2813,12 @@ impl<'cab> FullDecoder<'cab> {
         let qp = clamp_qpy(qp, self.bd) as i16;
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.qp_y_map[g] = qp;
+                if xx < self.w {
+                    if yy < self.h {
+                        if let Some(g) = self.grid_idx(xx, yy) {
+                            self.qp_y_map[g] = qp;
+                        }
+                    }
                 }
             }
         }
@@ -2612,11 +2827,12 @@ impl<'cab> FullDecoder<'cab> {
     fn set_mode(&mut self, x0: usize, y0: usize, size: usize, mode: u8) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.mode_y[g] = mode;
+                if xx < self.w {
+                    if yy < self.h {
+                        if let Some(g) = self.grid_idx(xx, yy) {
+                            self.mode_y[g] = mode;
+                        }
+                    }
                 }
             }
         }
@@ -2627,16 +2843,17 @@ impl<'cab> FullDecoder<'cab> {
         let s = self.cur_slice_idx;
         for yy in (y0..y0 + height).step_by(4) {
             for xx in (x0..x0 + width).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.decoded[g] = true;
-                    // Keep ownership in lock-step for alternate/PU-granular
-                    // decode paths too. The normal CTB path has already pre-tagged
-                    // the whole CTB before parsing any CU syntax.
-                    if mark_slice {
-                        self.slice_idx[g] = s;
+                if xx < self.w {
+                    if yy < self.h {
+                        if let Some(g) = self.grid_idx(xx, yy) {
+                            self.decoded[g] = true;
+                            // Keep ownership in lock-step for alternate/PU-granular
+                            // decode paths too. The normal CTB path has already pre-tagged
+                            // the whole CTB before parsing any CU syntax.
+                            if mark_slice {
+                                self.slice_idx[g] = s;
+                            }
+                        }
                     }
                 }
             }
@@ -2651,11 +2868,12 @@ impl<'cab> FullDecoder<'cab> {
     fn set_tqb(&mut self, x0: usize, y0: usize, size: usize) {
         for yy in (y0..y0 + size).step_by(4) {
             for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.tqb[g] = true;
+                if xx < self.w {
+                    if yy < self.h {
+                        if let Some(g) = self.grid_idx(xx, yy) {
+                            self.tqb[g] = true;
+                        }
+                    }
                 }
             }
         }
@@ -2716,9 +2934,10 @@ impl<'cab> FullDecoder<'cab> {
             .unwrap_or(MODE_DC)
     }
 
-    fn decode_chroma_mode(&mut self, luma_mode: u8) -> u8 {
+    fn decode_chroma_mode(&mut self, luma_mode: u8) -> (u8, bool) {
         let bin0 = self.cab.decode_bin(&mut self.ictx.intra_chroma_pred_mode);
-        let derived = if bin0 == 0 {
+        let is_derived_mode = bin0 == 0; // syntax value intra_chroma_pred_mode == 4
+        let derived = if is_derived_mode {
             luma_mode // DM
         } else {
             let mut idx = 0u8;
@@ -2732,11 +2951,12 @@ impl<'cab> FullDecoder<'cab> {
         // intra mode is remapped (the asymmetric sampling rotates the angle). This
         // mode drives both the angular prediction and the mode-dependent coefficient
         // scan, so it must match the encoder exactly.
-        if self.sps.chroma_idc == 2 {
+        let mode = if self.sps.chroma_idc == 2 {
             MODE_422_MAP[derived as usize]
         } else {
             derived
-        }
+        };
+        (mode, is_derived_mode)
     }
 }
 
@@ -2948,6 +3168,30 @@ impl<'cab> FullDecoder<'cab> {
         let any_chroma = cbf_cb.iter().any(|&b| b) || cbf_cr.iter().any(|&b| b);
         let need_qp = cbf_luma || any_chroma;
 
+        // tu_residual_act_flag is TU-local and appears before delta_qp().
+        // Its presence depends on the raw intra_chroma_pred_mode syntax (value
+        // 4, derived mode), not merely on the resolved chroma direction.
+        let tu_act = self.decode_tu_act_flag(need_qp);
+
+        // ACT combined 4:4:4 residual path: luma and both chroma TBs are the same
+        // size and co-located; residuals are jointly inverse-transformed with the
+        // colour transform before being added to their predictions.
+        if tu_act {
+            self.transform_unit_act(
+                x0,
+                y0,
+                log2_ts,
+                blk_idx,
+                luma_modes,
+                chroma_mode,
+                cbf_luma,
+                cbf_cb,
+                cbf_cr,
+                need_qp,
+            );
+            return;
+        }
+
         // Record this TU's boundaries for the deblocking filter (§8.7.2.4).
         // Intra TU boundaries are BS 2 directly. For inter, BS 1 from
         // coefficients is derived after the slice in `finalize_coeff_bs`, which
@@ -2972,18 +3216,28 @@ impl<'cab> FullDecoder<'cab> {
             self.cur_qp =
                 derive_qpy_from_delta(self.predict_qp_cur(), self.cu_qp_delta_val, self.bd);
         }
+        if any_chroma && !self.cu_tqb {
+            self.decode_chroma_qp_offset_syntax();
+        }
 
         // luma residual + reconstruction
         let luma_mode = self.luma_mode_at(x0, y0, luma_modes, blk_idx);
+        let cross_comp = self.pps.cross_component_prediction_enabled
+            && cbf_luma
+            && (self.cur_cu_inter || self.chroma_dm_at(x0, y0));
         if cbf_luma {
             let scan = luma_scan(luma_mode, log2_ts);
-            let ts_ctx = if self.pps.transform_skip_enabled && !self.cu_tqb && log2_ts == 2 {
+            let ts_ctx = if self.pps.transform_skip_enabled
+                && !self.cu_tqb
+                && log2_ts <= self.pps.log2_max_transform_skip_block_size
+            {
                 Some(0)
             } else {
                 None
             };
             let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-            let (transform_skip, max_x, _last_y, max_abs_level) = residual_coding(
+            let rext = self.rext_residual(luma_mode, true);
+            let (transform_skip, max_x, _last_y, max_abs_level, rdpcm) = residual_coding(
                 &mut self.cab,
                 &mut self.ctx,
                 self.exec.residual_scans,
@@ -2993,8 +3247,10 @@ impl<'cab> FullDecoder<'cab> {
                 self.sign_hiding,
                 ts_ctx,
                 self.cu_tqb,
+                &rext,
                 &mut coeffs,
             );
+            self.cur_tu_rdpcm = rdpcm;
             self.reconstruct_luma(
                 x0,
                 y0,
@@ -3004,6 +3260,7 @@ impl<'cab> FullDecoder<'cab> {
                 max_x + 1,
                 max_abs_level,
                 transform_skip,
+                cross_comp,
             );
             self.coeff_scratch = coeffs;
         } else if !self.cur_cu_inter {
@@ -3014,10 +3271,294 @@ impl<'cab> FullDecoder<'cab> {
         // chroma
         if chroma_present {
             if log2_ts > 2 || self.sps.chroma_idc == 3 {
-                self.do_chroma(x0, y0, log2_ts, chroma_mode, cbf_cb, cbf_cr);
+                self.do_chroma(x0, y0, log2_ts, chroma_mode, cbf_cb, cbf_cr, cross_comp);
             } else if blk_idx == 3 {
                 // 4×4 luma TUs: chroma coded once at parent 8×8 (log2=2 chroma)
-                self.do_chroma(xbase, ybase, 3, chroma_mode, cbf_cb, cbf_cr);
+                self.do_chroma(xbase, ybase, 3, chroma_mode, cbf_cb, cbf_cr, false);
+            }
+        }
+    }
+
+    /// Combined 4:4:4 ACT residual path (§8.6.7). Luma/Cb/Cr TBs are the same
+    /// size and co-located. Each component's residual is decoded, dequantized
+    /// (with its ACT-adjusted QP), and inverse-transformed independently; the
+    /// three residual blocks are then jointly run through the inverse colour
+    /// transform before being added to their (already-computed) predictions.
+    #[allow(clippy::too_many_arguments)]
+    fn transform_unit_act(
+        &mut self,
+        x0: usize,
+        y0: usize,
+        log2_ts: u32,
+        blk_idx: u8,
+        luma_modes: &[u8; 4],
+        chroma_mode: u8,
+        cbf_luma: bool,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
+        need_qp: bool,
+    ) {
+        let n = 1usize << log2_ts;
+        let n2 = n * n;
+        let tu_size = n;
+        self.mark_tu_edges(x0, y0, tu_size);
+        if cbf_luma {
+            self.set_nz_coeff(x0, y0, tu_size);
+        }
+        if !self.cur_cu_inter {
+            self.mark_block_edges(x0, y0, tu_size, 2);
+        }
+
+        // cu_qp_delta (shared with the non-ACT path).
+        if self.pps.cu_qp_delta_enabled && need_qp && !self.is_cu_qp_delta_coded {
+            self.cu_qp_delta_val = self.decode_cu_qp_delta();
+            self.is_cu_qp_delta_coded = true;
+            self.cur_qp =
+                derive_qpy_from_delta(self.predict_qp_cur(), self.cu_qp_delta_val, self.bd);
+        }
+        let any_chroma = cbf_cb.iter().any(|&b| b) || cbf_cr.iter().any(|&b| b);
+        if any_chroma && !self.cu_tqb {
+            self.decode_chroma_qp_offset_syntax();
+        }
+
+        let luma_mode = self.luma_mode_at(x0, y0, luma_modes, blk_idx);
+
+        // Three residual buffers (i32). Absent CBF ⇒ zero residual for that
+        // component (the colour transform still mixes it with the others).
+        let mut r_y = vec![0i32; n2];
+        let mut r_cb = vec![0i32; n2];
+        let mut r_cr = vec![0i32; n2];
+
+        // ACT-adjusted component QPs. The −5/−5/−3 base is already folded into
+        // the parsed pps_act_* offsets; the slice ACT offsets add on top.
+        let (act_y, act_cb, act_cr) = if self.pps.pps_slice_act_qp_offsets_present {
+            (
+                self.pps.pps_act_y_qp_offset + self.slice_act_y_qp_offset,
+                self.pps.pps_act_cb_qp_offset + self.slice_act_cb_qp_offset,
+                self.pps.pps_act_cr_qp_offset + self.slice_act_cr_qp_offset,
+            )
+        } else {
+            (
+                self.pps.pps_act_y_qp_offset,
+                self.pps.pps_act_cb_qp_offset,
+                self.pps.pps_act_cr_qp_offset,
+            )
+        };
+
+        if cbf_luma {
+            self.decode_residual_into_act(x0, y0, log2_ts, luma_mode, 0, act_y, &mut r_y);
+        }
+        let cross_comp = self.pps.cross_component_prediction_enabled
+            && cbf_luma
+            && (self.cur_cu_inter || self.chroma_dm_at(x0, y0));
+        // cross_comp_pred(Cb) is placed after luma residual coding and before
+        // any Cb residual bins.  It is present even when cbf_cb is zero.
+        let cb_scale = if cross_comp {
+            self.decode_cross_comp_scale(0)
+        } else {
+            0
+        };
+        // Cb (cIdx 1) and Cr (cIdx 2), 4:4:4 so same size, DCT (no DST).
+        // 4:4:4 NxN CUs carry per-PU chroma modes: select by TU position so
+        // mode-dependent scan and RDPCM decisions match the coded PU.
+        let cmode = if self.cur_cu_inter {
+            chroma_mode
+        } else {
+            self.chroma_mode_at(x0, y0)
+        };
+        if cbf_cb[0] {
+            self.decode_residual_into_act(x0, y0, log2_ts, cmode, 1, act_cb, &mut r_cb);
+        }
+        apply_cross_comp_residual(&mut r_cb, &r_y, self.bd, self.bd_c, cb_scale);
+
+        // The Cr scale syntax follows all Cb residual bins and precedes Cr.
+        let cr_scale = if cross_comp {
+            self.decode_cross_comp_scale(1)
+        } else {
+            0
+        };
+        if cbf_cr[0] {
+            self.decode_residual_into_act(x0, y0, log2_ts, cmode, 2, act_cr, &mut r_cr);
+        }
+        apply_cross_comp_residual(&mut r_cr, &r_y, self.bd, self.bd_c, cr_scale);
+
+        // Inverse colour transform on the co-located residual triples.
+        crate::act::inverse_block(&mut r_y, &mut r_cb, &mut r_cr, n2);
+
+        // Predict each component and add its transformed residual.
+        self.act_predict_and_add_luma(x0, y0, n, luma_mode, &r_y);
+        self.act_predict_and_add_chroma(true, x0, y0, n, chroma_mode, &r_cb);
+        self.act_predict_and_add_chroma(false, x0, y0, n, chroma_mode, &r_cr);
+    }
+
+    /// Decode + dequant + inverse-transform one component's residual into `out`
+    /// (i32, `n×n`) using ACT-adjusted QP. `component` is 0/1/2 for Y/Cb/Cr;
+    /// DST-4 applies solely to 4×4 intra luma.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_residual_into_act(
+        &mut self,
+        x0: usize,
+        y0: usize,
+        log2_ts: u32,
+        mode: u8,
+        component: usize,
+        act_qp_offset: i32,
+        out: &mut [i32],
+    ) {
+        let _ = (x0, y0);
+        let is_luma = component == 0;
+        let n = 1usize << log2_ts;
+        let scan = if is_luma {
+            luma_scan(mode, log2_ts)
+        } else {
+            chroma_scan(mode, log2_ts, true)
+        };
+        let ts_ctx = if self.pps.transform_skip_enabled
+            && !self.cu_tqb
+            && log2_ts <= self.pps.log2_max_transform_skip_block_size
+        {
+            Some(if is_luma { 0 } else { 1 })
+        } else {
+            None
+        };
+        let mut coeffs = std::mem::take(&mut self.coeff_scratch);
+        let rext = self.rext_residual(mode, is_luma);
+        let (transform_skip, _max_x, _last_y, max_abs_level, rdpcm) = residual_coding(
+            &mut self.cab,
+            &mut self.ctx,
+            self.exec.residual_scans,
+            log2_ts,
+            is_luma,
+            scan,
+            self.sign_hiding,
+            ts_ctx,
+            self.cu_tqb,
+            &rext,
+            &mut coeffs,
+        );
+
+        self.cur_tu_rdpcm = rdpcm;
+        let (rext_rot, rext_rdpcm) = self.rext_post_ops(transform_skip, n, mode);
+        if self.cu_tqb {
+            // Lossless: dequant/transform are bypassed; residual = parsed levels.
+            for (o, &c) in out[..n * n].iter_mut().zip(coeffs.iter()) {
+                *o = c;
+            }
+            apply_rext_residual_ops(&mut out[..n * n], n, rext_rot, rext_rdpcm);
+            self.coeff_scratch = coeffs;
+            return;
+        }
+
+        // Effective QP under ACT.  The ACT component offset replaces the normal
+        // PPS/slice chroma offsets; only the CU chroma-QP-list offset remains in
+        // addition (§8.6.1, equations 8-287/8-288).
+        let bd = if is_luma { self.bd } else { self.bd_c };
+        let qp_input = self.cur_qp + act_qp_offset;
+        let qp_prime_c = if is_luma {
+            qp_prime(clamp_qpy(qp_input, self.bd), bd)
+        } else {
+            let cu_offset = if component == 2 {
+                self.cu_chroma_qp_offset_cr
+            } else {
+                self.cu_chroma_qp_offset_cb
+            };
+            qp_prime(qpc(qp_input + cu_offset, self.sps.chroma_idc, bd), bd)
+        };
+
+        let scaling = scaling_matrix_from_lists(
+            self.pps.scaling_list.as_ref(),
+            self.sps.scaling_list.as_ref(),
+            component,
+            n,
+        );
+
+        let exec = &self.exec;
+        if transform_skip {
+            dequantize_transform_skip_scaled_into_i32(
+                exec,
+                &coeffs,
+                n,
+                qp_prime_c,
+                bd,
+                max_abs_level,
+                scaling,
+                out,
+            );
+            apply_rext_residual_ops(&mut out[..n * n], n, rext_rot, rext_rdpcm);
+        } else {
+            let deq = &mut self.deq_scratch;
+            dequantize_scaled_into_i32(
+                exec,
+                &coeffs,
+                n,
+                qp_prime_c,
+                bd,
+                max_abs_level,
+                scaling,
+                &mut deq[..n * n],
+            );
+            if n == 4 && is_luma && !self.cur_cu_inter {
+                (exec.inv_transform_dst4)(&deq[..n * n], bd, out);
+            } else {
+                (exec.inv_transform)(&deq[..n * n], n, bd, n, out);
+            }
+        }
+        self.coeff_scratch = coeffs;
+    }
+
+    /// Predict luma intra/inter and add the ACT residual into the plane.
+    fn act_predict_and_add_luma(&mut self, x0: usize, y0: usize, n: usize, mode: u8, res: &[i32]) {
+        if !self.cur_cu_inter {
+            self.predict_luma_block_into(x0, y0, n, mode);
+        } else {
+            self.load_plane_pred_luma(x0, y0, n);
+        }
+        let stride = self.w;
+        let valid_w = self.w.saturating_sub(x0).min(n);
+        let valid_h = self.h.saturating_sub(y0).min(n);
+        let pred = &self.scratch.pred[..n * n];
+        if valid_w != 0 {
+            if valid_h != 0 {
+                if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
+                    add_residual_into_i32(
+                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Predict chroma intra/inter and add the ACT residual into the Cb/Cr plane.
+    /// In 4:4:4 chroma coordinates equal luma coordinates.
+    fn act_predict_and_add_chroma(
+        &mut self,
+        is_cb: bool,
+        x0: usize,
+        y0: usize,
+        n: usize,
+        _mode: u8,
+        res: &[i32],
+    ) {
+        if !self.cur_cu_inter {
+            // ACT TUs are luma-sized (4:4:4); x0/y0 are luma coords, so the
+            // per-PU chroma-mode lookup applies directly.
+            let mode = self.chroma_mode_at(x0, y0);
+            self.predict_chroma_block_into(is_cb, x0, y0, n, mode);
+        } else {
+            self.load_plane_pred_chroma(is_cb, x0, y0, n);
+        }
+        let stride = self.cw;
+        let valid_w = self.cw.saturating_sub(x0).min(n);
+        let valid_h = self.ch.saturating_sub(y0).min(n);
+        let pred = &self.scratch.pred[..n * n];
+        let plane = if is_cb { &mut self.cb } else { &mut self.cr };
+        if valid_w != 0 {
+            if valid_h != 0 {
+                if let Some(dst) = plane_tail_mut(plane, stride, x0, y0) {
+                    add_residual_into_i32(
+                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+                    );
+                }
             }
         }
     }
@@ -3025,6 +3566,371 @@ impl<'cab> FullDecoder<'cab> {
     fn predict_qp_cur(&self) -> i32 {
         // qPY_PRED was stored in cur_qp at QG entry (before delta).
         self.cur_qp
+    }
+
+    /// Palette escape samples carry the same CU-level QP syntax as residual
+    /// coefficients. SCM places both elements before the palette run map, also
+    /// for the inferred all-escape case where no palette index syntax exists.
+    fn decode_palette_escape_qp_syntax(&mut self) {
+        // delta_qp() is present whenever palette escapes are present, including
+        // transquant-bypass CUs. Only chroma_qp_offset() is suppressed by TQB.
+        if self.pps.cu_qp_delta_enabled && !self.is_cu_qp_delta_coded {
+            self.cu_qp_delta_val = self.decode_cu_qp_delta();
+            self.is_cu_qp_delta_coded = true;
+            self.cur_qp =
+                derive_qpy_from_delta(self.predict_qp_cur(), self.cu_qp_delta_val, self.bd);
+        }
+        if !self.cu_tqb {
+            self.decode_chroma_qp_offset_syntax();
+        }
+    }
+
+    /// Decode chroma_qp_offset() once for the current chroma-QP-offset group.
+    /// This syntax is shared by palette escapes and ordinary transform units.
+    fn decode_chroma_qp_offset_syntax(&mut self) {
+        if !self.cu_chroma_qp_offset_enabled || self.is_cu_chroma_qp_offset_coded {
+            return;
+        }
+
+        let flag = self.cab.decode_bin(&mut self.pctx.chroma_qp_offset_flag) != 0;
+        let mut idx = 0usize;
+        if flag {
+            let list_len = self.pps.chroma_qp_offset_list.len();
+            while idx + 1 < list_len {
+                if self.cab.decode_bin(&mut self.pctx.chroma_qp_offset_idx) == 0 {
+                    break;
+                }
+                idx += 1;
+            }
+            let (cb, cr) = self
+                .pps
+                .chroma_qp_offset_list
+                .get(idx)
+                .copied()
+                .unwrap_or((0, 0));
+            self.cu_chroma_qp_offset_cb = cb;
+            self.cu_chroma_qp_offset_cr = cr;
+        } else {
+            self.cu_chroma_qp_offset_cb = 0;
+            self.cu_chroma_qp_offset_cr = 0;
+        }
+        self.is_cu_chroma_qp_offset_coded = true;
+    }
+
+    /// Decode a palette-mode coding unit (§7.3.8.13, §8.4.4.2): build the CU
+    /// palette from predictor reuse + signalled entries, decode the index map
+    /// (COPY_INDEX / COPY_ABOVE runs, escape samples), reconstruct the samples,
+    /// and update the persistent predictor.
+    fn decode_palette_cu(&mut self, x0: usize, y0: usize, log2_cb: u32) {
+        let size = 1usize << log2_cb;
+        let num_comps = if self.sps.chroma_idc == 0 { 1 } else { 3 };
+        let max_pred = self.sps.palette_max_predictor_size as usize;
+        let max_size = self.sps.palette_max_size as usize;
+
+        // --- (1) Predictor reuse flags (palette_predictor_run) ---
+        let pred_size = self.palette_predictor.size();
+        let (reused, num_reused) = {
+            let mut b = PaletteBridge {
+                cab: &mut self.cab,
+                pctx: &mut self.pctx,
+            };
+            crate::palette::decode_reuse_flags(&mut b, pred_size, max_size)
+        };
+
+        // --- (2) num_signalled_palette_entries ---
+        let num_signalled = if num_reused < max_size {
+            let mut b = PaletteBridge {
+                cab: &mut self.cab,
+                pctx: &mut self.pctx,
+            };
+            (crate::palette::read_eg0(&mut b) as usize).min(max_size - num_reused)
+        } else {
+            0
+        };
+        let palette_size = (num_reused + num_signalled).min(max_size);
+
+        // Reused predictor entries (in predictor order) form the palette head.
+        let mut palette: Vec<[u16; crate::palette::MAX_COMPONENTS]> =
+            Vec::with_capacity(palette_size);
+        for (k, &r) in reused.iter().enumerate() {
+            if r {
+                let mut e = [0u16; crate::palette::MAX_COMPONENTS];
+                for c in 0..num_comps {
+                    e[c] = self.palette_predictor.entries[c][k];
+                }
+                palette.push(e);
+            }
+        }
+
+        // --- (3) new_palette_entries, COMPONENT-MAJOR (§7.3.8.13):
+        // for each component, all `num_signalled` fixed-length values. ---
+        let new_start = palette.len();
+        for _ in 0..num_signalled {
+            palette.push([0u16; crate::palette::MAX_COMPONENTS]);
+        }
+        for c in 0..num_comps {
+            let nbits = if c == 0 {
+                self.bd as u32
+            } else {
+                self.bd_c as u32
+            };
+            for j in 0..num_signalled {
+                palette[new_start + j][c] = self.cab.decode_bypass_bits(nbits) as u16;
+            }
+        }
+
+        // --- (4) palette_escape_val_present_flag: present only when
+        // CurrentPaletteSize != 0 (§7.3.8.13). When the palette is empty the CU
+        // is all-escape and the flag is inferred 1. ---
+        let escape_present = if palette_size != 0 {
+            self.cab.decode_bypass() != 0
+        } else {
+            true
+        };
+
+        // MaxPaletteIndex = CurrentPaletteSize − 1 + escape_present.
+        let max_palette_index = palette_size as i64 - 1 + escape_present as i64;
+
+        // --- (5) index values + final-run flag, THEN transpose, THEN delta_qp/
+        // chroma_qp_offset, THEN runs (§7.3.8.13 order). ---
+        let (transpose, indices) = if max_palette_index > 0 {
+            let mpi = max_palette_index as u32;
+            let index_data = {
+                let mut b = PaletteBridge {
+                    cab: &mut self.cab,
+                    pctx: &mut self.pctx,
+                };
+                crate::palette::decode_index_values(&mut b, size * size, mpi)
+            };
+            let transpose = {
+                use crate::palette::PaletteBits;
+                let mut b = PaletteBridge {
+                    cab: &mut self.cab,
+                    pctx: &mut self.pctx,
+                };
+                b.transpose_flag() != 0
+            };
+            // delta_qp() / chroma_qp_offset(): only when escapes are present;
+            // the helper also applies the transquant-bypass inference.
+            if escape_present {
+                self.decode_palette_escape_qp_syntax();
+            }
+            let indices = {
+                let mut b = PaletteBridge {
+                    cab: &mut self.cab,
+                    pctx: &mut self.pctx,
+                };
+                crate::palette::assign_index_runs(&mut b, size, mpi, &index_data, transpose)
+            };
+            (transpose, indices)
+        } else if max_palette_index == 0 && escape_present && palette_size == 0 {
+            // All-escape CU: both luma delta-QP and chroma-QP adjustment remain
+            // present even though the index map is entirely inferred.
+            self.decode_palette_escape_qp_syntax();
+            (false, vec![palette_size as u32; size * size])
+        } else {
+            (false, vec![0u32; size * size])
+        };
+
+        // --- (6) escape values, COMPONENT-MAJOR (§7.3.8.13): for each component,
+        // scan all positions and read palette_escape_val at escape samples. ---
+        let esc_index = palette_size as u32;
+        let mut escapes = vec![[0u16; crate::palette::MAX_COMPONENTS]; size * size];
+        if escape_present {
+            let (qp_y, qp_cb, qp_cr) = self.palette_escape_qps();
+            for c in 0..num_comps {
+                let (qp, bd) = match c {
+                    0 => (qp_y, self.bd),
+                    1 => (qp_cb, self.bd_c),
+                    _ => (qp_cr, self.bd_c),
+                };
+                for (i, &idx) in indices.iter().enumerate() {
+                    if idx != esc_index {
+                        continue;
+                    }
+                    if c > 0 {
+                        let (bx, by) = crate::palette::scan_pos(i, size, false);
+                        // §7.3.8.13 tests chroma-sample presence using the
+                        // absolute luma coordinates xC/yC, not coordinates
+                        // relative to this CU.  Odd-positioned palette CUs
+                        // otherwise consume the wrong set of chroma escape
+                        // values and shift CABAC at the first such sample.
+                        let x_c = x0 + bx;
+                        let y_c = y0 + by;
+                        let present = match self.sps.chroma_idc {
+                            0 => false,
+                            1 => x_c & 1 == 0 && y_c & 1 == 0,
+                            2 if transpose => y_c & 1 == 0,
+                            2 => x_c & 1 == 0,
+                            3 => true,
+                            _ => false,
+                        };
+                        if !present {
+                            continue;
+                        }
+                    }
+                    let level = if self.cu_tqb {
+                        self.cab.decode_bypass_bits(bd as u32) as i32
+                    } else {
+                        crate::palette::read_egk(
+                            &mut PaletteBridge {
+                                cab: &mut self.cab,
+                                pctx: &mut self.pctx,
+                            },
+                            3,
+                        ) as i32
+                    };
+                    escapes[i][c] = dequant_escape(level, qp, bd, self.cu_tqb);
+                }
+            }
+        }
+
+        let cu = crate::palette::PaletteCu {
+            palette,
+            transpose,
+            indices,
+            escapes,
+            escape_index: esc_index,
+        };
+
+        // Reconstruct into the planes.
+        self.reconstruct_palette(&cu, x0, y0, size, num_comps);
+
+        // Update the persistent predictor from this CU's palette.
+        self.palette_predictor
+            .update(&cu.palette, &reused, max_pred);
+
+        // Bookkeeping: palette CUs are intra, always "decoded", TU-edge marked.
+        self.set_mode(x0, y0, size, MODE_DC);
+        self.mark_decoded(x0, y0, size);
+        self.mark_block_edges(x0, y0, size, 2);
+        self.set_slice_idx(x0, y0, size);
+        let cur_qp = clamp_qpy(self.cur_qp, self.bd);
+        self.qp_y_prev = cur_qp;
+        self.cur_qp = cur_qp;
+        self.set_qp(x0, y0, size, cur_qp);
+    }
+
+    /// Per-component QPs used to dequantize palette escape values (§8.4.4.2.2).
+    fn palette_escape_qps(&self) -> (i32, i32, i32) {
+        let qp_y = qp_prime(clamp_qpy(self.cur_qp, self.bd), self.bd);
+        if self.sps.chroma.is_monochrome() {
+            return (qp_y, qp_y, qp_y);
+        }
+        let idc = self.sps.chroma_idc;
+        let qp_cb = qp_prime(
+            qpc(
+                self.cur_qp
+                    + self.pps.cb_qp_offset
+                    + self.slice_cb_qp_offset
+                    + self.cu_chroma_qp_offset_cb,
+                idc,
+                self.bd_c,
+            ),
+            self.bd_c,
+        );
+        let qp_cr = qp_prime(
+            qpc(
+                self.cur_qp
+                    + self.pps.cr_qp_offset
+                    + self.slice_cr_qp_offset
+                    + self.cu_chroma_qp_offset_cr,
+                idc,
+                self.bd_c,
+            ),
+            self.bd_c,
+        );
+        (qp_y, qp_cb, qp_cr)
+    }
+
+    /// Write a decoded palette CU into the Y/Cb/Cr planes (§8.4.4.2).
+    fn reconstruct_palette(
+        &mut self,
+        cu: &crate::palette::PaletteCu,
+        x0: usize,
+        y0: usize,
+        size: usize,
+        num_comps: usize,
+    ) {
+        let cx0 = x0 / self.sub_w;
+        let cy0 = y0 / self.sub_h;
+        let strides = [self.w, self.cw, self.cw];
+        let dims = [(self.w, self.h), (self.cw, self.ch), (self.cw, self.ch)];
+        let origins = [(x0, y0), (cx0, cy0), (cx0, cy0)];
+        let sub = [
+            (1usize, 1usize),
+            (self.sub_w, self.sub_h),
+            (self.sub_w, self.sub_h),
+        ];
+        crate::palette::reconstruct(
+            cu,
+            size,
+            num_comps,
+            [self.y.deref_mut(), self.cb.deref_mut(), self.cr.deref_mut()],
+            strides,
+            dims,
+            origins,
+            sub,
+        );
+    }
+
+    /// Decode TU-local `tu_residual_act_flag` (§7.3.8.10). The flag is present
+    /// only for a TU carrying residual data and when ACT is enabled for 4:4:4,
+    /// with inter prediction or the exact intra derived-chroma-mode condition.
+    fn decode_tu_act_flag(&mut self, residual_present: bool) -> bool {
+        if !residual_present
+            || !self.pps.residual_adaptive_colour_transform_enabled
+            || self.sps.chroma_idc != 3
+        {
+            return false;
+        }
+
+        let syntax_present = self.cur_cu_inter
+            || if self.cu_intra_nxn {
+                self.cu_chroma_dm.iter().all(|&derived| derived)
+            } else {
+                self.cu_chroma_dm[0]
+            };
+        if !syntax_present {
+            return false;
+        }
+
+        let coded = self.cab.decode_bin(&mut self.ictx.cu_residual_act_flag) != 0;
+        // A conforming stream signals zero for transquant-bypass when luma and
+        // chroma bit depths differ. Still consume the syntax bin, but do not
+        // apply the non-orthonormal transform to malformed input.
+        coded && !(self.cu_tqb && self.bd != self.bd_c)
+    }
+
+    /// Decode one `cross_comp_pred()` scaling factor for Cb (`component=0`) or
+    /// Cr (`component=1`).  `log2_res_scale_abs_plus1` uses context-coded
+    /// truncated unary with cMax=4; value 4 therefore has no terminating zero.
+    fn decode_cross_comp_scale(&mut self, component: usize) -> i32 {
+        debug_assert!(component < 2);
+        let base = component * 4;
+        let mut log2_abs_plus1 = 0usize;
+        while log2_abs_plus1 < 4 {
+            let bin = self
+                .cab
+                .decode_bin(&mut self.ctx.log2_res_scale_abs_plus1[base + log2_abs_plus1]);
+            if bin == 0 {
+                break;
+            }
+            log2_abs_plus1 += 1;
+        }
+        if log2_abs_plus1 == 0 {
+            return 0;
+        }
+        let magnitude = 1i32 << (log2_abs_plus1 - 1);
+        if self
+            .cab
+            .decode_bin(&mut self.ctx.res_scale_sign_flag[component])
+            != 0
+        {
+            -magnitude
+        } else {
+            magnitude
+        }
     }
 
     fn decode_cu_qp_delta(&mut self) -> i32 {
@@ -3072,6 +3978,67 @@ impl<'cab> FullDecoder<'cab> {
             .and_then(|g| self.mode_y.get(g))
             .copied()
             .unwrap_or(MODE_DC)
+    }
+
+    /// Chroma prediction mode for the TU at luma position (x0,y0): the mode of
+    /// the PU quadrant it falls in within the current intra CU (§8.4.3; only a
+    /// 4:4:4 NxN CU has distinct per-PU chroma modes).
+    fn chroma_mode_at(&self, x0: usize, y0: usize) -> u8 {
+        let pu = self.cu_intra_pu.max(1);
+        let col = usize::from(x0.saturating_sub(self.cu_intra_x0) >= pu);
+        let row = usize::from(y0.saturating_sub(self.cu_intra_y0) >= pu);
+        self.cu_chroma_modes[row * 2 + col]
+    }
+
+    /// Whether the raw intra_chroma_pred_mode syntax for the PU containing the
+    /// TU was the derived-mode value 4.  Cross-component prediction and ACT
+    /// presence are defined from the raw syntax value, not the resolved mode.
+    fn chroma_dm_at(&self, x0: usize, y0: usize) -> bool {
+        let pu = self.cu_intra_pu.max(1);
+        let col = usize::from(x0.saturating_sub(self.cu_intra_x0) >= pu);
+        let row = usize::from(y0.saturating_sub(self.cu_intra_y0) >= pu);
+        self.cu_chroma_dm[row * 2 + col]
+    }
+
+    /// RExt residual-domain operations for a TS / transquant-bypass TB
+    /// (§8.6.4, §8.6.8): whether to rotate the 4×4 residual and which RDPCM
+    /// accumulation direction applies (0 = horizontal, 1 = vertical). `mode` is
+    /// the TB's intra prediction mode (ignored for inter CUs).
+    fn rext_post_ops(&self, transform_skip: bool, n: usize, mode: u8) -> (bool, Option<u8>) {
+        let ts_or_tqb = transform_skip || self.cu_tqb;
+        if !ts_or_tqb {
+            return (false, None);
+        }
+        let rotate = transform_skip
+            && !self.cu_tqb
+            && self.sps.transform_skip_rotation_enabled
+            && n == 4
+            && !self.cur_cu_inter;
+        let dir = if self.cur_cu_inter {
+            self.cur_tu_rdpcm
+        } else if self.sps.implicit_rdpcm_enabled && (mode == 10 || mode == 26) {
+            Some(u8::from(mode == 26))
+        } else {
+            None
+        };
+        (rotate, dir)
+    }
+
+    /// RExt residual-coding controls for the current TU (§7.4.3.2.2 SPS RExt
+    /// flags plus the current CU's inter/intra state).
+    fn rext_residual(&self, mode: u8, is_luma: bool) -> crate::cabac::RextResidual {
+        crate::cabac::RextResidual {
+            persistent_rice: self.sps.persistent_rice_adaptation_enabled,
+            transform_skip_context: self.sps.transform_skip_context_enabled,
+            explicit_rdpcm: self.sps.explicit_rdpcm_enabled,
+            implicit_rdpcm: self.sps.implicit_rdpcm_enabled
+                && !self.cur_cu_inter
+                && (mode == 10 || mode == 26),
+            bypass_alignment: self.sps.cabac_bypass_alignment_enabled,
+            extended_precision: self.sps.extended_precision_processing,
+            bit_depth: if is_luma { self.bd } else { self.bd_c },
+            is_inter: self.cur_cu_inter,
+        }
     }
 }
 
@@ -3208,10 +4175,10 @@ impl<'cab> FullDecoder<'cab> {
         if self.tiles.is_none() && self.cur_slice_idx <= 1 {
             return true;
         }
-        if let Some(g) = &self.tiles
-            && g.tile_id_at(nrx, nry) != g.tile_id_at(rx, ry)
-        {
-            return false;
+        if let Some(g) = &self.tiles {
+            if g.tile_id_at(nrx, nry) != g.tile_id_at(rx, ry) {
+                return false;
+            }
         }
         // Same slice: the neighbor must belong to the slice currently being
         // decoded. Multi-slice CTBs are pre-tagged before SAO/CU syntax; with a
@@ -3244,6 +4211,78 @@ impl<'cab> FullDecoder<'cab> {
             return true;
         }
         self.slice_idx_at(x, y) == self.cur_slice_idx
+    }
+
+    /// MinTbAddrZs for a luma sample location (§6.5.2), including tile-scan CTB
+    /// ordering. Returns `None` outside the coded picture or on arithmetic
+    /// overflow from a malformed configuration.
+    fn min_tb_addr_zs(&self, x: usize, y: usize) -> Option<usize> {
+        if x >= self.w || y >= self.h || self.ctb_cols == 0 {
+            return None;
+        }
+        let ctb_x = x >> self.log2_ctb;
+        let ctb_y = y >> self.log2_ctb;
+        let rs = ctb_y.checked_mul(self.ctb_cols)?.checked_add(ctb_x)?;
+        let ts = self.tiles.as_ref().map_or(rs, |grid| grid.rs_to_ts(rs));
+        crate::ibc::min_tb_addr_zs(x, y, self.log2_ctb, self.log2_min_tb, ts)
+    }
+
+    /// §6.4.1 z-scan availability for a source sample of a current-picture
+    /// reference. The current location is the coding-block origin, not the PU
+    /// origin; this matters for NxN and asymmetric inter partitions.
+    fn ibc_sample_available(&self, cu_x: usize, cu_y: usize, src_x: usize, src_y: usize) -> bool {
+        if src_x >= self.w || src_y >= self.h {
+            return false;
+        }
+        if !self.same_tile(src_x, src_y) || !self.same_slice(src_x, src_y) {
+            return false;
+        }
+        let Some(curr) = self.min_tb_addr_zs(cu_x, cu_y) else {
+            return false;
+        };
+        let Some(src) = self.min_tb_addr_zs(src_x, src_y) else {
+            return false;
+        };
+        src <= curr
+    }
+
+    /// Validate a current-picture reference against all §8.5.3.2.1 constraints:
+    /// source bounds, non-overlap, CTB wavefront, and z-scan/tile/slice
+    /// availability of both source corners.
+    fn ibc_bv_valid(&self, geom: crate::ibc::PuGeometry, mv: crate::inter::Mv) -> bool {
+        let bvx = (mv.x >> 2) as isize;
+        let bvy = (mv.y >> 2) as isize;
+        let chroma_array_type = if self.sps.separate_color_plane {
+            0
+        } else {
+            self.sps.chroma_idc
+        };
+        let (offset_x, offset_y) = if chroma_array_type == 0 {
+            (0, 0)
+        } else {
+            // mvCL is expressed in 1/8-chroma-sample units. An integer luma BV
+            // can still have a half-chroma-sample component in 4:2:0/4:2:2.
+            let mv_cx = isize::from(mv.x) * 2 / self.sub_w as isize;
+            let mv_cy = isize::from(mv.y) * 2 / self.sub_h as isize;
+            (
+                if mv_cx & 7 != 0 { 2 } else { 0 },
+                if mv_cy & 7 != 0 { 2 } else { 0 },
+            )
+        };
+        let Some(area) = crate::ibc::source_area(
+            geom,
+            bvx,
+            bvy,
+            offset_x,
+            offset_y,
+            self.w,
+            self.h,
+            self.log2_ctb,
+        ) else {
+            return false;
+        };
+        self.ibc_sample_available(geom.cu_x, geom.cu_y, area.x0, area.y0)
+            && self.ibc_sample_available(geom.cu_x, geom.cu_y, area.x1, area.y1)
     }
 
     /// Constrained intra prediction (§8.4.4.2.1): when the PPS flag is set, a
@@ -3343,8 +4382,10 @@ impl<'cab> FullDecoder<'cab> {
         nx: usize,
         max_abs_level: i32,
         transform_skip: bool,
+        capture_cross_comp: bool,
     ) {
         let n = 1usize << log2_ts;
+        let (rext_rot, rext_rdpcm) = self.rext_post_ops(transform_skip, n, mode);
         if !self.cur_cu_inter {
             self.predict_luma_block_into(x0, y0, n, mode);
         } else {
@@ -3361,6 +4402,7 @@ impl<'cab> FullDecoder<'cab> {
         if self.bd <= 8 {
             if self.cu_tqb {
                 (self.exec.narrow_i32_to_i16)(levels, &mut self.res_scratch16[..n * n]);
+                apply_rext_residual_ops(&mut self.res_scratch16[..n * n], n, rext_rot, rext_rdpcm);
             } else {
                 let qp_prime_y = qp_prime(self.cur_qp, self.bd);
                 let scaling = scaling_matrix_from_lists(
@@ -3379,6 +4421,12 @@ impl<'cab> FullDecoder<'cab> {
                         max_abs_level,
                         scaling,
                         &mut self.res_scratch16[..n * n],
+                    );
+                    apply_rext_residual_ops(
+                        &mut self.res_scratch16[..n * n],
+                        n,
+                        rext_rot,
+                        rext_rdpcm,
                     );
                 } else {
                     dequantize_scaled_into_i16(
@@ -3408,15 +4456,24 @@ impl<'cab> FullDecoder<'cab> {
                     }
                 }
             }
+            if capture_cross_comp {
+                for (dst, &src) in self.cross_comp_luma[..n * n]
+                    .iter_mut()
+                    .zip(self.res_scratch16[..n * n].iter())
+                {
+                    *dst = i32::from(src);
+                }
+            }
             let pred = &self.scratch.pred[..n * n];
             let res = &self.res_scratch16[..n * n];
-            if valid_w != 0
-                && valid_h != 0
-                && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
-            {
-                add_residual_into_i16(
-                    &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
-                );
+            if valid_w != 0 {
+                if valid_h != 0 {
+                    if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
+                        add_residual_into_i16(
+                            &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+                        );
+                    }
+                }
             }
             self.mark_decoded(x0, y0, n);
             return;
@@ -3426,6 +4483,7 @@ impl<'cab> FullDecoder<'cab> {
             // Lossless: residual is the parsed level array verbatim (row-major),
             // no scaling or inverse transform (HEVC §8.6.5).
             self.res_scratch[..n * n].copy_from_slice(&levels[..n * n]);
+            apply_rext_residual_ops(&mut self.res_scratch[..n * n], n, rext_rot, rext_rdpcm);
         } else {
             let qp_prime_y = qp_prime(self.cur_qp, self.bd);
             let scaling = scaling_matrix_from_lists(
@@ -3445,6 +4503,7 @@ impl<'cab> FullDecoder<'cab> {
                     scaling,
                     &mut self.res_scratch[..n * n],
                 );
+                apply_rext_residual_ops(&mut self.res_scratch[..n * n], n, rext_rot, rext_rdpcm);
             } else {
                 dequantize_scaled_into_i32(
                     &self.exec,
@@ -3473,15 +4532,19 @@ impl<'cab> FullDecoder<'cab> {
                 }
             }
         }
+        if capture_cross_comp {
+            self.cross_comp_luma[..n * n].copy_from_slice(&self.res_scratch[..n * n]);
+        }
         let pred = &self.scratch.pred[..n * n];
         let res = &self.res_scratch[..n * n];
-        if valid_w != 0
-            && valid_h != 0
-            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
-        {
-            add_residual_into_i32(
-                &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
-            );
+        if valid_w != 0 {
+            if valid_h != 0 {
+                if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
+                    add_residual_into_i32(
+                        &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
+                    );
+                }
+            }
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -3493,11 +4556,12 @@ impl<'cab> FullDecoder<'cab> {
         let stride = self.w;
         let valid_w = self.w.saturating_sub(x0).min(n);
         let valid_h = self.h.saturating_sub(y0).min(n);
-        if valid_w != 0
-            && valid_h != 0
-            && let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0)
-        {
-            copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
+        if valid_w != 0 {
+            if valid_h != 0 {
+                if let Some(dst) = plane_tail_mut(&mut self.y, stride, x0, y0) {
+                    copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
+                }
+            }
         }
         self.mark_decoded(x0, y0, n);
     }
@@ -3569,7 +4633,11 @@ impl<'cab> FullDecoder<'cab> {
             &sc.fa[..2 * n + 1],
             &sc.fl[..2 * n + 1],
             n,
-            true,
+            // is_luma gates only the DC / pure-horizontal / pure-vertical intra
+            // edge filters inside predict; the SCC flag (and implicit-RDPCM
+            // lossless blocks, §8.4.4.2.6) turns exactly those off.
+            !self.sps.intra_boundary_filtering_disabled
+                && !(self.sps.implicit_rdpcm_enabled && self.cu_tqb),
             self.bd,
             &mut sc.pred[..n * n],
             &mut sc.refs_ang,
@@ -3586,7 +4654,15 @@ impl<'cab> FullDecoder<'cab> {
         mode: u8,
         cbf_cb: [bool; 2],
         cbf_cr: [bool; 2],
+        cross_comp: bool,
     ) {
+        // 4:4:4 NxN CUs carry a chroma mode per PU; select by the TU's quadrant
+        // within the CU. For all other cases the four entries are identical.
+        let mode = if self.cur_cu_inter {
+            mode
+        } else {
+            self.chroma_mode_at(lx, ly)
+        };
         let idc = self.sps.chroma_idc;
         let clog2 = if idc == 3 { luma_log2 } else { luma_log2 - 1 };
         let cn = 1usize << clog2;
@@ -3600,9 +4676,20 @@ impl<'cab> FullDecoder<'cab> {
         let n_tb = if idc == 2 { 2 } else { 1 };
         let scan = chroma_scan(mode, clog2, idc == 3);
 
+        // cross_comp_pred(Cb) occurs before all Cb residual blocks.  The PPS
+        // flag is conforming only for 4:4:4, where there is one co-located TB.
+        let cb_scale = if cross_comp {
+            self.decode_cross_comp_scale(0)
+        } else {
+            0
+        };
+
         let qp_prime_cb = qp_prime(
             qpc(
-                self.cur_qp + self.pps.cb_qp_offset + self.slice_cb_qp_offset,
+                self.cur_qp
+                    + self.pps.cb_qp_offset
+                    + self.slice_cb_qp_offset
+                    + self.cu_chroma_qp_offset_cb,
                 idc,
                 self.bd_c,
             ),
@@ -3612,12 +4699,16 @@ impl<'cab> FullDecoder<'cab> {
             let ty = cy0 + t * cn;
             if cb {
                 let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-                let ts_ctx = if self.pps.transform_skip_enabled && !self.cu_tqb && clog2 == 2 {
+                let ts_ctx = if self.pps.transform_skip_enabled
+                    && !self.cu_tqb
+                    && clog2 <= self.pps.log2_max_transform_skip_block_size
+                {
                     Some(1)
                 } else {
                     None
                 };
-                let (transform_skip, max_x, _, max_abs_level) = residual_coding(
+                let rext = self.rext_residual(mode, false);
+                let (transform_skip, max_x, _, max_abs_level, rdpcm) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     self.exec.residual_scans,
@@ -3627,8 +4718,10 @@ impl<'cab> FullDecoder<'cab> {
                     self.sign_hiding,
                     ts_ctx,
                     self.cu_tqb,
+                    &rext,
                     &mut coeffs,
                 );
+                self.cur_tu_rdpcm = rdpcm;
                 self.reconstruct_chroma(
                     true,
                     cx0,
@@ -3640,15 +4733,28 @@ impl<'cab> FullDecoder<'cab> {
                     max_x + 1,
                     max_abs_level,
                     transform_skip,
+                    cb_scale,
                 );
                 self.coeff_scratch = coeffs;
+            } else if cb_scale != 0 {
+                self.reconstruct_cross_comp_only(true, cx0, ty, cn, mode, cb_scale);
             } else if !self.cur_cu_inter {
                 self.predict_only_chroma(true, cx0, ty, cn, mode);
             }
         }
+
+        // cross_comp_pred(Cr) is after every Cb residual bin and before Cr.
+        let cr_scale = if cross_comp {
+            self.decode_cross_comp_scale(1)
+        } else {
+            0
+        };
         let qp_prime_cr = qp_prime(
             qpc(
-                self.cur_qp + self.pps.cr_qp_offset + self.slice_cr_qp_offset,
+                self.cur_qp
+                    + self.pps.cr_qp_offset
+                    + self.slice_cr_qp_offset
+                    + self.cu_chroma_qp_offset_cr,
                 idc,
                 self.bd_c,
             ),
@@ -3658,12 +4764,16 @@ impl<'cab> FullDecoder<'cab> {
             let ty = cy0 + t * cn;
             if cr {
                 let mut coeffs = std::mem::take(&mut self.coeff_scratch);
-                let ts_ctx = if self.pps.transform_skip_enabled && !self.cu_tqb && clog2 == 2 {
+                let ts_ctx = if self.pps.transform_skip_enabled
+                    && !self.cu_tqb
+                    && clog2 <= self.pps.log2_max_transform_skip_block_size
+                {
                     Some(1)
                 } else {
                     None
                 };
-                let (transform_skip, max_x, _, max_abs_level) = residual_coding(
+                let rext = self.rext_residual(mode, false);
+                let (transform_skip, max_x, _, max_abs_level, rdpcm) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     self.exec.residual_scans,
@@ -3673,8 +4783,10 @@ impl<'cab> FullDecoder<'cab> {
                     self.sign_hiding,
                     ts_ctx,
                     self.cu_tqb,
+                    &rext,
                     &mut coeffs,
                 );
+                self.cur_tu_rdpcm = rdpcm;
                 self.reconstruct_chroma(
                     false,
                     cx0,
@@ -3686,8 +4798,11 @@ impl<'cab> FullDecoder<'cab> {
                     max_x + 1,
                     max_abs_level,
                     transform_skip,
+                    cr_scale,
                 );
                 self.coeff_scratch = coeffs;
+            } else if cr_scale != 0 {
+                self.reconstruct_cross_comp_only(false, cx0, ty, cn, mode, cr_scale);
             } else if !self.cur_cu_inter {
                 self.predict_only_chroma(false, cx0, ty, cn, mode);
             }
@@ -3815,7 +4930,9 @@ impl<'cab> FullDecoder<'cab> {
         nx: usize,
         max_abs_level: i32,
         transform_skip: bool,
+        res_scale: i32,
     ) {
+        let (rext_rot, rext_rdpcm) = self.rext_post_ops(transform_skip, n, mode);
         if !self.cur_cu_inter {
             self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
         } else {
@@ -3832,9 +4949,12 @@ impl<'cab> FullDecoder<'cab> {
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
-        if self.bd_c <= 8 {
+        // Cross-component prediction can grow an otherwise 8-bit residual
+        // beyond i16, so retain the i16 fast path only when no scaling is used.
+        if self.bd_c <= 8 && res_scale == 0 {
             if self.cu_tqb {
                 (self.exec.narrow_i32_to_i16)(levels, &mut self.res_scratch16[..n2]);
+                apply_rext_residual_ops(&mut self.res_scratch16[..n2], n, rext_rot, rext_rdpcm);
             } else {
                 if transform_skip {
                     dequantize_transform_skip_scaled_into_i16(
@@ -3847,6 +4967,7 @@ impl<'cab> FullDecoder<'cab> {
                         scaling,
                         &mut self.res_scratch16[..n2],
                     );
+                    apply_rext_residual_ops(&mut self.res_scratch16[..n2], n, rext_rot, rext_rdpcm);
                 } else {
                     dequantize_scaled_into_i16(
                         &self.exec,
@@ -3882,6 +5003,7 @@ impl<'cab> FullDecoder<'cab> {
         if self.cu_tqb {
             // Lossless: chroma residual is the parsed levels verbatim.
             self.res_scratch[..n2].copy_from_slice(&levels[..n2]);
+            apply_rext_residual_ops(&mut self.res_scratch[..n2], n, rext_rot, rext_rdpcm);
         } else {
             if transform_skip {
                 dequantize_transform_skip_scaled_into_i32(
@@ -3894,6 +5016,7 @@ impl<'cab> FullDecoder<'cab> {
                     scaling,
                     &mut self.res_scratch[..n2],
                 );
+                apply_rext_residual_ops(&mut self.res_scratch[..n2], n, rext_rot, rext_rdpcm);
             } else {
                 dequantize_scaled_into_i32(
                     &self.exec,
@@ -3914,9 +5037,58 @@ impl<'cab> FullDecoder<'cab> {
                 );
             }
         }
+        apply_cross_comp_residual(
+            &mut self.res_scratch[..n2],
+            &self.cross_comp_luma[..n2],
+            self.bd,
+            self.bd_c,
+            res_scale,
+        );
         let pred = &self.scratch.pred[..n2];
         let res = &self.res_scratch[..n2];
         if valid_w != 0 && valid_h != 0 {
+            let plane = if is_cb { &mut self.cb } else { &mut self.cr };
+            if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
+                add_residual_into_i32(
+                    &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd_c,
+                );
+            }
+        }
+    }
+
+    /// Reconstruct a chroma TB whose coded CBF is zero but whose
+    /// cross-component scale is non-zero.  The luma-derived term is still a
+    /// real chroma residual (§8.6.6), so prediction-only reconstruction would
+    /// silently drop it.
+    fn reconstruct_cross_comp_only(
+        &mut self,
+        is_cb: bool,
+        cx0: usize,
+        cy0: usize,
+        n: usize,
+        mode: u8,
+        res_scale: i32,
+    ) {
+        if !self.cur_cu_inter {
+            self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
+        } else {
+            self.load_plane_pred_chroma(is_cb, cx0, cy0, n);
+        }
+        let n2 = n * n;
+        self.res_scratch[..n2].fill(0);
+        apply_cross_comp_residual(
+            &mut self.res_scratch[..n2],
+            &self.cross_comp_luma[..n2],
+            self.bd,
+            self.bd_c,
+            res_scale,
+        );
+        let stride = self.cw;
+        let valid_w = self.cw.saturating_sub(cx0).min(n);
+        let valid_h = self.ch.saturating_sub(cy0).min(n);
+        if valid_w != 0 && valid_h != 0 {
+            let pred = &self.scratch.pred[..n2];
+            let res = &self.res_scratch[..n2];
             let plane = if is_cb { &mut self.cb } else { &mut self.cr };
             if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
                 add_residual_into_i32(
@@ -3940,6 +5112,29 @@ impl<'cab> FullDecoder<'cab> {
                 copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
             }
         }
+    }
+}
+
+/// HEVC §8.6.6, equation 8-324.  Use i64 for the intermediate because the
+/// normative expression shifts the luma residual by BitDepthC before shifting
+/// it back by BitDepthY; extended-precision streams can otherwise overflow an
+/// i32 temporary even though the final residual remains representable.
+#[inline]
+fn apply_cross_comp_residual(
+    chroma: &mut [i32],
+    luma: &[i32],
+    bit_depth_y: u8,
+    bit_depth_c: u8,
+    res_scale: i32,
+) {
+    if res_scale == 0 {
+        return;
+    }
+    debug_assert!(chroma.len() <= luma.len());
+    for (c, &y) in chroma.iter_mut().zip(luma.iter()) {
+        let scaled_y = (i64::from(y) << u32::from(bit_depth_c)) >> u32::from(bit_depth_y);
+        let delta = (i64::from(res_scale) * scaled_y) >> 3;
+        *c = (i64::from(*c) + delta).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
     }
 }
 
@@ -3987,12 +5182,17 @@ pub(crate) struct RowFactory {
     grid_h: usize,
     slice_qp: i32,
     log2_qg: u32,
+    log2_chroma_qp_offset: u32,
     ctb_cols: usize,
     ctb_rows: usize,
     sao_luma: bool,
     sao_chroma: bool,
     slice_cb_qp_offset: i32,
     slice_cr_qp_offset: i32,
+    cu_chroma_qp_offset_enabled: bool,
+    slice_act_y_qp_offset: i32,
+    slice_act_cb_qp_offset: i32,
+    slice_act_cr_qp_offset: i32,
     deblocking_disabled: bool,
     beta_offset_div2: i32,
     tc_offset_div2: i32,
@@ -4008,6 +5208,7 @@ pub(crate) struct RowFactory {
     mvd_l1_zero: bool,
     temporal_mvp: bool,
     max_num_merge_cand: usize,
+    use_integer_mv: bool,
     collocated_from_l0: bool,
     collocated_ref_idx: usize,
     ref_list0: Vec<crate::dpb::RefEntry>,
@@ -4033,6 +5234,8 @@ impl RowFactory {
         row_cabac: &'row [u8],
         ctx: ContextSet,
         ictx: IntraModeContexts,
+        pctx: crate::cabac::PaletteContexts,
+        palette_predictor: crate::palette::PalettePredictor,
     ) -> Result<FullDecoder<'row>, DecodeError> {
         let cab = CabacDecoder::new_borrowed(row_cabac)
             .map_err(|_| DecodeError::Bitstream("row cabac init".into()))?;
@@ -4046,6 +5249,8 @@ impl RowFactory {
             cab,
             ctx,
             ictx,
+            pctx,
+            palette_predictor,
             sps: self.sps.clone(),
             pps: self.pps.clone(),
             exec: self.exec.clone(),
@@ -4097,6 +5302,13 @@ impl RowFactory {
                 },
             ],
             cu_tqb: false,
+            cu_chroma_dm: [false; 4],
+            cu_intra_nxn: false,
+            cu_chroma_modes: [MODE_DC; 4],
+            cu_intra_x0: 0,
+            cu_intra_y0: 0,
+            cu_intra_pu: 64,
+            cur_tu_rdpcm: None,
             grid_w: self.grid_w,
             grid_h: self.grid_h,
             ct_depth: mk8(self.ct_depth),
@@ -4105,7 +5317,12 @@ impl RowFactory {
             qp_y_map: mki(self.qp_y_map),
             cu_qp_delta_val: 0,
             is_cu_qp_delta_coded: false,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_chroma_qp_offset_cb: 0,
+            cu_chroma_qp_offset_cr: 0,
+            cu_chroma_qp_offset_enabled: self.cu_chroma_qp_offset_enabled,
             log2_qg: self.log2_qg,
+            log2_chroma_qp_offset: self.log2_chroma_qp_offset,
             cur_qp: self.slice_qp,
             sao: mks(self.sao),
             ctb_cols: self.ctb_cols,
@@ -4117,6 +5334,9 @@ impl RowFactory {
             cur_tile_id: 0,
             slice_cb_qp_offset: self.slice_cb_qp_offset,
             slice_cr_qp_offset: self.slice_cr_qp_offset,
+            slice_act_y_qp_offset: self.slice_act_y_qp_offset,
+            slice_act_cb_qp_offset: self.slice_act_cb_qp_offset,
+            slice_act_cr_qp_offset: self.slice_act_cr_qp_offset,
             deblocking_disabled: self.deblocking_disabled,
             beta_offset_div2: self.beta_offset_div2,
             tc_offset_div2: self.tc_offset_div2,
@@ -4126,9 +5346,12 @@ impl RowFactory {
             // allocation per row).
             wpp_ctx_snap: Vec::new(),
             wpp_ictx_snap: Vec::new(),
+            wpp_palette_snap: Vec::new(),
+            wpp_pctx_snap: Vec::new(),
             scratch: intra::IntraScratch::new(),
             deq_scratch: Box::new([0i32; 1024]),
             res_scratch: Box::new([0i32; 1024]),
+            cross_comp_luma: Box::new([0i32; 1024]),
             deq_scratch16: Box::new([0i16; 1024]),
             res_scratch16: Box::new([0i16; 1024]),
             coeff_scratch: vec![0i32; 1024],
@@ -4143,7 +5366,9 @@ impl RowFactory {
             mvd_l1_zero: self.mvd_l1_zero,
             temporal_mvp: self.temporal_mvp,
             max_num_merge_cand: self.max_num_merge_cand,
+            use_integer_mv: self.use_integer_mv,
             cur_cu_inter: false,
+            _curr_pic_ref_active: self.sps.curr_pic_ref_enabled && self.pps.curr_pic_ref_enabled,
             last_pu_merge: false,
             cu_skip_map: Vec::new(),
             collocated_from_l0: self.collocated_from_l0,
@@ -4180,7 +5405,99 @@ fn derive_qpy_from_delta(prev: i32, delta: i32, bit_depth: u8) -> i32 {
     clamp_qpy(qp as i32, bit_depth)
 }
 
+/// Bridges the CABAC engine + palette contexts to the `PaletteBits` trait so the
+/// format-independent palette entropy logic in `crate::palette` can drive them.
+struct PaletteBridge<'a, 'cab> {
+    cab: &'a mut CabacDecoder<'cab>,
+    pctx: &'a mut crate::cabac::PaletteContexts,
+}
+
+impl crate::palette::PaletteBits for PaletteBridge<'_, '_> {
+    fn run_type_flag(&mut self) -> u8 {
+        // palette_run_type_flag AND copy_above_indices_for_final_run_flag share
+        // the SAME context variable (§9.3.4.2.1): one probability state.
+        self.cab.decode_bin(&mut self.pctx.run_type_flag)
+    }
+    fn transpose_flag(&mut self) -> u8 {
+        self.cab.decode_bin(&mut self.pctx.transpose_flag)
+    }
+    fn run_prefix_bin(&mut self, bin_idx: usize, copy_above: bool) -> u8 {
+        // H.265 Table 9-51. The COPY_INDEX first bin is handled separately
+        // because its context depends on palette_idx_idc.
+        let ctx = match (copy_above, bin_idx) {
+            (false, 1 | 2) => Some(3),
+            (false, 3 | 4) => Some(4),
+            (true, 0) => Some(5),
+            (true, 1 | 2) => Some(6),
+            (true, 3 | 4) => Some(7),
+            _ => None,
+        };
+        match ctx {
+            Some(i) => self.cab.decode_bin(&mut self.pctx.run_prefix[i]),
+            None => self.cab.decode_bypass(),
+        }
+    }
+    fn run_prefix_index_bin(&mut self, palette_index: u32) -> u8 {
+        // First COPY_INDEX prefix bin: context depends on the palette index
+        // bucket (§9.3.4.2.1), sharing contexts [0..2] with the index-mode bins.
+        let ci = if palette_index == 0 {
+            0
+        } else if palette_index < 3 {
+            1
+        } else {
+            2
+        };
+        self.cab.decode_bin(&mut self.pctx.run_prefix[ci])
+    }
+    fn bypass(&mut self) -> u8 {
+        self.cab.decode_bypass()
+    }
+    fn bypass_bits(&mut self, n: u32) -> u32 {
+        self.cab.decode_bypass_bits(n)
+    }
+}
+
+/// Dequantize a palette escape value (§8.4.4.2.2). Under cu_transquant_bypass the
+/// coded value is the reconstructed sample directly. Otherwise the normative
+/// scaling applies:
+///   bdShift = (bitDepth + 4)     // = Max(20 − bitDepth, 0) form with tsShift 5
+///   tmp = (level * levelScale[qP%6] << (qP/6)) + (1 << (bdShift − 1))
+///   rec = Clip3(0, (1<<bitDepth)−1, tmp >> bdShift)
+/// where `qP` is the component Qp′ (already including the QpBdOffset).
+fn dequant_escape(level: i32, qp_prime: i32, bit_depth: u8, tqb: bool) -> u16 {
+    let max = (1i32 << bit_depth) - 1;
+    if tqb {
+        return level.clamp(0, max) as u16;
+    }
+    let qp = qp_prime.max(0);
+    // Palette escape reconstruction (§8.4.4.2): fixed final shift of 6, +32
+    // rounding, independent of bit depth.
+    //   tmp = ((level * levelScale[qP%6]) << (qP/6)) + 32
+    //   rec = Clip3(0, (1<<bitDepth)-1, tmp >> 6)
+    let scaled = ((level as i64 * level_scale(qp % 6) as i64) << (qp / 6)) + 32;
+    (scaled >> 6).clamp(0, max as i64) as u16
+}
+
 #[inline]
+fn level_scale(rem: i32) -> i32 {
+    const LS: [i32; 6] = [40, 45, 51, 57, 64, 72];
+    LS[rem.rem_euclid(6) as usize]
+}
+
+/// Seed the palette predictor (§9.3.2.3): PPS initialisers take precedence over
+/// SPS initialisers; absent both, the predictor starts empty.
+fn initial_palette_predictor(sps: &Sps, pps: &Pps) -> crate::palette::PalettePredictor {
+    let num_comps = if sps.chroma_idc == 0 { 1 } else { 3 };
+    let mut p = crate::palette::PalettePredictor::default();
+    let init = if pps.palette_predictor_initializer_present {
+        &pps.palette_predictor_initializers
+    } else {
+        &sps.palette_predictor_initializers
+    };
+    p.reset_from(init, num_comps);
+    p
+}
+
 fn qp_prime(qp: i32, bit_depth: u8) -> i32 {
     let off = qp_bd_offset(bit_depth);
     (qp + off).clamp(0, 51 + off)
@@ -4326,6 +5643,22 @@ impl InterPartMode {
             InterPartMode::PnRx2N => vec![(x0, y0, cb - q, cb), (x0 + cb - q, y0, q, cb)],
         }
     }
+
+    /// nPbSw/nPbSh from §8.5.3.2.1 equations 8-86 and 8-87. These spans are
+    /// used only by the current-picture reference CTB-availability constraint;
+    /// asymmetric PUs retain the span of their partition direction.
+    #[inline]
+    fn ibc_spans(self, cb: usize) -> (usize, usize) {
+        let span_w = match self {
+            InterPartMode::P2Nx2N | InterPartMode::P2NxN => cb,
+            _ => cb / 2,
+        };
+        let span_h = match self {
+            InterPartMode::P2Nx2N | InterPartMode::PNx2N => cb,
+            _ => cb / 2,
+        };
+        (span_w, span_h)
+    }
 }
 
 /// Neighbor-motion accessor bridging the FullDecoder's per-4x4 motion field and
@@ -4364,7 +5697,7 @@ impl<'a> DecoderNeighbors<'a> {
 
 impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
     fn motion_at(&self, x: isize, y: isize) -> Option<MotionInfo> {
-        if !self.available(x, y) {
+        if x < 0 || y < 0 {
             return None;
         }
         let g = self.grid(x as usize, y as usize)?;
@@ -4416,6 +5749,13 @@ impl<'a> crate::motion::Neighbors for DecoderNeighbors<'a> {
         } else {
             self.ref_list1.get(self.collocated_ref_idx)
         }?;
+        // The current picture can appear in the reference lists (SCC
+        // current-picture referencing) but is never a valid collocated picture:
+        // its own motion field is still being written. §8.5.3.2.8 derives TMVP
+        // only from a previously decoded picture.
+        if col.poc == cur_poc {
+            return None;
+        }
         let frame = self.ref_frames.iter().find(|f| f.poc == col.poc)?;
         if frame.width4 == 0 {
             return None;
@@ -4506,23 +5846,31 @@ impl<'cab> FullDecoder<'cab> {
         // §6.4.1 process: a left/above neighbor in a different slice or tile is
         // unavailable and must not contribute to the context increment.
         let mut inc = 0usize;
-        if x0 >= 4
-            && self.same_tile(x0 - 1, y0)
-            && self.same_slice(x0 - 1, y0)
-            && let Some(g) = self.grid_idx(x0 - 1, y0)
-            && self.decoded[g]
-            && self.motion_is_skip(g)
-        {
-            inc += 1;
+        if x0 >= 4 {
+            if self.same_tile(x0 - 1, y0) {
+                if self.same_slice(x0 - 1, y0) {
+                    if let Some(g) = self.grid_idx(x0 - 1, y0) {
+                        if self.decoded[g] {
+                            if self.motion_is_skip(g) {
+                                inc += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
-        if y0 >= 4
-            && self.same_tile(x0, y0 - 1)
-            && self.same_slice(x0, y0 - 1)
-            && let Some(g) = self.grid_idx(x0, y0 - 1)
-            && self.decoded[g]
-            && self.motion_is_skip(g)
-        {
-            inc += 1;
+        if y0 >= 4 {
+            if self.same_tile(x0, y0 - 1) {
+                if self.same_slice(x0, y0 - 1) {
+                    if let Some(g) = self.grid_idx(x0, y0 - 1) {
+                        if self.decoded[g] {
+                            if self.motion_is_skip(g) {
+                                inc += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.cab.decode_bin(&mut self.ctx.cu_skip_flag[inc]) != 0
     }
@@ -4548,10 +5896,10 @@ impl<'cab> FullDecoder<'cab> {
         self.mark_motion_bs(x0, y0, w, h, &mi);
         for yy in (y0..y0 + h).step_by(4) {
             for xx in (x0..x0 + w).step_by(4) {
-                if let Some(g) = self.grid_idx(xx, yy)
-                    && g < self.motion.len()
-                {
-                    self.motion[g] = mi;
+                if let Some(g) = self.grid_idx(xx, yy) {
+                    if g < self.motion.len() {
+                        self.motion[g] = mi;
+                    }
                 }
             }
         }
@@ -4569,33 +5917,35 @@ impl<'cab> FullDecoder<'cab> {
     ) {
         let gw = self.grid_w;
         // Left edge at x0 (vertical boundary), on the 8×8 deblock grid.
-        if x0 > 0 && x0.is_multiple_of(8) {
+        if x0 > 0 && ((x0) % (8) == 0) {
             let gx = x0 / 4;
             let mut yy = y0;
             while yy < (y0 + h).min(self.h) {
                 let g = (yy / 4) * gw + gx;
-                if let Some(gl) = self.grid_idx(x0 - 1, yy)
-                    && self.motion_differs(gl, mi)
-                    && self.bs_v[g] < 1
-                {
-                    self.bs_v[g] = 1;
-                    self.edge_v[g] = true;
+                if let Some(gl) = self.grid_idx(x0 - 1, yy) {
+                    if self.motion_differs(gl, mi) {
+                        if self.bs_v[g] < 1 {
+                            self.bs_v[g] = 1;
+                            self.edge_v[g] = true;
+                        }
+                    }
                 }
                 yy += 4;
             }
         }
         // Top edge at y0 (horizontal boundary).
-        if y0 > 0 && y0.is_multiple_of(8) {
+        if y0 > 0 && ((y0) % (8) == 0) {
             let base = (y0 / 4) * gw;
             let mut xx = x0;
             while xx < (x0 + w).min(self.w) {
                 let g = base + xx / 4;
-                if let Some(gt) = self.grid_idx(xx, y0 - 1)
-                    && self.motion_differs(gt, mi)
-                    && self.bs_h[g] < 1
-                {
-                    self.bs_h[g] = 1;
-                    self.edge_h[g] = true;
+                if let Some(gt) = self.grid_idx(xx, y0 - 1) {
+                    if self.motion_differs(gt, mi) {
+                        if self.bs_h[g] < 1 {
+                            self.bs_h[g] = 1;
+                            self.edge_h[g] = true;
+                        }
+                    }
                 }
                 xx += 4;
             }
@@ -4626,18 +5976,29 @@ impl<'cab> FullDecoder<'cab> {
         self.mark_tu_edges(x0, y0, cb);
         for yy in (y0..y0 + cb).step_by(4) {
             for xx in (x0..x0 + cb).step_by(4) {
-                if let Some(g) = self.grid_idx(xx, yy)
-                    && g < self.cu_skip_map.len()
-                {
-                    self.cu_skip_map[g] = skip;
+                if let Some(g) = self.grid_idx(xx, yy) {
+                    if g < self.cu_skip_map.len() {
+                        self.cu_skip_map[g] = skip;
+                    }
                 }
             }
         }
 
         if skip {
             // Skip: single 2Nx2N merge PU, no residual.
-            let mi = self.decode_merge_pu(x0, y0, cb, cb, x0, y0, cb, cb, 0);
-            self.motion_compensate(x0, y0, cb, cb, &mi);
+            let geom = crate::ibc::PuGeometry {
+                cu_x: x0,
+                cu_y: y0,
+                cu_size: cb,
+                pu_x: x0,
+                pu_y: y0,
+                pu_w: cb,
+                pu_h: cb,
+                pb_span_w: cb,
+                pb_span_h: cb,
+            };
+            let mut mi = self.decode_merge_pu(geom, 0);
+            self.predict_pu(geom, &mut mi);
             self.store_motion(x0, y0, cb, cb, mi);
             self.finish_inter_cu(x0, y0, cb);
             return;
@@ -4646,7 +6007,7 @@ impl<'cab> FullDecoder<'cab> {
         // Inter part_mode (§7.4.9.5 / 9.3.4.2). Determines PU geometry.
         let part = self.decode_part_mode_inter(log2_cb);
         let pus = part.pu_rects(x0, y0, cb);
-        let npus = pus.len();
+        let (pb_span_w, pb_span_h) = part.ibc_spans(cb);
         // Mark the internal prediction-unit split boundaries so their boundary
         // strength is evaluated even when they don't coincide with a TU edge
         // (§8.7.2.4 applies at PU *and* TU edges).
@@ -4658,21 +6019,31 @@ impl<'cab> FullDecoder<'cab> {
                 self.mark_pu_edge_h(px, py, pw);
             }
         }
-        // Motion of an earlier PU in this CU is available to later PUs for
-        // spatial merge / AMVP derivation. Store and expose each PU as soon as
-        // its syntax has been decoded; delaying all stores until the second pass
-        // silently removes same-CU candidates and changes decoded MVs.
-        let mut motions: [crate::inter::MotionInfo; 4] = Default::default();
+        // Decode, predict, and publish each PU in coding order. Motion from a
+        // previous PU in the same CU is available to later merge/AMVP
+        // derivation through §6.4.2, but the picture-level decoded map must not
+        // be marked until reconstruction (including residuals) is complete.
         for (i, &(px, py, pw, ph)) in pus.iter().enumerate() {
-            let mi = self.decode_prediction_unit(px, py, pw, ph, x0, y0, cb, cb, i);
-            motions[i] = mi;
+            let geom = crate::ibc::PuGeometry {
+                cu_x: x0,
+                cu_y: y0,
+                cu_size: cb,
+                pu_x: px,
+                pu_y: py,
+                pu_w: pw,
+                pu_h: ph,
+                pb_span_w,
+                pb_span_h,
+            };
+            let mut mi = self.decode_prediction_unit(geom, i);
+            for list in 0..2 {
+                if mi.pred_used(list) && mi.ref_poc[list] == self.cur_poc {
+                    mi.mv[list] = crate::ibc::integerize_bv(mi.mv[list]);
+                }
+            }
+            self.predict_pu(geom, &mut mi);
             self.store_motion(px, py, pw, ph, mi);
-            self.mark_decoded_rect(px, py, pw, ph);
         }
-        for (i, &(px, py, pw, ph)) in pus.iter().enumerate() {
-            self.motion_compensate(px, py, pw, ph, &motions[i]);
-        }
-        let _ = npus;
 
         // rqt_root_cbf (§7.3.8.5): decoded unless the CU is a 2Nx2N merge, in
         // which case it is inferred = true (a 2Nx2N merge with no residual would
@@ -4772,21 +6143,13 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// Build the merge candidate list and select `merge_idx` for a skip/merge PU.
-    #[allow(clippy::too_many_arguments)]
     fn decode_merge_pu(
         &mut self,
-        px: usize,
-        py: usize,
-        pw: usize,
-        ph: usize,
-        cux: usize,
-        cuy: usize,
-        cuw: usize,
-        cuh: usize,
+        geom: crate::ibc::PuGeometry,
         part_idx: usize,
     ) -> crate::inter::MotionInfo {
         let merge_idx = self.decode_merge_idx();
-        self.derive_pu_merge(px, py, pw, ph, cux, cuy, cuw, cuh, part_idx, merge_idx)
+        self.derive_pu_merge(geom, part_idx, merge_idx)
     }
 
     fn decode_merge_idx(&mut self) -> usize {
@@ -4804,25 +6167,73 @@ impl<'cab> FullDecoder<'cab> {
         idx
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// TwoVersionsOfCurrDecPicFlag from equation 7-40. This is a PPS/SPS
+    /// capability flag; it must not be derived from the per-slice decision to
+    /// disable SAO or override deblocking.
+    #[inline]
+    fn two_versions_of_current_picture(&self) -> bool {
+        self.pps.curr_pic_ref_enabled
+            && (self.sps.sao_enabled
+                || !self.pps.deblocking_filter_disabled
+                || self.pps.deblocking_filter_override_enabled)
+    }
+
+    /// Apply the SCC bi-prediction restriction from §8.5.3.2.1 to either
+    /// merge or explicit-AMVP motion. The test is on nPbSw/nPbSh, not the
+    /// current PU dimensions: 16x4/16x12 and 4x16/12x16 AMP partitions also
+    /// have 8x8 partition spans.
+    fn restrict_scc_bipred(&self, pu_w: usize, pu_h: usize, mi: &mut MotionInfo) {
+        // x265 is8x8BipredRestriction + restrictBipredMergeCand: the size test
+        // is on the PU dimensions (getPartIndexAndSize), width<=8 && height<=8
+        // — NOT on partition spans. 16x4 AMP PUs are NOT restricted.
+        if !mi.pred.l0
+            || !mi.pred.l1
+            || pu_w > 8
+            || pu_h > 8
+            || !self.two_versions_of_current_picture()
+        {
+            return;
+        }
+        let frac0 = (mi.mv[0].x & 3) != 0 || (mi.mv[0].y & 3) != 0;
+        let frac1 = (mi.mv[1].x & 3) != 0 || (mi.mv[1].y & 3) != 0;
+        let identical = mi.mv[0] == mi.mv[1] && mi.ref_poc[0] == mi.ref_poc[1];
+        if frac0 && frac1 && !identical {
+            mi.pred.l1 = false;
+            mi.ref_idx[1] = -1;
+            mi.mv[1] = crate::inter::Mv::default();
+            mi.ref_poc[1] = 0;
+            mi.ref_lt[1] = false;
+        }
+    }
+
     fn derive_pu_merge(
         &self,
-        px: usize,
-        py: usize,
-        pw: usize,
-        ph: usize,
-        cux: usize,
-        cuy: usize,
-        cuw: usize,
-        cuh: usize,
+        geom: crate::ibc::PuGeometry,
         part_idx: usize,
         merge_idx: usize,
     ) -> MotionInfo {
+        let crate::ibc::PuGeometry {
+            cu_x: cux,
+            cu_y: cuy,
+            cu_size: cuw,
+            pu_x: px,
+            pu_y: py,
+            pu_w: pw,
+            pu_h: ph,
+            pb_span_w: _,
+            pb_span_h: _,
+        } = geom;
+        let cuh = cuw;
         let nb = self.neighbors();
         let par_mrg_level = self.pps.log2_parallel_merge_level;
         // singleMCLFlag (§8.5.3.2.1): for 8×8 CUs with a parallel merge level > 2
         // every PU derives its merge list as if it were the whole 2Nx2N CU.
         let single_mcl = par_mrg_level > 2 && cuw == 8;
+        // §8.5.3.2.1: an 8×4 / 4×8 PU must not be bi-predicted; a bi-pred merge
+        // candidate is converted to uni-L0. Uses the ORIGINAL PU size, before
+        // any singleMCLFlag substitution below.
+        let no_bi = pw + ph == 12;
+        let (orig_pw, orig_ph) = (pw, ph);
         let (px, py, pw, ph, part_idx) = if single_mcl {
             (cux, cuy, cuw, cuh, 0)
         } else {
@@ -4833,11 +6244,14 @@ impl<'cab> FullDecoder<'cab> {
             y: py,
             w: pw,
             h: ph,
+            cu_x: cux,
+            cu_y: cuy,
             is_b: self.slice_type == crate::inter::SLICE_B,
             part_idx,
             cu_w: cuw,
             cu_h: cuh,
             par_mrg_level,
+            curr_pic_ref: self.pps.curr_pic_ref_enabled,
         };
         let cand = crate::motion::derive_merge(
             &nb,
@@ -4848,7 +6262,28 @@ impl<'cab> FullDecoder<'cab> {
             &self.ref_list0,
             &self.ref_list1,
         );
-        self.cand_to_motion(&cand)
+        let mut mi = self.cand_to_motion(&cand);
+        let convert = mi.pred.l0 && mi.pred.l1 && no_bi;
+        // §8.5.3.2.1: an 8×4 / 4×8 PU is never bi-predicted; a bi-predictive
+        // merge candidate is used as uni-L0.
+        if convert {
+            mi.pred.l1 = false;
+            mi.ref_idx[1] = -1;
+            mi.mv[1] = crate::inter::Mv::default();
+            mi.ref_poc[1] = 0;
+            mi.ref_lt[1] = false;
+        }
+        // Merge candidates are rounded to integer luma-sample precision when
+        // use_integer_mv_flag is set, and always when they reference CurrPic
+        // (§8.5.3.2.2, equations 8-124/8-125). The SCC bi-prediction
+        // restriction is evaluated after this rounding.
+        for list in 0..2 {
+            if mi.pred_used(list) && (self.use_integer_mv || mi.ref_poc[list] == self.cur_poc) {
+                mi.mv[list] = crate::ibc::integerize_bv(mi.mv[list]);
+            }
+        }
+        self.restrict_scc_bipred(orig_pw, orig_ph, &mut mi);
+        mi
     }
 
     fn cand_to_motion(&self, c: &crate::motion::MergeCand) -> MotionInfo {
@@ -4892,23 +6327,28 @@ impl<'cab> FullDecoder<'cab> {
 
     /// Decode a non-merge prediction unit: merge_flag, then either merge or the
     /// AMVP path (inter_pred_idc, ref_idx, mvd, mvp_flag).
-    #[allow(clippy::too_many_arguments)]
     fn decode_prediction_unit(
         &mut self,
-        px: usize,
-        py: usize,
-        pw: usize,
-        ph: usize,
-        cux: usize,
-        cuy: usize,
-        cuw: usize,
-        cuh: usize,
+        geom: crate::ibc::PuGeometry,
         part_idx: usize,
     ) -> MotionInfo {
+        let crate::ibc::PuGeometry {
+            cu_x,
+            cu_y,
+            cu_size: cuw,
+            pu_x: px,
+            pu_y: py,
+            pu_w: pw,
+            pu_h: ph,
+            pb_span_w: _,
+            pb_span_h: _,
+            ..
+        } = geom;
+        let cuh = cuw;
         let merge = self.cab.decode_bin(&mut self.ctx.merge_flag) != 0;
         self.last_pu_merge = merge;
         if merge {
-            return self.decode_merge_pu(px, py, pw, ph, cux, cuy, cuw, cuh, part_idx);
+            return self.decode_merge_pu(geom, part_idx);
         }
         let is_b = self.slice_type == crate::inter::SLICE_B;
         // inter_pred_idc: PRED_L0 / PRED_L1 / PRED_BI.
@@ -4929,7 +6369,7 @@ impl<'cab> FullDecoder<'cab> {
 
         if use_l0 {
             let (mv, ridx, poc) =
-                self.decode_mvd_amvp(px, py, pw, ph, cuw, cuh, part_idx, 0, false);
+                self.decode_mvd_amvp(px, py, pw, ph, cu_x, cu_y, cuw, cuh, part_idx, 0, false);
             mi.mv[0] = mv;
             mi.ref_idx[0] = ridx as i8;
             mi.ref_poc[0] = poc;
@@ -4943,7 +6383,8 @@ impl<'cab> FullDecoder<'cab> {
         }
         if use_l1 {
             let zero = self.mvd_l1_zero && use_l0;
-            let (mv, ridx, poc) = self.decode_mvd_amvp(px, py, pw, ph, cuw, cuh, part_idx, 1, zero);
+            let (mv, ridx, poc) =
+                self.decode_mvd_amvp(px, py, pw, ph, cu_x, cu_y, cuw, cuh, part_idx, 1, zero);
             mi.mv[1] = mv;
             mi.ref_idx[1] = ridx as i8;
             mi.ref_poc[1] = poc;
@@ -4955,6 +6396,10 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             mi.ref_idx[1] = -1;
         }
+        // NOTE: the SCC 8×8 bi-pred restriction (§8.5.3.2.1) is part of the
+        // MERGE derivation only. For explicitly coded (AMVP) motion it is a
+        // bitstream conformance constraint on the encoder, not a decoder-side
+        // conversion — x265's reconstruction keeps explicitly coded BI as BI.
         mi
     }
 
@@ -4985,6 +6430,8 @@ impl<'cab> FullDecoder<'cab> {
         py: usize,
         pw: usize,
         ph: usize,
+        cu_x: usize,
+        cu_y: usize,
         cuw: usize,
         cuh: usize,
         part_idx: usize,
@@ -5021,11 +6468,14 @@ impl<'cab> FullDecoder<'cab> {
             y: py,
             w: pw,
             h: ph,
+            cu_x,
+            cu_y,
             is_b: self.slice_type == crate::inter::SLICE_B,
             part_idx,
             cu_w: cuw,
             cu_h: cuh,
             par_mrg_level: self.pps.log2_parallel_merge_level,
+            curr_pic_ref: self.pps.curr_pic_ref_enabled,
         };
         let preds = crate::motion::derive_amvp(
             &nb,
@@ -5037,7 +6487,11 @@ impl<'cab> FullDecoder<'cab> {
             &self.ref_list1,
         );
         let mvp = preds[mvp_flag as usize];
-        let mv = crate::inter::Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y));
+        let integer = self.use_integer_mv || ref_poc == self.cur_poc;
+        let mv = crate::inter::Mv::new(
+            combine_mvp_mvd(mvp.x, mvd.x, integer),
+            combine_mvp_mvd(mvp.y, mvd.y, integer),
+        );
         (mv, ref_idx, ref_poc)
     }
 
@@ -5135,17 +6589,55 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    fn motion_compensate(&mut self, x0: usize, y0: usize, w: usize, h: usize, mi: &MotionInfo) {
+    fn motion_compensate(&mut self, geom: crate::ibc::PuGeometry, mi: &MotionInfo) {
+        let (x0, y0, w, h) = (geom.pu_x, geom.pu_y, geom.pu_w, geom.pu_h);
         let bd = self.bd;
         let bd_c = self.bd_c;
         let weighted = self.luma_weighted().cloned();
+        let current_mv0 = (mi.pred.l0
+            && mi.ref_idx[0] >= 0
+            && self
+                .ref_list0
+                .get(mi.ref_idx[0] as usize)
+                .is_some_and(|reference| reference.poc == self.cur_poc))
+        .then(|| crate::ibc::integerize_bv(mi.mv[0]));
+        let current_mv1 = (mi.pred.l1
+            && mi.ref_idx[1] >= 0
+            && self
+                .ref_list1
+                .get(mi.ref_idx[1] as usize)
+                .is_some_and(|reference| reference.poc == self.cur_poc))
+        .then(|| crate::ibc::integerize_bv(mi.mv[1]));
+        // Keep address safety separate from the normative BV conformance
+        // checker. A conservative checker false-negative must not replace a
+        // safely readable current-picture reference with mid-grey. The boolean
+        // is retained for diagnostics/tests but does not gate reconstruction.
+        let current_src0 = current_mv0.and_then(|mv| {
+            crate::ibc::source_origin(x0, y0, w, h, mv, self.w, self.h)
+                .map(|origin| (origin, self.ibc_bv_valid(geom, mv)))
+        });
+        let current_src1 = current_mv1.and_then(|mv| {
+            crate::ibc::source_origin(x0, y0, w, h, mv, self.w, self.h)
+                .map(|origin| (origin, self.ibc_bv_valid(geom, mv)))
+        });
 
         let len = w.saturating_mul(h);
         if len != 0 {
             self.mc_pred0.resize(len, 0);
             self.mc_pred1.resize(len, 0);
 
-            let luma0 = if mi.pred.l0 {
+            let luma0 = if let Some(((sx, sy), _conforming)) = current_src0 {
+                crate::ibc::load_internal_block(
+                    &self.y,
+                    self.w,
+                    sx,
+                    sy,
+                    w,
+                    h,
+                    bd,
+                    &mut self.mc_pred0[..len],
+                )
+            } else if mi.pred.l0 {
                 if let Some(frame) = ref_frame_for_lists(
                     &self.ref_frames,
                     &self.ref_list0,
@@ -5183,7 +6675,18 @@ impl<'cab> FullDecoder<'cab> {
                 false
             };
 
-            let luma1 = if mi.pred.l1 {
+            let luma1 = if let Some(((sx, sy), _conforming)) = current_src1 {
+                crate::ibc::load_internal_block(
+                    &self.y,
+                    self.w,
+                    sx,
+                    sy,
+                    w,
+                    h,
+                    bd,
+                    &mut self.mc_pred1[..len],
+                )
+            } else if mi.pred.l1 {
                 if let Some(frame) = ref_frame_for_lists(
                     &self.ref_frames,
                     &self.ref_list0,
@@ -5323,7 +6826,48 @@ impl<'cab> FullDecoder<'cab> {
             self.mc_pred1.resize(clen, 0);
 
             for plane in 0..2 {
-                let c0 = if mi.pred.l0 {
+                let c0 = if let Some(mv) = current_mv0 {
+                    if current_src0.is_some() {
+                        // A current-picture BV is integer in luma units, but it
+                        // can still be fractional on a subsampled chroma grid
+                        // (for example an odd luma BV in 4:2:0). Use the normal
+                        // chroma interpolation kernel against the live,
+                        // pre-filter current picture rather than truncating the
+                        // chroma source coordinate.
+                        let data = if plane == 0 {
+                            &self.cb[..]
+                        } else {
+                            &self.cr[..]
+                        };
+                        let rp = crate::mc::RefPlane {
+                            data,
+                            stride: self.cw,
+                            width: self.cw,
+                            height: self.ch,
+                        };
+                        let mvcx = mv.x as isize * 2 / self.sub_w as isize;
+                        let mvcy = mv.y as isize * 2 / self.sub_h as isize;
+                        let ix = cx as isize + (mvcx >> 3);
+                        let iy = cy as isize + (mvcy >> 3);
+                        let fx = (mvcx & 7) as usize;
+                        let fy = (mvcy & 7) as usize;
+                        (self.exec.motion_chroma_interp)(
+                            &rp,
+                            ix,
+                            iy,
+                            fx,
+                            fy,
+                            cw,
+                            ch,
+                            bd_c,
+                            &mut self.mc_pred0[..clen],
+                            &mut self.mc_tmp,
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else if mi.pred.l0 {
                     if let Some(frame) = ref_frame_for_lists(
                         &self.ref_frames,
                         &self.ref_list0,
@@ -5364,7 +6908,42 @@ impl<'cab> FullDecoder<'cab> {
                     false
                 };
 
-                let c1 = if mi.pred.l1 {
+                let c1 = if let Some(mv) = current_mv1 {
+                    if current_src1.is_some() {
+                        let data = if plane == 0 {
+                            &self.cb[..]
+                        } else {
+                            &self.cr[..]
+                        };
+                        let rp = crate::mc::RefPlane {
+                            data,
+                            stride: self.cw,
+                            width: self.cw,
+                            height: self.ch,
+                        };
+                        let mvcx = mv.x as isize * 2 / self.sub_w as isize;
+                        let mvcy = mv.y as isize * 2 / self.sub_h as isize;
+                        let ix = cx as isize + (mvcx >> 3);
+                        let iy = cy as isize + (mvcy >> 3);
+                        let fx = (mvcx & 7) as usize;
+                        let fy = (mvcy & 7) as usize;
+                        (self.exec.motion_chroma_interp)(
+                            &rp,
+                            ix,
+                            iy,
+                            fx,
+                            fy,
+                            cw,
+                            ch,
+                            bd_c,
+                            &mut self.mc_pred1[..clen],
+                            &mut self.mc_tmp,
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else if mi.pred.l1 {
                     if let Some(frame) = ref_frame_for_lists(
                         &self.ref_frames,
                         &self.ref_list0,
@@ -5497,6 +7076,13 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
+    /// Predict one PU. Current-picture references are loaded unfiltered into
+    /// the same internal-precision buffers as ordinary references, which also
+    /// supports L1 and bi-predictive current-picture use.
+    fn predict_pu(&mut self, geom: crate::ibc::PuGeometry, mi: &mut MotionInfo) {
+        self.motion_compensate(geom, mi);
+    }
+
     /// Inject the current picture's inter state (POC + reference lists + frames)
     /// before decoding. Called by the video driver after DPB list construction.
     pub(crate) fn set_inter_state(
@@ -5517,6 +7103,18 @@ impl<'cab> FullDecoder<'cab> {
     pub(crate) fn take_motion(&mut self) -> (Vec<MotionInfo>, usize, usize) {
         let m = std::mem::take(&mut self.motion);
         (m.to_vec(), self.grid_w, self.grid_h)
+    }
+}
+
+/// Combine one AMVP predictor component with its coded MVD. For integer-MV
+/// slices and current-picture references the MVD is expressed in integer luma
+/// samples, while the stored MV remains in quarter-sample units (§8.5.3.2.1).
+#[inline]
+fn combine_mvp_mvd(pred: i16, diff: i16, integer: bool) -> i16 {
+    if integer {
+        (pred >> 2).wrapping_add(diff).wrapping_mul(4)
+    } else {
+        pred.wrapping_add(diff)
     }
 }
 
@@ -5620,6 +7218,13 @@ pub(crate) struct SliceHeader {
     /// PPS chroma offsets during chroma QP derivation.
     pub(crate) cb_qp_offset: i32,
     pub(crate) cr_qp_offset: i32,
+    /// cu_chroma_qp_offset_enabled_flag from the slice header.
+    pub(crate) cu_chroma_qp_offset_enabled: bool,
+    /// slice_act_y/cb/cr_qp_offset (0 when not present); added to the PPS ACT
+    /// offsets for the residual colour transform (§7.4.7.1).
+    pub(crate) act_y_qp_offset: i32,
+    pub(crate) act_cb_qp_offset: i32,
+    pub(crate) act_cr_qp_offset: i32,
     /// Effective deblocking state for this slice: the PPS values unless the slice
     /// header overrides them (`deblocking_filter_override_flag`).
     pub(crate) deblocking_disabled: bool,
@@ -5662,6 +7267,9 @@ pub(crate) struct SliceHeader {
     pub(crate) collocated_ref_idx: usize,
     /// five_minus_max_num_merge_cand -> MaxNumMergeCand.
     pub(crate) max_num_merge_cand: usize,
+    /// Effective use_integer_mv_flag. When the syntax element is absent this is
+    /// inferred from motion_vector_resolution_control_idc.
+    pub(crate) use_integer_mv: bool,
     /// Weighted-prediction table (luma/chroma weights+offsets), if present.
     pub(crate) pred_weights: Option<crate::inter::PredWeightTable>,
     /// slice_loop_filter_across_slices_enabled_flag (inherits the PPS default
@@ -5756,7 +7364,7 @@ pub(crate) fn parse_slice_header_full(
             }
         }
         r.read_bit().map_err(|_| e("alignment_bit"))?;
-        while !r.bit_pos().is_multiple_of(8) {
+        while !((r.bit_pos()) % (8) == 0) {
             r.read_bit().map_err(|_| e("alignment_pad"))?;
         }
         return Ok(SliceHeader {
@@ -5766,6 +7374,10 @@ pub(crate) fn parse_slice_header_full(
             cabac_offset: r.bit_pos() / 8,
             cb_qp_offset: 0,
             cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled: false,
+            act_y_qp_offset: 0,
+            act_cb_qp_offset: 0,
+            act_cr_qp_offset: 0,
             deblocking_disabled: pps.deblocking_filter_disabled,
             beta_offset_div2: pps.beta_offset_div2,
             tc_offset_div2: pps.tc_offset_div2,
@@ -5788,6 +7400,7 @@ pub(crate) fn parse_slice_header_full(
             collocated_from_l0: true,
             collocated_ref_idx: 0,
             max_num_merge_cand: 5,
+            use_integer_mv: false,
             pred_weights: None,
             slice_loop_filter_across_slices: pps.loop_filter_across_slices,
             pic_output_flag: true,
@@ -5911,6 +7524,9 @@ pub(crate) fn parse_slice_header_full(
     let mut collocated_from_l0 = true;
     let mut collocated_ref_idx = 0usize;
     let mut max_num_merge_cand = 5usize;
+    // When not explicitly present, use_integer_mv_flag is inferred equal to
+    // motion_vector_resolution_control_idc (valid inferred values are 0 or 1).
+    let mut use_integer_mv = sps.motion_vector_resolution_control_idc == 1;
     let mut pred_weights = None;
     let is_inter = slice_type == crate::inter::SLICE_P || slice_type == crate::inter::SLICE_B;
     let is_b = slice_type == crate::inter::SLICE_B;
@@ -5931,7 +7547,8 @@ pub(crate) fn parse_slice_header_full(
         // total delta-POC count) sizes the list_entry_lX fixed-length codes.
         let num_pics_total = cur_rps.used_s0.iter().filter(|&&u| u).count()
             + cur_rps.used_s1.iter().filter(|&&u| u).count()
-            + lt_refs.iter().filter(|&&(_, used, _, _)| used).count();
+            + lt_refs.iter().filter(|&&(_, used, _, _)| used).count()
+            + usize::from(pps.curr_pic_ref_enabled);
         if pps.lists_modification_present && num_pics_total > 1 {
             let bits = ceil_log2(num_pics_total as u64);
             if r.read_flag().map_err(|_| e("ref_pic_list_mod_l0"))? {
@@ -5967,6 +7584,37 @@ pub(crate) fn parse_slice_header_full(
         let weighted = (slice_type == crate::inter::SLICE_P && pps.weighted_pred)
             || (is_b && pps.weighted_bipred);
         if weighted {
+            // SCC (§7.3.6.3): weight flags are skipped for list entries whose
+            // reference is the current picture. Reconstruct which active slots
+            // hold it: the current picture is the LAST of the NumPicTotalCurr
+            // temp-list entries (§8.3.4), lists fill cyclically, explicit
+            // list_entry_lX overrides, and with implicit ordering and more temp
+            // entries than active ones it lands in the final active slot (8-9).
+            let curr_mask = |num_active: usize, mods: &[u32], is_l0: bool| -> Vec<bool> {
+                let mut m = vec![false; num_active];
+                if pps.curr_pic_ref_enabled && num_pics_total > 0 {
+                    let curr_idx = num_pics_total - 1;
+                    for (i, dst) in m.iter_mut().enumerate() {
+                        let idx = mods
+                            .get(i)
+                            .map(|&v| v as usize)
+                            .unwrap_or(i % num_pics_total);
+                        *dst = idx == curr_idx;
+                    }
+                    // Equation 8-9 (current picture forced into the final
+                    // active slot) applies to reference list 0 only.
+                    if is_l0 && mods.is_empty() && num_active != 0 && num_pics_total > num_active {
+                        m[num_active - 1] = true;
+                    }
+                }
+                m
+            };
+            let mask0 = curr_mask(num_ref_idx_l0, &list_mod_l0, true);
+            let mask1 = if is_b {
+                curr_mask(num_ref_idx_l1, &list_mod_l1, false)
+            } else {
+                Vec::new()
+            };
             pred_weights = Some(crate::inter::PredWeightTable::parse(
                 &mut r,
                 [num_ref_idx_l0, num_ref_idx_l1],
@@ -5974,10 +7622,14 @@ pub(crate) fn parse_slice_header_full(
                 !sps.chroma.is_monochrome(),
                 sps.bit_depth_luma,
                 sps.bit_depth_chroma,
+                [&mask0, &mask1],
             )?);
         }
         let five_minus = r.read_ue().map_err(|_| e("five_minus_max_merge"))? as usize;
         max_num_merge_cand = 5usize.saturating_sub(five_minus);
+        if sps.motion_vector_resolution_control_idc == 2 {
+            use_integer_mv = r.read_flag().map_err(|_| e("use_integer_mv_flag"))?;
+        }
     }
     let _ = is_irap;
     let slice_qp_delta = r.read_se().map_err(|_| e("qp_delta"))?;
@@ -5993,6 +7645,25 @@ pub(crate) fn parse_slice_header_full(
         cb_qp_offset = r.read_se().map_err(|_| e("cb_qp_off"))?;
         cr_qp_offset = r.read_se().map_err(|_| e("cr_qp_off"))?;
     }
+    // slice_act_y/cb/cr_qp_offset (§7.3.6.1), present when the PPS SCC extension
+    // signals slice-level ACT QP overrides.
+    let mut act_y_qp_offset = 0;
+    let mut act_cb_qp_offset = 0;
+    let mut act_cr_qp_offset = 0;
+    if pps.pps_slice_act_qp_offsets_present {
+        act_y_qp_offset = r.read_se().map_err(|_| e("slice_act_y"))?;
+        act_cb_qp_offset = r.read_se().map_err(|_| e("slice_act_cb"))?;
+        act_cr_qp_offset = r.read_se().map_err(|_| e("slice_act_cr"))?;
+    }
+    // The PPS range extension only signals that the per-slice gate is present.
+    // Omitting this one header bit shifts byte_alignment and the entire CABAC
+    // payload for every stream using CU chroma-QP offsets.
+    let cu_chroma_qp_offset_enabled = if pps.chroma_qp_offset_list_enabled {
+        r.read_flag()
+            .map_err(|_| e("cu_chroma_qp_offset_enabled"))?
+    } else {
+        false
+    };
     // Deblocking: default to the PPS state, overridden per-slice if signalled.
     let mut deblocking_disabled = pps.deblocking_filter_disabled;
     let mut beta_offset_div2 = pps.beta_offset_div2;
@@ -6036,7 +7707,7 @@ pub(crate) fn parse_slice_header_full(
         }
     }
     r.read_bit().map_err(|_| e("alignment_bit"))?;
-    while !r.bit_pos().is_multiple_of(8) {
+    while !((r.bit_pos()) % (8) == 0) {
         r.read_bit().map_err(|_| e("alignment_pad"))?;
     }
     Ok(SliceHeader {
@@ -6046,6 +7717,10 @@ pub(crate) fn parse_slice_header_full(
         cabac_offset: r.bit_pos() / 8,
         cb_qp_offset,
         cr_qp_offset,
+        cu_chroma_qp_offset_enabled,
+        act_y_qp_offset,
+        act_cb_qp_offset,
+        act_cr_qp_offset,
         deblocking_disabled,
         beta_offset_div2,
         tc_offset_div2,
@@ -6068,6 +7743,7 @@ pub(crate) fn parse_slice_header_full(
         collocated_from_l0,
         collocated_ref_idx,
         max_num_merge_cand,
+        use_integer_mv,
         pred_weights,
         slice_loop_filter_across_slices,
         pic_output_flag,
@@ -6092,10 +7768,11 @@ fn ceil_log2(n: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::InterPartMode;
     use super::{
-        ceil_log2, clamp_qpy, derive_qpy_from_delta, fill_slice_owner_rect, inter_motion_differs,
-        load_plane_block_clipped, peek_slice_pps_id, promote_first_slice_owners, qp_prime, qpc,
-        qpy_min,
+        ceil_log2, clamp_qpy, combine_mvp_mvd, derive_qpy_from_delta, fill_slice_owner_rect,
+        inter_motion_differs, load_plane_block_clipped, peek_slice_pps_id,
+        promote_first_slice_owners, qp_prime, qpc, qpy_min,
     };
     use crate::inter::{MotionInfo, Mv, PredFlags};
 
@@ -6227,6 +7904,31 @@ mod tests {
     }
 
     #[test]
+    fn ibc_partition_spans_follow_npbsw_npbsh() {
+        assert_eq!(InterPartMode::P2Nx2N.ibc_spans(16), (16, 16));
+        assert_eq!(InterPartMode::P2NxN.ibc_spans(16), (16, 8));
+        assert_eq!(InterPartMode::PNx2N.ibc_spans(16), (8, 16));
+        assert_eq!(InterPartMode::PNxN.ibc_spans(16), (8, 8));
+        // AMP dimensions are not their nPbSw/nPbSh values: every 16x4/16x12
+        // and 4x16/12x16 partition still uses an 8x8 span in equation 8-106.
+        assert_eq!(InterPartMode::P2NxnU.ibc_spans(16), (8, 8));
+        assert_eq!(InterPartMode::P2NxnD.ibc_spans(16), (8, 8));
+        assert_eq!(InterPartMode::PnLx2N.ibc_spans(16), (8, 8));
+        assert_eq!(InterPartMode::PnRx2N.ibc_spans(16), (8, 8));
+    }
+
+    #[test]
+    fn current_picture_mvd_is_in_integer_sample_units() {
+        // Quarter-sample path keeps the full predictor precision.
+        assert_eq!(combine_mvp_mvd(5, 0, false), 5);
+        // Integer/current-picture path first rounds the predictor down to an
+        // integer sample, adds the integer MVD, then restores quarter units.
+        assert_eq!(combine_mvp_mvd(5, 0, true), 4);
+        assert_eq!(combine_mvp_mvd(-5, 1, true), -4);
+        assert_eq!(combine_mvp_mvd(4, -2, true), -4);
+    }
+
+    #[test]
     fn deblock_motion_compares_l1_and_crossed_lists() {
         let l1_a = MotionInfo {
             pred: PredFlags {
@@ -6257,5 +7959,39 @@ mod tests {
             ..Default::default()
         };
         assert!(!inter_motion_differs(&l0, &l1_a));
+    }
+}
+
+/// Apply RExt residual rotation (reverse the 4×4 block) and/or RDPCM
+/// accumulation (§8.6.4 residual modification): vertical adds the row above,
+/// horizontal adds the sample to the left. Runs on the dequantized residual,
+/// which is equivalent to the spec's coefficient-domain ordering because both
+/// operations commute with the flat per-block transform-skip scaling.
+fn apply_rext_residual_ops<T>(res: &mut [T], n: usize, rotate: bool, rdpcm: Option<u8>)
+where
+    T: Copy + core::ops::Add<Output = T>,
+{
+    if rotate {
+        let n2 = n * n;
+        for i in 0..n2 / 2 {
+            res.swap(i, n2 - 1 - i);
+        }
+    }
+    match rdpcm {
+        Some(1) => {
+            for y in 1..n {
+                for x in 0..n {
+                    res[y * n + x] = res[y * n + x] + res[(y - 1) * n + x];
+                }
+            }
+        }
+        Some(_) => {
+            for y in 0..n {
+                for x in 1..n {
+                    res[y * n + x] = res[y * n + x] + res[y * n + x - 1];
+                }
+            }
+        }
+        None => {}
     }
 }

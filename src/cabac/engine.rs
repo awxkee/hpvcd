@@ -238,6 +238,15 @@ impl<'a> CabacDecoder<'a> {
         }
     }
 
+    /// Align the arithmetic engine before coefficient bypass syntax when
+    /// `cabac_bypass_alignment_enabled_flag` and `escapeDataPresent` are set.
+    /// HEVC §9.3.4.3.6 changes only the current range; the offset and input
+    /// position remain untouched.
+    #[inline(always)]
+    pub(crate) fn align_bypass(&mut self) {
+        self.range = 256;
+    }
+
     /// Decode one bypass bin (HEVC §9.3.4.2 DecodeBypass).
     #[inline(always)]
     pub(crate) fn decode_bypass(&mut self) -> u8 {
@@ -386,5 +395,75 @@ mod tests {
                 assert_eq!(batched.byte_pos, scalar.byte_pos);
             }
         }
+    }
+
+    #[test]
+    fn batched_bypass_matches_after_context_bins() {
+        let data = [
+            0x8d, 0x27, 0xf4, 0x19, 0xa6, 0x53, 0x0b, 0xdc, 0x71, 0x3e, 0x95, 0x42, 0xe8, 0x16,
+            0xbf, 0x64, 0x29, 0xd3, 0x7a, 0x05, 0xc1, 0x9e, 0x38, 0x57,
+        ];
+
+        for decision_count in 0..32 {
+            for bypass_count in 0..=32 {
+                let mut scalar = CabacDecoder::new_borrowed(&data).unwrap();
+                let mut batched = CabacDecoder::new_borrowed(&data).unwrap();
+                let mut scalar_ctx = CtxModel::new(17, 0);
+                let mut batched_ctx = scalar_ctx;
+
+                for i in 0..decision_count {
+                    assert_eq!(
+                        scalar.decode_bin(&mut scalar_ctx),
+                        batched.decode_bin(&mut batched_ctx)
+                    );
+                    // Exercise the exact residual pattern: context bins with
+                    // occasional single bypass bins before a batched sign/Rice
+                    // suffix. This catches offset-only drift that a range-only
+                    // lockstep trace cannot see.
+                    if i % 3 == 2 {
+                        assert_eq!(scalar.decode_bypass(), batched.decode_bypass());
+                    }
+                }
+
+                let mut expected = 0u32;
+                for _ in 0..bypass_count {
+                    expected = (expected << 1) | u32::from(scalar.decode_bypass());
+                }
+                assert_eq!(batched.decode_bypass_bits(bypass_count), expected);
+                assert_eq!(batched.range, scalar.range);
+                assert_eq!(batched.offset, scalar.offset);
+                assert_eq!(batched_ctx.state, scalar_ctx.state);
+                assert_eq!(
+                    batched.byte_pos * 8 - batched.bitcnt as usize,
+                    scalar.byte_pos * 8 - scalar.bitcnt as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bypass_alignment_changes_only_range() {
+        let data = [0x96, 0x35, 0xca, 0x71, 0x0f, 0xe4, 0x58, 0xa2];
+        let mut cab = CabacDecoder::new_borrowed(&data).unwrap();
+        let mut ctx = CtxModel::new(23, 1);
+
+        // Put the engine into a non-trivial state first; alignment must not
+        // consume input, renormalize, or alter the arithmetic offset.
+        for _ in 0..5 {
+            let _ = cab.decode_bin(&mut ctx);
+        }
+        let offset = cab.offset;
+        let byte_pos = cab.byte_pos;
+        let bitbuf = cab.bitbuf;
+        let bitcnt = cab.bitcnt;
+
+        cab.range = 319;
+        cab.align_bypass();
+
+        assert_eq!(cab.range, 256);
+        assert_eq!(cab.offset, offset);
+        assert_eq!(cab.byte_pos, byte_pos);
+        assert_eq!(cab.bitbuf, bitbuf);
+        assert_eq!(cab.bitcnt, bitcnt);
     }
 }

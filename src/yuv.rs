@@ -214,12 +214,8 @@ impl Cvt<'_> {
             let luma_row = &yuv.y[luma_base..][..self.dw];
             let cb_row = &yuv.cb[c_base..][..self.cw];
             let cr_row = &yuv.cr[c_base..][..self.cw];
-            for (x_pix, (dst, &luma_raw)) in row_out
-                .as_chunks_mut::<3>()
-                .0
-                .iter_mut()
-                .zip(luma_row.iter())
-                .enumerate()
+            for (x_pix, (dst, &luma_raw)) in
+                row_out.chunks_exact_mut(3).zip(luma_row.iter()).enumerate()
             {
                 let c_col = (self.x0 + x_pix) / self.sub_w;
                 let cb_c = cb_row[c_col] as i64 - self.neutral;
@@ -237,7 +233,7 @@ impl Cvt<'_> {
 
     fn slow_rows<T: PxCast>(&self, y0: usize, out: &mut [T], cmax: i64) {
         for (dy, row_out) in out.chunks_exact_mut(self.dw * 3).enumerate() {
-            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            for (x_pix, dst) in row_out.chunks_exact_mut(3).enumerate() {
                 let (r, g, b) = self.pixel(y0 + dy, x_pix);
                 dst[0] = T::cast(r.clamp(0, cmax));
                 dst[1] = T::cast(g.clamp(0, cmax));
@@ -255,7 +251,7 @@ impl Cvt<'_> {
             let l_row = &yuv.y[y_row * yuv.width..][..yuv.width];
             let cb_row = &yuv.cb[c_row * self.cw..][..self.cw];
             let cr_row = &yuv.cr[c_row * self.cw..][..self.cw];
-            for (x_pix, dst) in row_out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            for (x_pix, dst) in row_out.chunks_exact_mut(3).enumerate() {
                 let src_x = self.x0.saturating_add(x_pix);
                 let x_col = src_x.min(yuv.width - 1);
                 let c_col = (src_x / self.sub_w).min(self.cw - 1);
@@ -279,20 +275,21 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     let total = dw * dh * chn;
-    if let Some(p) = pool
-        && p.threads() > 1
-        && dh > 1
-    {
-        let band_rows = dh.div_ceil((p.threads() * 4).min(dh));
-        let bands = dh.div_ceil(band_rows);
-        let dm = DisjointMut::new(vec![T::default(); total]);
-        parallel_for(p, bands, |b| {
-            let y0 = b * band_rows;
-            let nr = band_rows.min(dh - y0);
-            let mut band = dm.slice_mut(y0 * dw * chn..(y0 + nr) * dw * chn);
-            f(y0, &mut band);
-        });
-        return dm.into_inner();
+    if let Some(p) = pool {
+        if p.threads() > 1 {
+            if dh > 1 {
+                let band_rows = dh.div_ceil((p.threads() * 4).min(dh));
+                let bands = dh.div_ceil(band_rows);
+                let dm = DisjointMut::new(vec![T::default(); total]);
+                parallel_for(p, bands, |b| {
+                    let y0 = b * band_rows;
+                    let nr = band_rows.min(dh - y0);
+                    let mut band = dm.slice_mut(y0 * dw * chn..(y0 + nr) * dw * chn);
+                    f(y0, &mut band);
+                });
+                return dm.into_inner();
+            }
+        }
     }
     let mut v = vec![T::default(); total];
     f(0, &mut v);

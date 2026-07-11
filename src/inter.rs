@@ -122,6 +122,10 @@ impl PredWeightTable {
         chroma: bool,
         bd_luma: u8,
         bd_chroma: u8,
+        // SCC (§7.3.6.3): per-list mask of entries whose reference picture is
+        // the current picture — their weight flags are NOT coded and the
+        // neutral weight is inferred.
+        is_curr_pic: [&[bool]; 2],
     ) -> Result<Self, DecodeError> {
         let luma_log2_denom = r.read_ue().map_err(|_| e("luma_log2_denom"))? as u8;
         let chroma_log2_denom = if chroma {
@@ -148,14 +152,23 @@ impl PredWeightTable {
 
         let lists = if has_l1 { 2 } else { 1 };
         for (list, &n) in num_ref[..lists].iter().enumerate() {
+            let skip = |i: usize| is_curr_pic[list].get(i).copied().unwrap_or(false);
             let mut luma_flags = Vec::with_capacity(n);
-            for _ in 0..n {
-                luma_flags.push(r.read_flag().map_err(|_| e("luma_weight_flag"))?);
+            for i in 0..n {
+                luma_flags.push(if skip(i) {
+                    false
+                } else {
+                    r.read_flag().map_err(|_| e("luma_weight_flag"))?
+                });
             }
             let mut chroma_flags = vec![false; n];
             if chroma {
-                for dst in chroma_flags[..n].iter_mut() {
-                    *dst = r.read_flag().map_err(|_| e("chroma_weight_flag"))?;
+                for (i, dst) in chroma_flags[..n].iter_mut().enumerate() {
+                    *dst = if skip(i) {
+                        false
+                    } else {
+                        r.read_flag().map_err(|_| e("chroma_weight_flag"))?
+                    };
                 }
             }
             for i in 0..n {

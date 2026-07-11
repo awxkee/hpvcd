@@ -22,7 +22,7 @@ fn main() {
     // .unwrap();
     // iamge.save("./out_v.jpg").unwrap();
 
-    let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
+    let bytes = fs::read("./assets/Zero_and_One_Palette_Size_A_Canon_2.heic").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
@@ -69,4 +69,15 @@ fn main() {
         .unwrap(),
     );
     img.save("./out.jpg").unwrap();
+
+    let bytes1 = fs::read("./assets/Zero_and_One_Palette_Size_A_Canon_2.bit").unwrap();
+    let decoded = hpvcd::decode_hevc(&bytes1).unwrap();
+    let rgb_image = decoded[0].to_rgb8();
+    let iamge = RgbImage::from_vec(
+        decoded[0].width() as u32,
+        decoded[0].height() as u32,
+        rgb_image.to_vec(),
+    )
+    .unwrap();
+    iamge.save("./out_v.jpg").unwrap();
 }

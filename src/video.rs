@@ -146,12 +146,7 @@ impl VideoFrame {
     pub fn to_rgba8(&self) -> Vec<u8> {
         let rgb = self.to_rgb8();
         let mut out = vec![0u8; (rgb.len() / 3) * 4];
-        for (dst, px) in out
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(rgb.as_chunks::<3>().0.iter())
-        {
+        for (dst, px) in out.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
             dst[0] = px[0];
             dst[1] = px[1];
             dst[2] = px[2];
@@ -646,10 +641,10 @@ impl VideoDecoder {
         // Fast path: the target's GOP is (partly) decoded and the frame is
         // already cached — scrubbing within a GOP costs nothing after the first
         // frame that reaches this far.
-        if self.seek_cache.gop_start == Some(start)
-            && let Some(f) = self.seek_cache.gop_frames.get(&target_poc)
-        {
-            return Ok(Some(f.clone()));
+        if self.seek_cache.gop_start == Some(start) {
+            if let Some(f) = self.seek_cache.gop_frames.get(&target_poc) {
+                return Ok(Some(f.clone()));
+            }
         }
 
         // If we're entering a *different* GOP than the cached one, restart the
@@ -713,11 +708,13 @@ impl VideoDecoder {
         for_each_nal(data, framing, |n: Nal| {
             if n.nal_type == nal::SPS && rate.is_none() {
                 let rbsp = crate::bitreader::unescape_rbsp(&n.bytes[2..]);
-                if let Ok(sps) = parse_sps(&rbsp)
-                    && sps.vui_time_scale > 0
-                    && sps.vui_num_units_in_tick > 0
-                {
-                    rate = Some(sps.vui_time_scale as f64 / sps.vui_num_units_in_tick as f64);
+                if let Ok(sps) = parse_sps(&rbsp) {
+                    if sps.vui_time_scale > 0 {
+                        if sps.vui_num_units_in_tick > 0 {
+                            rate =
+                                Some(sps.vui_time_scale as f64 / sps.vui_num_units_in_tick as f64);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -1126,25 +1123,37 @@ impl VideoDecoder {
         };
 
         // Reference lists (built once per picture from the first slice's RPS).
-        let (ref_list0, ref_list1, ref_frames) = if hdr0.slice_type != crate::inter::SLICE_I {
-            let pocs = rps_pocs.clone().unwrap_or_else(|| {
-                self.dpb
-                    .apply_rps_lt(poc, &hdr0.cur_rps, &hdr0.lt_refs, max_poc_lsb)
-            });
-            let is_b = hdr0.slice_type == crate::inter::SLICE_B;
-            let (l0, l1) = self.dpb.build_ref_lists(
-                &pocs,
-                hdr0.num_ref_idx_l0,
-                hdr0.num_ref_idx_l1,
-                is_b,
-                &hdr0.list_mod_l0,
-                &hdr0.list_mod_l1,
-            )?;
-            let frames = self.collect_ref_frames(&l0, &l1);
-            (l0, l1, frames)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
+        // With curr_pic_ref (IBC) the current picture is appended to L0 as a
+        // reference even on I slice, so those slices also build a list.
+        let ibc_active = sps.curr_pic_ref_enabled && pps.curr_pic_ref_enabled;
+        let (ref_list0, ref_list1, ref_frames) =
+            if hdr0.slice_type != crate::inter::SLICE_I || ibc_active {
+                let pocs = rps_pocs.clone().unwrap_or_else(|| {
+                    self.dpb
+                        .apply_rps_lt(poc, &hdr0.cur_rps, &hdr0.lt_refs, max_poc_lsb)
+                });
+                let is_b = hdr0.slice_type == crate::inter::SLICE_B;
+                let current = ibc_active.then_some(crate::dpb::RefEntry {
+                    _dpb_index: usize::MAX,
+                    poc,
+                    // The current decoded picture is marked long-term while it
+                    // is used for current-picture referencing (§8.1.3/C.3.4).
+                    long_term: true,
+                });
+                let (l0, l1) = self.dpb.build_ref_lists(
+                    &pocs,
+                    hdr0.num_ref_idx_l0,
+                    hdr0.num_ref_idx_l1,
+                    is_b,
+                    current,
+                    &hdr0.list_mod_l0,
+                    &hdr0.list_mod_l1,
+                )?;
+                let frames = self.collect_ref_frames(&l0, &l1);
+                (l0, l1, frames)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         // Create the decoder on the first segment and decode it.
         let cabac0 = &first_rbsp[hdr0.cabac_offset.min(first_rbsp.len())..];
@@ -1210,17 +1219,25 @@ impl VideoDecoder {
             }
             // Rebuild ref lists for independent segments (dependent segments
             // inherit them); reuse the picture's reference frame views.
-            if !hdr.dependent_slice_segment && hdr.slice_type != crate::inter::SLICE_I {
+            if !hdr.dependent_slice_segment
+                && (hdr.slice_type != crate::inter::SLICE_I || ibc_active)
+            {
                 let max_poc_lsb = 1i32 << sps.log2_max_poc_lsb;
                 let pocs = self
                     .dpb
                     .apply_rps_lt(poc, &hdr.cur_rps, &hdr.lt_refs, max_poc_lsb);
                 let is_b = hdr.slice_type == crate::inter::SLICE_B;
+                let current = ibc_active.then_some(crate::dpb::RefEntry {
+                    _dpb_index: usize::MAX,
+                    poc,
+                    long_term: true,
+                });
                 let (l0, l1) = self.dpb.build_ref_lists(
                     &pocs,
                     hdr.num_ref_idx_l0,
                     hdr.num_ref_idx_l1,
                     is_b,
+                    current,
                     &hdr.list_mod_l0,
                     &hdr.list_mod_l1,
                 )?;
@@ -1334,6 +1351,10 @@ fn merge_dependent_header(dep: &mut SliceHeader, indep: &SliceHeader) {
     dep.sao_chroma = indep.sao_chroma;
     dep.cb_qp_offset = indep.cb_qp_offset;
     dep.cr_qp_offset = indep.cr_qp_offset;
+    dep.cu_chroma_qp_offset_enabled = indep.cu_chroma_qp_offset_enabled;
+    dep.act_y_qp_offset = indep.act_y_qp_offset;
+    dep.act_cb_qp_offset = indep.act_cb_qp_offset;
+    dep.act_cr_qp_offset = indep.act_cr_qp_offset;
     dep.deblocking_disabled = indep.deblocking_disabled;
     dep.beta_offset_div2 = indep.beta_offset_div2;
     dep.tc_offset_div2 = indep.tc_offset_div2;
@@ -1349,6 +1370,7 @@ fn merge_dependent_header(dep: &mut SliceHeader, indep: &SliceHeader) {
     dep.collocated_from_l0 = indep.collocated_from_l0;
     dep.collocated_ref_idx = indep.collocated_ref_idx;
     dep.max_num_merge_cand = indep.max_num_merge_cand;
+    dep.use_integer_mv = indep.use_integer_mv;
     dep.pred_weights = indep.pred_weights.clone();
     dep.slice_loop_filter_across_slices = indep.slice_loop_filter_across_slices;
     dep.pic_output_flag = indep.pic_output_flag;

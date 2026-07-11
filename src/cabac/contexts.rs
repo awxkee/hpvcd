@@ -93,6 +93,15 @@ pub(crate) struct ContextSet {
     // coeff_abs_level_greater2 (6 contexts)
     pub(crate) coeff_abs_level_greater2: [CtxModel; 6],
 
+    // RExt persistent Rice adaptation state (§9.3.3.13). Indexed by
+    // sbType = 2*(cIdx==0) + (transform_skip || transquant_bypass). Reset with
+    // the contexts (slice start / WPP sync), snapshotted alongside them.
+    pub(crate) stat_coeff: [u8; 4],
+
+    // RExt explicit RDPCM (§7.3.8.11): flag + direction, [luma, chroma].
+    pub(crate) explicit_rdpcm_flag: [CtxModel; 2],
+    pub(crate) explicit_rdpcm_dir: [CtxModel; 2],
+
     // SAO: sao_merge_left/up flag (1 ctx, shared) and sao_type_idx (1 ctx).
     // initType0: sao_merge=153, sao_type_idx=200.
     pub(crate) sao_merge_flag: CtxModel,
@@ -104,6 +113,13 @@ pub(crate) struct ContextSet {
     pub(crate) cu_qp_delta_abs: [CtxModel; 2],
     // cu_transquant_bypass_flag (1 ctx), initValue 154 (all init types).
     pub(crate) cu_transquant_bypass_flag: CtxModel,
+
+    // RExt cross-component residual prediction (§7.3.8.12 / Table 9-48).
+    // Four unary bins are context-coded independently for each chroma
+    // component; the sign has one context per component.  All initValues are
+    // 154 for every init type (Tables 9-36 and 9-37).
+    pub(crate) log2_res_scale_abs_plus1: [CtxModel; 8],
+    pub(crate) res_scale_sign_flag: [CtxModel; 2],
 
     // ---- Inter-only contexts (present for P/B slices) ----
     pub(crate) cu_skip_flag: [CtxModel; 3],
@@ -185,6 +201,9 @@ impl ContextSet {
 
             // coeff_abs_level_greater2_flag (6) — initType0: {138,153,136,167,152,152}
             coeff_abs_level_greater2: arr([138, 153, 136, 167, 152, 152], qp),
+            stat_coeff: [0; 4],
+            explicit_rdpcm_flag: arr([139, 139], qp),
+            explicit_rdpcm_dir: arr([139, 139], qp),
 
             // SAO initType0: sao_merge_flag=153, sao_type_idx=200 (libde265).
             sao_merge_flag: c(153, qp),
@@ -193,6 +212,8 @@ impl ContextSet {
             transform_skip_flag: arr([139, 139], qp),
             cu_qp_delta_abs: arr([154, 154], qp),
             cu_transquant_bypass_flag: c(154, qp),
+            log2_res_scale_abs_plus1: arr([154; 8], qp),
+            res_scale_sign_flag: arr([154; 2], qp),
             // Inter contexts are unused in I-slices; initialise to initType-0-ish
             // placeholders (never read).
             cu_skip_flag: arr([197, 185, 201], qp),
@@ -272,11 +293,16 @@ impl ContextSet {
             coded_sub_block_flag: arr(csb, qp),
             coeff_abs_level_greater1: arr(g1, qp),
             coeff_abs_level_greater2: arr(g2, qp),
+            stat_coeff: [0; 4],
+            explicit_rdpcm_flag: arr([139, 139], qp),
+            explicit_rdpcm_dir: arr([139, 139], qp),
             sao_merge_flag: c(153, qp),
             sao_type_idx: c([200u8, 185, 160][it], qp),
             transform_skip_flag: arr([139, 139], qp),
             cu_qp_delta_abs: arr([154, 154], qp),
             cu_transquant_bypass_flag: c(154, qp),
+            log2_res_scale_abs_plus1: arr([154; 8], qp),
+            res_scale_sign_flag: arr([154; 2], qp),
             cu_skip_flag: arr([[197u8, 185, 201], [197, 185, 201]][inter], qp),
             pred_mode_flag: c([149u8, 134][inter], qp),
             merge_flag: c([110u8, 154][inter], qp),
@@ -296,12 +322,12 @@ impl ContextSet {
 }
 
 // Authoritative multi-initType tables (libde265 contextmodel.cc).
-const LAST_SIG_PREFIX: [u8; 54] = [
+static LAST_SIG_PREFIX: [u8; 54] = [
     110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63, 125,
     110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108, 125, 110, 124,
     110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111, 79, 108, 123, 93,
 ];
-const SIG_COEFF_FLAG: [[u8; 42]; 3] = [
+static SIG_COEFF_FLAG: [[u8; 42]; 3] = [
     [
         111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107, 125, 141,
         179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182, 182, 152, 136, 152, 136, 153,
@@ -318,13 +344,13 @@ const SIG_COEFF_FLAG: [[u8; 42]; 3] = [
         151, 183, 140, 151, 183, 140,
     ],
 ];
-const COEFF_G1: [u8; 72] = [
+static COEFF_G1: [u8; 72] = [
     140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107, 122, 152, 140, 179, 166,
     182, 140, 227, 122, 197, 154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121,
     136, 137, 169, 194, 166, 167, 154, 167, 137, 182, 154, 196, 167, 167, 154, 152, 167, 182, 182,
     134, 149, 136, 153, 121, 136, 122, 169, 208, 166, 167, 154, 152, 167, 182,
 ];
-const COEFF_G2: [u8; 18] = [
+static COEFF_G2: [u8; 18] = [
     138, 153, 136, 167, 152, 152, 107, 167, 91, 122, 107, 167, 107, 167, 91, 107, 107, 167,
 ];
 
@@ -336,6 +362,10 @@ pub(crate) struct IntraModeContexts {
     pub(crate) _part_mode: CtxModel,
     pub(crate) prev_intra_luma_pred_flag: CtxModel,
     pub(crate) intra_chroma_pred_mode: CtxModel,
+    /// cu_residual_act_flag (§9.3.4.2, SCC): single context, initValue 154.
+    pub(crate) cu_residual_act_flag: CtxModel,
+    /// palette_mode_flag (§9.3.4.2, SCC): single context, initValue 154.
+    pub(crate) palette_mode_flag: CtxModel,
 }
 
 impl IntraModeContexts {
@@ -344,6 +374,8 @@ impl IntraModeContexts {
             _part_mode: CtxModel::init(184, qp),
             prev_intra_luma_pred_flag: CtxModel::init(184, qp),
             intra_chroma_pred_mode: CtxModel::init(63, qp),
+            cu_residual_act_flag: CtxModel::init(154, qp),
+            palette_mode_flag: CtxModel::init(154, qp),
         }
     }
 
@@ -358,6 +390,41 @@ impl IntraModeContexts {
             _part_mode: CtxModel::init(154, qp),
             prev_intra_luma_pred_flag: CtxModel::init([184u8, 154, 183][it], qp),
             intra_chroma_pred_mode: CtxModel::init([63u8, 152, 152][it], qp),
+            cu_residual_act_flag: CtxModel::init(154, qp),
+            palette_mode_flag: CtxModel::init(154, qp),
+        }
+    }
+}
+
+/// Palette-mode contexts (§9.3.4.2.1, Table 9-4 SCC). All single-context
+/// elements initialize to 154 across every init type; `palette_run_prefix`
+/// context-codes its lead bins per Table 9-48.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PaletteContexts {
+    /// palette_run_type_flag: COPY_ABOVE (1) vs COPY_INDEX (0). This SAME context
+    /// also codes copy_above_indices_for_final_run_flag (§9.3.4.2.1) — one state.
+    pub(crate) run_type_flag: CtxModel,
+    /// palette_transpose_flag.
+    pub(crate) transpose_flag: CtxModel,
+    /// palette_run_prefix contexts: [0..4] for copy-index runs, [5..7] for
+    /// copy-above runs (§9.3.4.2.1 / Table 9-49).
+    pub(crate) run_prefix: [CtxModel; 8],
+    /// cu_chroma_qp_offset_flag / cu_chroma_qp_offset_idx (range-extension), read
+    /// in the palette delta_qp()/chroma_qp_offset() position when enabled.
+    pub(crate) chroma_qp_offset_flag: CtxModel,
+    pub(crate) chroma_qp_offset_idx: CtxModel,
+}
+
+impl PaletteContexts {
+    pub(crate) fn init(qp: u8) -> Self {
+        // palette_run_prefix initValues (SCC context tables).
+        static RUN_PREFIX: [u8; 8] = [154, 154, 154, 154, 154, 154, 154, 154];
+        Self {
+            run_type_flag: CtxModel::init(154, qp),
+            transpose_flag: CtxModel::init(154, qp),
+            run_prefix: RUN_PREFIX.map(|iv| CtxModel::init(iv, qp)),
+            chroma_qp_offset_flag: CtxModel::init(154, qp),
+            chroma_qp_offset_idx: CtxModel::init(154, qp),
         }
     }
 }

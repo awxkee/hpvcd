@@ -1026,7 +1026,7 @@ pub(crate) fn bi_mc_weighted_avx2(
     if !(1..32).contains(&(log2_wd + 1))
         || w0.unsigned_abs() > 8192
         || w1.unsigned_abs() > 8192
-        || rnd.is_none_or(|r| i32::try_from(r).is_err())
+        || rnd.map_or(true, |r| i32::try_from(r).is_err())
         || !can_motion_comp(s0.len(), pred_w, pred_h, valid_w, valid_h, dst, dst_stride)
         || s1.len() < len
     {

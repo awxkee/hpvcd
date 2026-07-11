@@ -508,12 +508,7 @@ fn inv_dct_n_into<const N: usize, S: Coeff>(coeff: &[S], bit_depth: u8, nx: usiz
         }
     }
 
-    for (tmp_row, out_row) in tmp
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<N>().0.iter_mut())
-    {
+    for (tmp_row, out_row) in tmp.chunks_exact(N).zip(out.chunks_exact_mut(N)) {
         let row: [i32; N] = std::array::from_fn(|k| tmp_row[k] as i32);
         let raw = idct_raw::<N>(row);
         for (dst, &raw) in out_row.iter_mut().zip(raw.iter()) {
@@ -557,12 +552,7 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
         }
     }
 
-    for (rowv, out_row) in tmp
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<N>().0.iter_mut())
-    {
+    for (rowv, out_row) in tmp.chunks_exact(N).zip(out.chunks_exact_mut(N)) {
         acc[..N].fill(0);
         for (&rk, trow) in rowv.iter().zip(t.iter()) {
             if rk == 0 {

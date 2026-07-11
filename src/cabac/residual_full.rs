@@ -293,35 +293,101 @@ fn decode_last_prefix(
 }
 
 #[inline(always)]
-fn decode_remaining(dec: &mut CabacDecoder<'_>, rice: u32) -> u32 {
+fn decode_egk_bypass(dec: &mut CabacDecoder<'_>, k: u32) -> u32 {
     let mut prefix = 0u32;
-    while dec.decode_bypass() != 0 {
+    while prefix < 31 && dec.decode_bypass() != 0 {
         prefix += 1;
-        if prefix > 32 {
-            break;
-        }
     }
-    if prefix <= 3 {
-        (prefix << rice) + dec.decode_bypass_bits(rice)
+    if prefix == 31 || prefix + k >= 32 {
+        return 0;
+    }
+    let suffix = dec.decode_bypass_bits(prefix + k);
+    (((1u32 << prefix) - 1) << k).wrapping_add(suffix)
+}
+
+#[inline(always)]
+fn decode_limited_egk_bypass(dec: &mut CabacDecoder<'_>, rice_param: u32, bit_depth: u8) -> u32 {
+    let log2_transform_range = 15u32.max(u32::from(bit_depth) + 6);
+    let max_prefix_extension = 28u32.saturating_sub(log2_transform_range);
+    let mut extension = 0u32;
+    while extension < max_prefix_extension && dec.decode_bypass() != 0 {
+        extension += 1;
+    }
+
+    let escape_length = if extension == max_prefix_extension {
+        // At the limit there is no terminating zero; a fixed transform-range
+        // suffix follows the all-ones extension (§9.3.3.4).
+        log2_transform_range
     } else {
-        // prefix is ≤ 32, rice ≤ 4 — cap suffix_bits so we never read > 32 bypass bins
-        let suffix_bits = (prefix - 3 + rice).min(32);
-        let cw = dec.decode_bypass_bits(suffix_bits);
-        // Saturate the base calculation: (1<<(p-3)+2)<<rice can overflow u32 when p≈32
-        let base = 1u32
-            .checked_shl(prefix - 3)
-            .unwrap_or(u32::MAX)
-            .saturating_add(2)
-            .checked_shl(rice)
-            .unwrap_or(u32::MAX);
-        base.saturating_add(cw)
+        extension + rice_param
+    };
+    if extension >= 32 || rice_param >= 32 || escape_length > 32 {
+        return 0;
     }
+    let base = ((1u32 << extension) - 1)
+        .checked_shl(rice_param)
+        .unwrap_or(0);
+    base.wrapping_add(dec.decode_bypass_bits(escape_length))
+}
+
+#[inline(always)]
+fn decode_remaining(
+    dec: &mut CabacDecoder<'_>,
+    rice: u32,
+    extended_precision: bool,
+    bit_depth: u8,
+) -> u32 {
+    // The TR prefix has at most four one-bins. Quotients 0..3 carry a fixed
+    // Rice suffix; the all-ones prefix enters EG(k+1), or limited EG(k+1) when
+    // extended_precision_processing_flag is enabled (§9.3.3.11).
+    let mut quotient = 0u32;
+    while quotient < 4 && dec.decode_bypass() != 0 {
+        quotient += 1;
+    }
+    if quotient < 4 {
+        return (quotient << rice).wrapping_add(dec.decode_bypass_bits(rice));
+    }
+
+    let suffix = if extended_precision {
+        decode_limited_egk_bypass(dec, rice + 1, bit_depth)
+    } else {
+        decode_egk_bypass(dec, rice + 1)
+    };
+    (4u32 << rice).wrapping_add(suffix)
 }
 
 static MIN_GROUP: [u32; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
 
 /// Decode residual coefficients for one TU. Returns row-major levels (n×n i32).
 #[allow(clippy::too_many_arguments)]
+/// RExt residual-coding controls (§7.4.3.2.2 flags exercised by SCC streams).
+pub(crate) struct RextResidual {
+    /// persistent_rice_adaptation_enabled_flag: init each sub-block's Rice
+    /// parameter from ContextSet::stat_coeff (§9.3.3.13).
+    pub(crate) persistent_rice: bool,
+    /// transform_skip_context_enabled_flag: single dedicated sig-coeff context
+    /// for transform-skip / transquant-bypass blocks (§9.3.4.2.5).
+    pub(crate) transform_skip_context: bool,
+    /// explicit_rdpcm_enabled_flag and whether this TU is in an inter
+    /// (non-intra-predicted) CU, gating the explicit_rdpcm syntax (§7.3.8.11).
+    pub(crate) explicit_rdpcm: bool,
+    /// The implicit-RDPCM SPS flag is enabled and this intra TU uses horizontal
+    /// or vertical prediction. It becomes active only when transform skip is set.
+    pub(crate) implicit_rdpcm: bool,
+    /// cabac_bypass_alignment_enabled_flag: align the arithmetic range before
+    /// coefficient signs/remaining levels whenever escapeDataPresent is true.
+    pub(crate) bypass_alignment: bool,
+    /// extended_precision_processing_flag selects limited EGk for coefficient
+    /// remaining escape suffixes. `bit_depth` is the active component depth.
+    pub(crate) extended_precision: bool,
+    pub(crate) bit_depth: u8,
+    pub(crate) is_inter: bool,
+}
+
+/// Explicit RDPCM outcome for the TU: None, or Some(dir) with 0=horizontal,
+/// 1=vertical residual DPCM.
+pub(crate) type RdpcmDir = Option<u8>;
+
 pub(crate) fn residual_coding(
     dec: &mut CabacDecoder<'_>,
     ctx: &mut ContextSet,
@@ -332,8 +398,9 @@ pub(crate) fn residual_coding(
     sign_data_hiding: bool,
     transform_skip_ctx: Option<usize>, // Some(ctx_idx) if transform_skip allowed (TU≤4)
     transquant_bypass: bool,
+    rext: &RextResidual,
     coeffs: &mut [i32],
-) -> (bool, usize, usize, i32) {
+) -> (bool, usize, usize, i32, RdpcmDir) {
     let n = 1usize << log2_ts;
     coeffs[..n * n].fill(0);
     let mut max_x = 0usize;
@@ -342,8 +409,21 @@ pub(crate) fn residual_coding(
     // transform_skip_flag
     let mut transform_skip = false;
     if let Some(_ci) = transform_skip_ctx {
-        let idx = if is_luma { 0 } else { 1 };
-        transform_skip = dec.decode_bin(&mut ctx.transform_skip_flag[idx]) != 0;
+        if !transquant_bypass {
+            let idx = if is_luma { 0 } else { 1 };
+            transform_skip = dec.decode_bin(&mut ctx.transform_skip_flag[idx]) != 0;
+        }
+    }
+
+    // explicit_rdpcm_flag / dir (§7.3.8.11): inter TUs with transform skip or
+    // transquant bypass, when the SPS enables explicit RDPCM.
+    let mut rdpcm: RdpcmDir = None;
+    if rext.explicit_rdpcm && rext.is_inter && (transform_skip || transquant_bypass) {
+        let ci = if is_luma { 0 } else { 1 };
+        if dec.decode_bin(&mut ctx.explicit_rdpcm_flag[ci]) != 0 {
+            let dir = dec.decode_bin(&mut ctx.explicit_rdpcm_dir[ci]) as u8;
+            rdpcm = Some(dir);
+        }
     }
 
     // last_sig_coeff position
@@ -430,7 +510,14 @@ pub(crate) fn residual_coding(
                 let significant = if k == 0 && infer_dc && sig_len == 0 {
                     true
                 } else {
-                    let ci = sig_ctx_table.ctx(xc, yc, prev_csbf);
+                    // §9.3.4.2.5: with transform_skip_context enabled, TS/TQB
+                    // blocks use one dedicated context (luma 42, chroma 16).
+                    let ci = if rext.transform_skip_context && (transform_skip || transquant_bypass)
+                    {
+                        if is_luma { 42 } else { 27 + 16 }
+                    } else {
+                        sig_ctx_table.ctx(xc, yc, prev_csbf)
+                    };
                     dec.decode_bin(&mut ctx.sig_coeff_flag[ci]) != 0
                 };
 
@@ -448,7 +535,6 @@ pub(crate) fn residual_coding(
         let sig_entries = &sig_entries[..sig_len];
         let last_sig_pos = usize::from(sig_entries[0] & 15); // highest k
         let first_sig_pos = usize::from(sig_entries[sig_len - 1] & 15); // lowest k
-
         // ── greater1 ──
         let mut ctx_set: i32 = if i == 0 || !is_luma { 0 } else { 2 };
         if !first_subblock && c1_carry == 0 {
@@ -474,7 +560,6 @@ pub(crate) fn residual_coding(
             }
         }
         c1_carry = c1;
-
         // ── greater2 (only on first greater1 coeff) ──
         let gr2 = if first_gr1_idx < 16 {
             let ci = ctx_set as usize + if is_luma { 0 } else { 4 };
@@ -483,10 +568,27 @@ pub(crate) fn residual_coding(
             false
         };
 
+        // §7.3.8.11 escapeDataPresent becomes true when there is a second
+        // greater1 coefficient, when more than eight significant coefficients
+        // are present, or when greater2 is set.  With CABAC bypass alignment,
+        // both coeff_sign_flag and coeff_abs_level_remaining must start from an
+        // arithmetic range of exactly 256 (§9.3.1 / §9.3.4.3.6).
+        let escape_data_present = sig_len > 8 || gr1_mask.count_ones() > 1 || gr2;
+        if rext.bypass_alignment && escape_data_present {
+            dec.align_bypass();
+        }
+
         // ── sign hiding decision ──
+        // Sign-data hiding is disabled for every residual-DPCM block. With
+        // explicit RDPCM this depends on the decoded flag; with implicit RDPCM
+        // it depends on transform skip plus the horizontal/vertical intra mode.
+        // Leaving it enabled consumes one fewer bypass sign and silently shifts
+        // the arithmetic offset before coeff_abs_level_remaining.
+        let rdpcm_active = rdpcm.is_some() || (transform_skip && rext.implicit_rdpcm);
         let sign_hidden = sign_data_hiding
             && (last_sig_pos as i32 - first_sig_pos as i32) > 3
-            && !transquant_bypass;
+            && !transquant_bypass
+            && !rdpcm_active;
 
         // The hidden sign is always the final (lowest-scan-position) entry, so
         // all coded signs form one contiguous bypass run.  Reverse once to make
@@ -498,9 +600,17 @@ pub(crate) fn residual_coding(
         } else {
             coded_signs.reverse_bits() >> (u16::BITS as usize - sign_count)
         };
-
         // ── coeff_abs_level_remaining + assemble ──
-        let mut rice = 0u32;
+        // §9.3.3.13: with persistent Rice adaptation the sub-block's initial
+        // Rice parameter comes from StatCoeff[sbType], and the first coded
+        // remaining value in the sub-block updates that statistic.
+        let sb_type = (2 * usize::from(is_luma)) + usize::from(transform_skip || transquant_bypass);
+        let mut rice = if rext.persistent_rice {
+            u32::from(ctx.stat_coeff[sb_type] >> 2)
+        } else {
+            0
+        };
+        let mut first_rem_in_sb = true;
         let mut abs_parity = 0i32;
         for (j, &entry) in sig_entries.iter().enumerate() {
             let g1 = ((gr1_mask >> j) & 1) as i32;
@@ -513,15 +623,33 @@ pub(crate) fn residual_coding(
                 1
             };
             let rem = if base == threshold {
-                decode_remaining(dec, rice)
+                let rem = decode_remaining(dec, rice, rext.extended_precision, rext.bit_depth);
+                if rext.persistent_rice && first_rem_in_sb {
+                    first_rem_in_sb = false;
+                    let stat = &mut ctx.stat_coeff[sb_type];
+                    if rem >= (3u32 << (*stat >> 2)) {
+                        *stat += 1;
+                    } else if 2 * rem < (1u32 << (*stat >> 2)) && *stat > 0 {
+                        *stat -= 1;
+                    }
+                }
+                // Rice parameter adaptation happens only when a remaining value
+                // is actually decoded (§9.3.3.2). Persistent-rice removes the
+                // cap of 4.
+                let level = base + rem as i32;
+                if level > (3 << rice) {
+                    rice = if rext.persistent_rice {
+                        rice + 1
+                    } else {
+                        (rice + 1).min(4)
+                    };
+                }
+                rem
             } else {
                 0
             };
             let level = base + rem as i32;
             max_abs_level = max_abs_level.max(level);
-            if level > (3 << rice) {
-                rice = (rice + 1).min(4);
-            }
 
             let coeff_index = usize::from(entry >> 4);
             let xc = coeff_index & (n - 1);
@@ -543,5 +671,5 @@ pub(crate) fn residual_coding(
         }
     }
 
-    (transform_skip, max_x, last_y, max_abs_level)
+    (transform_skip, max_x, last_y, max_abs_level, rdpcm)
 }

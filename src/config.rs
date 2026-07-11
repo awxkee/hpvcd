@@ -91,6 +91,43 @@ pub(crate) struct Sps {
     /// VUI timing: frame rate = time_scale / num_units_in_tick (0 = absent).
     pub(crate) vui_num_units_in_tick: u32,
     pub(crate) vui_time_scale: u32,
+
+    // ---- Range extension (§7.3.2.2.2). Parsed so the bitstream is navigated
+    // correctly; the corresponding residual-coding features are not decoded, so
+    // these are retained for completeness / future use rather than consumed. ----
+    #[allow(dead_code)]
+    pub(crate) transform_skip_rotation_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) transform_skip_context_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) implicit_rdpcm_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) explicit_rdpcm_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) extended_precision_processing: bool,
+    #[allow(dead_code)]
+    pub(crate) intra_smoothing_disabled: bool,
+    #[allow(dead_code)]
+    pub(crate) high_precision_offsets_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) persistent_rice_adaptation_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) cabac_bypass_alignment_enabled: bool,
+
+    // ---- SCC extension (§7.3.2.2.3) ----
+    /// curr_pic_ref: current picture is inserted into RefPicList0 as an IBC ref.
+    pub(crate) curr_pic_ref_enabled: bool,
+    pub(crate) palette_mode_enabled: bool,
+    pub(crate) palette_max_size: u32,
+    pub(crate) palette_max_predictor_size: u32,
+    /// Per-slice-reset predictor seed (component-major: [comp][entry]).
+    pub(crate) palette_predictor_initializers: Vec<Vec<u16>>,
+    /// 0 = adaptive/off, 2 = force integer block-vector MVs. IBC block vectors
+    /// are always integerized, so this is currently informational.
+    #[allow(dead_code)]
+    pub(crate) motion_vector_resolution_control_idc: u8,
+    #[allow(dead_code)]
+    pub(crate) intra_boundary_filtering_disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +178,47 @@ pub(crate) struct Pps {
     pub(crate) num_ref_idx_l0_default: usize,
     pub(crate) num_ref_idx_l1_default: usize,
     pub(crate) slice_segment_header_extension_present: bool,
+
+    // ---- Range extension (§7.3.2.3.2). Parsed for correct bitstream navigation;
+    // the associated features are not decoded, so these are reserved. ----
+    #[allow(dead_code)]
+    pub(crate) log2_max_transform_skip_block_size: u32,
+    #[allow(dead_code)]
+    pub(crate) cross_component_prediction_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) chroma_qp_offset_list_enabled: bool,
+    #[allow(dead_code)]
+    pub(crate) diff_cu_chroma_qp_offset_depth: u32,
+    /// (cb, cr) offset pairs indexed by cu_chroma_qp_offset_idx.
+    #[allow(dead_code)]
+    pub(crate) chroma_qp_offset_list: Vec<(i32, i32)>,
+    #[allow(dead_code)]
+    pub(crate) log2_sao_offset_scale_luma: u32,
+    #[allow(dead_code)]
+    pub(crate) log2_sao_offset_scale_chroma: u32,
+
+    // ---- SCC extension (§7.3.2.3.3) ----
+    /// curr_pic_ref: PPS-level enable for IBC (both SPS and PPS must be set).
+    pub(crate) curr_pic_ref_enabled: bool,
+    pub(crate) residual_adaptive_colour_transform_enabled: bool,
+    /// ACT slice-level QP override present flag.
+    pub(crate) pps_slice_act_qp_offsets_present: bool,
+    /// ACT component QP offsets (Y/Cg/Co), added to the −5/−5/−3 base.
+    pub(crate) pps_act_y_qp_offset: i32,
+    pub(crate) pps_act_cb_qp_offset: i32,
+    pub(crate) pps_act_cr_qp_offset: i32,
+    /// Distinguishes an absent PPS initializer table (fall back to SPS) from
+    /// a present table with zero entries (explicitly reset the predictor empty).
+    pub(crate) palette_predictor_initializer_present: bool,
+    pub(crate) palette_predictor_initializers: Vec<Vec<u16>>,
+    // Bit-depth metadata for the PPS palette initialisers: used while parsing
+    // the initialiser entries; not re-consulted afterward.
+    #[allow(dead_code)]
+    pub(crate) monochrome_palette: bool,
+    #[allow(dead_code)]
+    pub(crate) luma_bit_depth_entry: u32,
+    #[allow(dead_code)]
+    pub(crate) chroma_bit_depth_entry: u32,
 }
 
 impl Sps {
@@ -197,6 +275,24 @@ impl Pps {
             num_ref_idx_l0_default: 1,
             num_ref_idx_l1_default: 1,
             slice_segment_header_extension_present: false,
+            log2_max_transform_skip_block_size: 2,
+            cross_component_prediction_enabled: false,
+            chroma_qp_offset_list_enabled: false,
+            diff_cu_chroma_qp_offset_depth: 0,
+            chroma_qp_offset_list: Vec::new(),
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+            curr_pic_ref_enabled: false,
+            residual_adaptive_colour_transform_enabled: false,
+            pps_slice_act_qp_offsets_present: false,
+            pps_act_y_qp_offset: 0,
+            pps_act_cb_qp_offset: 0,
+            pps_act_cr_qp_offset: 0,
+            palette_predictor_initializer_present: false,
+            palette_predictor_initializers: Vec::new(),
+            monochrome_palette: false,
+            luma_bit_depth_entry: 0,
+            chroma_bit_depth_entry: 0,
         }
     }
 }
@@ -606,7 +702,47 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         if r.read_flag().map_err(|_| e("timing_present"))? {
             vui_num_units_in_tick = r.read_bits(32).map_err(|_| e("num_units_in_tick"))?;
             vui_time_scale = r.read_bits(32).map_err(|_| e("time_scale"))?;
-            // The remaining timing/HRD fields aren't needed for the frame rate.
+            if r.read_flag().map_err(|_| e("poc_proportional"))? {
+                r.read_ue().map_err(|_| e("num_ticks_poc_diff_one"))?;
+            }
+            if r.read_flag().map_err(|_| e("hrd_present"))? {
+                skip_hrd_parameters(&mut r, true, max_sub_layers_minus1)?;
+            }
+        }
+        // bitstream_restriction (§E.2.1): present after the timing info; the
+        // extension flags follow the VUI, so every field must be consumed.
+        if r.read_flag().map_err(|_| e("bitstream_restriction"))? {
+            r.read_flag().map_err(|_| e("tiles_fixed"))?;
+            r.read_flag().map_err(|_| e("mc_over_boundaries"))?;
+            r.read_flag().map_err(|_| e("restricted_ref_lists"))?;
+            r.read_ue().map_err(|_| e("min_spatial_seg"))?;
+            r.read_ue().map_err(|_| e("max_bytes_per_pic"))?;
+            r.read_ue().map_err(|_| e("max_bits_per_min_cu"))?;
+            r.read_ue().map_err(|_| e("log2_max_mv_h"))?;
+            r.read_ue().map_err(|_| e("log2_max_mv_v"))?;
+        }
+    }
+
+    // sps_extension_present_flag → range/multilayer/3d/scc/4bits (§7.3.2.2.1).
+    let mut re = RangeExt::default();
+    let mut scc = SccExt::default();
+    if r.read_flag().map_err(|_| e("sps_ext_present"))? {
+        let range_ext = r.read_flag().map_err(|_| e("sps_range_ext"))?;
+        let multilayer_ext = r.read_flag().map_err(|_| e("sps_multilayer_ext"))?;
+        let ext_3d = r.read_flag().map_err(|_| e("sps_3d_ext"))?;
+        let scc_ext = r.read_flag().map_err(|_| e("sps_scc_ext"))?;
+        r.read_bits(4).map_err(|_| e("sps_ext_4bits"))?;
+        if range_ext {
+            re = parse_sps_range_ext(&mut r)?;
+        }
+        if multilayer_ext {
+            r.read_flag().map_err(|_| e("inter_view_mv_vert"))?;
+        }
+        if ext_3d {
+            return Err(e("sps 3d extension unsupported"));
+        }
+        if scc_ext {
+            scc = parse_sps_scc_ext(&mut r, chroma_idc, bit_depth_luma, bit_depth_chroma)?;
         }
     }
 
@@ -679,6 +815,112 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         matrix_coefficients,
         vui_num_units_in_tick,
         vui_time_scale,
+        transform_skip_rotation_enabled: re.transform_skip_rotation,
+        transform_skip_context_enabled: re.transform_skip_context,
+        implicit_rdpcm_enabled: re.implicit_rdpcm,
+        explicit_rdpcm_enabled: re.explicit_rdpcm,
+        extended_precision_processing: re.extended_precision,
+        intra_smoothing_disabled: re.intra_smoothing_disabled,
+        high_precision_offsets_enabled: re.high_precision_offsets,
+        persistent_rice_adaptation_enabled: re.persistent_rice,
+        cabac_bypass_alignment_enabled: re.cabac_bypass_alignment,
+        curr_pic_ref_enabled: scc.curr_pic_ref,
+        palette_mode_enabled: scc.palette_mode,
+        palette_max_size: scc.palette_max_size,
+        palette_max_predictor_size: scc.palette_max_predictor_size,
+        palette_predictor_initializers: scc.palette_predictor_initializers,
+        motion_vector_resolution_control_idc: scc.mv_resolution_control_idc,
+        intra_boundary_filtering_disabled: scc.intra_boundary_filtering_disabled,
+    })
+}
+
+#[derive(Default)]
+struct RangeExt {
+    transform_skip_rotation: bool,
+    transform_skip_context: bool,
+    implicit_rdpcm: bool,
+    explicit_rdpcm: bool,
+    extended_precision: bool,
+    intra_smoothing_disabled: bool,
+    high_precision_offsets: bool,
+    persistent_rice: bool,
+    cabac_bypass_alignment: bool,
+}
+
+fn parse_sps_range_ext(r: &mut BitReader) -> Result<RangeExt, DecodeError> {
+    Ok(RangeExt {
+        transform_skip_rotation: r.read_flag().map_err(|_| e("ts_rotation"))?,
+        transform_skip_context: r.read_flag().map_err(|_| e("ts_context"))?,
+        implicit_rdpcm: r.read_flag().map_err(|_| e("implicit_rdpcm"))?,
+        explicit_rdpcm: r.read_flag().map_err(|_| e("explicit_rdpcm"))?,
+        extended_precision: r.read_flag().map_err(|_| e("extended_precision"))?,
+        intra_smoothing_disabled: r.read_flag().map_err(|_| e("intra_smoothing_dis"))?,
+        high_precision_offsets: r.read_flag().map_err(|_| e("high_prec_offsets"))?,
+        persistent_rice: r.read_flag().map_err(|_| e("persistent_rice"))?,
+        cabac_bypass_alignment: r.read_flag().map_err(|_| e("cabac_bypass_align"))?,
+    })
+}
+
+#[derive(Default)]
+struct SccExt {
+    curr_pic_ref: bool,
+    palette_mode: bool,
+    palette_max_size: u32,
+    palette_max_predictor_size: u32,
+    palette_predictor_initializers: Vec<Vec<u16>>,
+    mv_resolution_control_idc: u8,
+    intra_boundary_filtering_disabled: bool,
+}
+
+fn parse_sps_scc_ext(
+    r: &mut BitReader,
+    chroma_idc: u8,
+    bd_luma: u8,
+    bd_chroma: u8,
+) -> Result<SccExt, DecodeError> {
+    let curr_pic_ref = r.read_flag().map_err(|_| e("curr_pic_ref"))?;
+    let palette_mode = r.read_flag().map_err(|_| e("palette_mode"))?;
+    let mut palette_max_size = 0;
+    let mut palette_max_predictor_size = 0;
+    let mut palette_predictor_initializers = Vec::new();
+    if palette_mode {
+        palette_max_size = r.read_ue().map_err(|_| e("palette_max_size"))?;
+        let delta = r.read_ue().map_err(|_| e("delta_palette_max_pred"))?;
+        palette_max_predictor_size = palette_max_size.saturating_add(delta);
+        if palette_max_size > 4096 || palette_max_predictor_size > 8192 {
+            return Err(e("palette size out of range"));
+        }
+        if r.read_flag().map_err(|_| e("pal_pred_init_present"))? {
+            let num = r
+                .read_ue()
+                .map_err(|_| e("num_pal_pred_init"))?
+                .saturating_add(1);
+            if num > palette_max_predictor_size {
+                return Err(e("too many palette initializers"));
+            }
+            // numComps = (ChromaArrayType == 0) ? 1 : 3 — every non-monochrome
+            // format stores three components.
+            let num_comps = if chroma_idc == 0 { 1 } else { 3 };
+            for c in 0..num_comps {
+                let bits = if c == 0 { bd_luma } else { bd_chroma } as u32;
+                let mut col = Vec::with_capacity(num as usize);
+                for _ in 0..num {
+                    col.push(r.read_bits(bits).map_err(|_| e("pal_pred_init"))? as u16);
+                }
+                palette_predictor_initializers.push(col);
+            }
+        }
+    }
+    let mv_resolution_control_idc = r.read_bits(2).map_err(|_| e("mv_res_ctrl"))? as u8;
+    let intra_boundary_filtering_disabled = r.read_flag().map_err(|_| e("intra_bound_filt_dis"))?;
+    Ok(SccExt {
+        curr_pic_ref,
+        palette_mode,
+        palette_max_size,
+        palette_max_predictor_size,
+        palette_predictor_initializers,
+        mv_resolution_control_idc,
+        intra_boundary_filtering_disabled,
     })
 }
 
@@ -772,6 +1014,25 @@ pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps,
     let log2_parallel_merge_level = r.read_ue().map_err(|_| e("log2_parallel_merge"))? + 2;
     let slice_segment_header_extension_present = r.read_flag().map_err(|_| e("slice_hdr_ext"))?;
 
+    let mut pre = PpsRangeExt::default();
+    let mut pscc = PpsSccExt::default();
+    if r.read_flag().map_err(|_| e("pps_ext_present"))? {
+        let range_ext = r.read_flag().map_err(|_| e("pps_range_ext"))?;
+        let multilayer_ext = r.read_flag().map_err(|_| e("pps_multilayer_ext"))?;
+        let ext_3d = r.read_flag().map_err(|_| e("pps_3d_ext"))?;
+        let scc_ext = r.read_flag().map_err(|_| e("pps_scc_ext"))?;
+        r.read_bits(4).map_err(|_| e("pps_ext_4bits"))?;
+        if range_ext {
+            pre = parse_pps_range_ext(&mut r, transform_skip_enabled)?;
+        }
+        if multilayer_ext || ext_3d {
+            return Err(e("pps multilayer/3d extension unsupported"));
+        }
+        if scc_ext {
+            pscc = parse_pps_scc_ext(&mut r)?;
+        }
+    }
+
     Ok(Pps {
         id: pps_id,
         sps_id: pps_sps_id,
@@ -811,7 +1072,143 @@ pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps,
         num_ref_idx_l0_default,
         num_ref_idx_l1_default,
         slice_segment_header_extension_present,
+        log2_max_transform_skip_block_size: pre.log2_max_transform_skip_block_size,
+        cross_component_prediction_enabled: pre.cross_component_prediction,
+        chroma_qp_offset_list_enabled: pre.chroma_qp_offset_list_enabled,
+        diff_cu_chroma_qp_offset_depth: pre.diff_cu_chroma_qp_offset_depth,
+        chroma_qp_offset_list: pre.chroma_qp_offset_list,
+        log2_sao_offset_scale_luma: pre.log2_sao_offset_scale_luma,
+        log2_sao_offset_scale_chroma: pre.log2_sao_offset_scale_chroma,
+        curr_pic_ref_enabled: pscc.curr_pic_ref,
+        residual_adaptive_colour_transform_enabled: pscc.residual_act_enabled,
+        pps_slice_act_qp_offsets_present: pscc.slice_act_qp_offsets_present,
+        pps_act_y_qp_offset: pscc.act_y_qp_offset,
+        pps_act_cb_qp_offset: pscc.act_cb_qp_offset,
+        pps_act_cr_qp_offset: pscc.act_cr_qp_offset,
+        palette_predictor_initializer_present: pscc.palette_predictor_initializer_present,
+        palette_predictor_initializers: pscc.palette_predictor_initializers,
+        monochrome_palette: pscc.monochrome_palette,
+        luma_bit_depth_entry: pscc.luma_bit_depth_entry,
+        chroma_bit_depth_entry: pscc.chroma_bit_depth_entry,
     })
+}
+
+struct PpsRangeExt {
+    log2_max_transform_skip_block_size: u32,
+    cross_component_prediction: bool,
+    chroma_qp_offset_list_enabled: bool,
+    diff_cu_chroma_qp_offset_depth: u32,
+    chroma_qp_offset_list: Vec<(i32, i32)>,
+    log2_sao_offset_scale_luma: u32,
+    log2_sao_offset_scale_chroma: u32,
+}
+
+impl Default for PpsRangeExt {
+    fn default() -> Self {
+        Self {
+            // §7.4.3.3.3: log2_max_transform_skip_block_size_minus2 defaults to
+            // 0 → block size 4×4 (log2 = 2) when the PPS range extension is absent.
+            log2_max_transform_skip_block_size: 2,
+            cross_component_prediction: false,
+            chroma_qp_offset_list_enabled: false,
+            diff_cu_chroma_qp_offset_depth: 0,
+            chroma_qp_offset_list: Vec::new(),
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+        }
+    }
+}
+
+fn parse_pps_range_ext(
+    r: &mut BitReader,
+    transform_skip_enabled: bool,
+) -> Result<PpsRangeExt, DecodeError> {
+    let mut out = PpsRangeExt {
+        log2_max_transform_skip_block_size: 2,
+        ..Default::default()
+    };
+    if transform_skip_enabled {
+        out.log2_max_transform_skip_block_size =
+            r.read_ue().map_err(|_| e("log2_max_ts_block"))? + 2;
+    }
+    out.cross_component_prediction = r.read_flag().map_err(|_| e("cross_comp_pred"))?;
+    out.chroma_qp_offset_list_enabled = r.read_flag().map_err(|_| e("chroma_qp_off_list_en"))?;
+    if out.chroma_qp_offset_list_enabled {
+        out.diff_cu_chroma_qp_offset_depth = r.read_ue().map_err(|_| e("diff_cu_chroma_qp"))?;
+        let len = r
+            .read_ue()
+            .map_err(|_| e("chroma_qp_off_list_len"))?
+            .saturating_add(1);
+        if len > 6 {
+            return Err(e("chroma_qp_offset_list_len out of range"));
+        }
+        for _ in 0..len {
+            let cb = r.read_se().map_err(|_| e("cb_qp_off_list"))?;
+            let cr = r.read_se().map_err(|_| e("cr_qp_off_list"))?;
+            out.chroma_qp_offset_list.push((cb, cr));
+        }
+    }
+    out.log2_sao_offset_scale_luma = r.read_ue().map_err(|_| e("sao_scale_luma"))?;
+    out.log2_sao_offset_scale_chroma = r.read_ue().map_err(|_| e("sao_scale_chroma"))?;
+    Ok(out)
+}
+
+#[derive(Default)]
+struct PpsSccExt {
+    curr_pic_ref: bool,
+    residual_act_enabled: bool,
+    slice_act_qp_offsets_present: bool,
+    act_y_qp_offset: i32,
+    act_cb_qp_offset: i32,
+    act_cr_qp_offset: i32,
+    palette_predictor_initializer_present: bool,
+    palette_predictor_initializers: Vec<Vec<u16>>,
+    monochrome_palette: bool,
+    luma_bit_depth_entry: u32,
+    chroma_bit_depth_entry: u32,
+}
+
+fn parse_pps_scc_ext(r: &mut BitReader) -> Result<PpsSccExt, DecodeError> {
+    let mut out = PpsSccExt {
+        curr_pic_ref: r.read_flag().map_err(|_| e("pps_curr_pic_ref"))?,
+        residual_act_enabled: r.read_flag().map_err(|_| e("residual_act_en"))?,
+        ..Default::default()
+    };
+    if out.residual_act_enabled {
+        // §7.3.2.3.3: the slice-present flag precedes the three QP offsets.
+        out.slice_act_qp_offsets_present = r.read_flag().map_err(|_| e("slice_act_qp_present"))?;
+        // The bitstream syntax elements are named *_plus5 / *_plus3; the
+        // derived PPS ACT offsets subtract those biases (§7.4.3.3.3).
+        out.act_y_qp_offset = r.read_se().map_err(|_| e("act_y_qp"))? - 5;
+        out.act_cb_qp_offset = r.read_se().map_err(|_| e("act_cb_qp"))? - 5;
+        out.act_cr_qp_offset = r.read_se().map_err(|_| e("act_cr_qp"))? - 3;
+    }
+    out.palette_predictor_initializer_present =
+        r.read_flag().map_err(|_| e("pps_pal_pred_init_present"))?;
+    if out.palette_predictor_initializer_present {
+        let num = r.read_ue().map_err(|_| e("pps_num_pal_pred"))?;
+        if num > 0 {
+            out.monochrome_palette = r.read_flag().map_err(|_| e("mono_palette"))?;
+            out.luma_bit_depth_entry = r.read_ue().map_err(|_| e("luma_bd_entry"))? + 8;
+            if !out.monochrome_palette {
+                out.chroma_bit_depth_entry = r.read_ue().map_err(|_| e("chroma_bd_entry"))? + 8;
+            }
+            let num_comps = if out.monochrome_palette { 1 } else { 3 };
+            for c in 0..num_comps {
+                let bits = if c == 0 {
+                    out.luma_bit_depth_entry
+                } else {
+                    out.chroma_bit_depth_entry
+                };
+                let mut col = Vec::with_capacity(num as usize);
+                for _ in 0..num {
+                    col.push(r.read_bits(bits).map_err(|_| e("pps_pal_pred"))? as u16);
+                }
+                out.palette_predictor_initializers.push(col);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Demux SPS+PPS from an hvcC and parse both fully.
@@ -859,4 +1256,69 @@ pub(crate) fn parse_hvcc_full(hvcc: &[u8]) -> Result<(Sps, Pps), DecodeError> {
         sps.scaling_list_enabled,
     )?;
     Ok((sps, pps))
+}
+
+/// Skip hrd_parameters (§E.2.2) so following SPS/VUI syntax stays aligned.
+fn skip_hrd_parameters(
+    r: &mut BitReader,
+    common_inf: bool,
+    max_sub_layers_minus1: u32,
+) -> Result<(), DecodeError> {
+    let mut nal_hrd = false;
+    let mut vcl_hrd = false;
+    let mut sub_pic = false;
+    if common_inf {
+        nal_hrd = r.read_flag().map_err(|_| e("nal_hrd"))?;
+        vcl_hrd = r.read_flag().map_err(|_| e("vcl_hrd"))?;
+        if nal_hrd || vcl_hrd {
+            sub_pic = r.read_flag().map_err(|_| e("sub_pic_hrd"))?;
+            if sub_pic {
+                r.read_bits(8).map_err(|_| e("tick_divisor"))?;
+                r.read_bits(5).map_err(|_| e("du_cpb_len"))?;
+                r.read_flag().map_err(|_| e("sub_pic_cpb_in_pt"))?;
+                r.read_bits(5).map_err(|_| e("dpb_du_len"))?;
+            }
+            r.read_bits(4).map_err(|_| e("bit_rate_scale"))?;
+            r.read_bits(4).map_err(|_| e("cpb_size_scale"))?;
+            if sub_pic {
+                r.read_bits(4).map_err(|_| e("cpb_du_scale"))?;
+            }
+            r.read_bits(5).map_err(|_| e("init_cpb_len"))?;
+            r.read_bits(5).map_err(|_| e("au_cpb_len"))?;
+            r.read_bits(5).map_err(|_| e("dpb_out_len"))?;
+        }
+    }
+    for _ in 0..=max_sub_layers_minus1 {
+        let fixed_general = r.read_flag().map_err(|_| e("fixed_rate_gen"))?;
+        let fixed_cvs = if !fixed_general {
+            r.read_flag().map_err(|_| e("fixed_rate_cvs"))?
+        } else {
+            true
+        };
+        let low_delay = if fixed_cvs {
+            r.read_ue().map_err(|_| e("elemental_duration"))?;
+            false
+        } else {
+            r.read_flag().map_err(|_| e("low_delay"))?
+        };
+        let cpb_cnt = if !low_delay {
+            r.read_ue().map_err(|_| e("cpb_cnt"))? as usize
+        } else {
+            0
+        };
+        for hrd_on in [nal_hrd, vcl_hrd] {
+            if hrd_on {
+                for _ in 0..=cpb_cnt {
+                    r.read_ue().map_err(|_| e("bit_rate_value"))?;
+                    r.read_ue().map_err(|_| e("cpb_size_value"))?;
+                    if sub_pic {
+                        r.read_ue().map_err(|_| e("cpb_size_du"))?;
+                        r.read_ue().map_err(|_| e("bit_rate_du"))?;
+                    }
+                    r.read_flag().map_err(|_| e("cbr"))?;
+                }
+            }
+        }
+    }
+    Ok(())
 }

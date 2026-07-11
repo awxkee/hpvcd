@@ -34,9 +34,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::threadpool::ProgressGate;
 
-use crate::cabac::{ContextSet, IntraModeContexts};
+use crate::cabac::{ContextSet, IntraModeContexts, PaletteContexts};
 use crate::decode::FullDecoder;
 use crate::error::DecodeError;
+use crate::palette::PalettePredictor;
 use crate::threadpool::ThreadPool;
 
 /// Byte range `[start, end)` of one CTB-row sub-stream within the unescaped
@@ -125,10 +126,16 @@ pub(crate) fn run_wavefront(
 
     // Per-row completed-column gates and context-snapshot hand-off slots.
     let progress: Vec<ProgressGate> = (0..ctb_rows).map(|_| ProgressGate::new()).collect();
-    let snapshots: Vec<OnceLock<(ContextSet, IntraModeContexts)>> =
-        (0..ctb_rows).map(|_| OnceLock::new()).collect();
+    let snapshots: Vec<
+        OnceLock<(
+            ContextSet,
+            IntraModeContexts,
+            PaletteContexts,
+            PalettePredictor,
+        )>,
+    > = (0..ctb_rows).map(|_| OnceLock::new()).collect();
 
-    let (init_ctx, init_ictx) = template.init_contexts_pub();
+    let (init_ctx, init_ictx, init_pctx, init_palette) = template.init_contexts_pub();
 
     // One factory: `&mut template` taken exactly here, never during worker runs.
     let factory = template.row_factory();
@@ -148,6 +155,7 @@ pub(crate) fn run_wavefront(
             let factory_ref = &factory;
             let next_row_ref = &next_row;
             let init_ctx = init_ctx.clone();
+            let init_palette = init_palette.clone();
 
             scope.spawn(move || {
                 loop {
@@ -181,8 +189,8 @@ pub(crate) fn run_wavefront(
                     // earlier and is in flight, so this wait always resolves.
                     // Row above publishes its snapshot before progress 2, and every
                     // claimed row publishes even on error/abandon, so this resolves.
-                    let (ctx, ictx) = if ry == 0 {
-                        (init_ctx.clone(), init_ictx)
+                    let (ctx, ictx, pctx, palette_predictor) = if ry == 0 {
+                        (init_ctx.clone(), init_ictx, init_pctx, init_palette.clone())
                     } else {
                         progress_ref[ry - 1].wait_at_least(2);
                         snapshots_ref[ry - 1]
@@ -193,7 +201,9 @@ pub(crate) fn run_wavefront(
 
                     // SAFETY: disjointness upheld by the 2-CTB lag; buffers live
                     // for the whole scope (template outlives it).
-                    let mut row = match unsafe { factory_ref.make(row_cabac, ctx, ictx) } {
+                    let mut row = match unsafe {
+                        factory_ref.make(row_cabac, ctx, ictx, pctx, palette_predictor)
+                    } {
                         Ok(r) => r,
                         Err(e) => {
                             let _ = first_err_ref.set(e);
@@ -226,10 +236,17 @@ pub(crate) fn run_wavefront(
 
 /// A fresh pair of default entropy contexts, used only to unblock a stalled row
 /// below after an error so the wavefront can drain instead of deadlocking.
-fn default_contexts() -> (ContextSet, IntraModeContexts) {
+fn default_contexts() -> (
+    ContextSet,
+    IntraModeContexts,
+    PaletteContexts,
+    PalettePredictor,
+) {
     (
         ContextSet::init_islice(26),
         IntraModeContexts::init_islice(26),
+        PaletteContexts::init(26),
+        PalettePredictor::default(),
     )
 }
 

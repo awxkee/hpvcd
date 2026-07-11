@@ -31,9 +31,9 @@ mod contexts;
 mod engine;
 mod residual_full;
 
-pub(crate) use contexts::{ContextSet, IntraModeContexts};
+pub(crate) use contexts::{ContextSet, IntraModeContexts, PaletteContexts};
 pub(crate) use engine::CabacDecoder;
 pub(crate) use residual_full::{
-    ResidualScanTables, SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding,
+    ResidualScanTables, RextResidual, SCAN_DIAG, SCAN_HORIZ, SCAN_VERT, residual_coding,
     resolve_residual_scan_tables,
 };

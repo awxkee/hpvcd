@@ -54,12 +54,14 @@ pub(crate) fn scale_mv(mv: Mv, col_dist: i32, cur_dist: i32) -> Mv {
     Mv::new(sc(mv.x), sc(mv.y))
 }
 
-/// Motion of a spatial neighbor, or `None` if unavailable/intra.
+/// Motion-neighbor access used by merge and AMVP derivation.
 pub(crate) trait Neighbors {
-    /// Motion at luma position (x, y) if available and inter-coded and in the
-    /// same slice/tile; else None.
+    /// Raw motion at luma position `(x, y)`. Prediction-block availability is
+    /// derived separately because a previous PU in the same CU is available
+    /// even though its samples are not represented by the picture-level
+    /// `decoded` map yet.
     fn motion_at(&self, x: isize, y: isize) -> Option<MotionInfo>;
-    /// Whether (x, y) is available for prediction from (cur_x, cur_y).
+    /// Z-scan/slice/tile availability for a position outside the current CU.
     fn available(&self, x: isize, y: isize) -> bool;
     /// Collocated temporal motion for target position, scaled to `ref_poc`.
     fn temporal(&self, x: usize, y: usize, list: usize, ref_poc: i32, cur_poc: i32) -> Option<Mv>;
@@ -96,6 +98,12 @@ pub(crate) struct PuGeom {
     pub(crate) y: usize,
     pub(crate) w: usize,
     pub(crate) h: usize,
+    /// Top-left and dimensions of the containing coding block. These are
+    /// required by the prediction-block availability process (§6.4.2), which
+    /// treats same-CU neighbors differently from picture-level z-scan
+    /// neighbors.
+    pub(crate) cu_x: usize,
+    pub(crate) cu_y: usize,
     /// Whether this is a B slice (enables L1 and combined candidates).
     pub(crate) is_b: bool,
     /// Part index and mode for the second-PU redundancy checks (§8.5.3.2.1).
@@ -104,9 +112,40 @@ pub(crate) struct PuGeom {
     /// horizontal) for the A1/B1 redundancy exclusion.
     pub(crate) cu_w: usize,
     pub(crate) cu_h: usize,
+    /// Current-picture referencing active (SCC): the zero merge candidates
+    /// exclude the current picture from the L0 ref-index cycling, matching
+    /// HM-SCM / x265 (getInterMergeCandidates: numRefIdx0-- when SCC). Without
+    /// this, zero candidates cycle onto the current-picture entry with a (0,0)
+    /// BV, which is an invalid block vector.
+    pub(crate) curr_pic_ref: bool,
     /// log2 of the parallel merge estimation region size (§7.4.3.3.1). A
     /// spatial candidate in the same region as the PU is unavailable.
     pub(crate) par_mrg_level: u32,
+}
+
+/// Derive prediction-block availability (§6.4.2). A neighbor in the same
+/// coding block does not use the picture-level reconstructed-sample map. The
+/// sole same-CU exclusion is the lower-left region of the second NxN PU;
+/// neighbors outside the CU use the regular z-scan/slice/tile process.
+#[inline]
+fn prediction_block_available<N: Neighbors>(nb: &N, pu: &PuGeom, px: isize, py: isize) -> bool {
+    if px < 0 || py < 0 {
+        return false;
+    }
+    let (x, y) = (px as usize, py as usize);
+    let same_cb = x >= pu.cu_x
+        && y >= pu.cu_y
+        && x < pu.cu_x.saturating_add(pu.cu_w)
+        && y < pu.cu_y.saturating_add(pu.cu_h);
+    if !same_cb {
+        return nb.available(px, py);
+    }
+
+    !(pu.w.saturating_mul(2) == pu.cu_w
+        && pu.h.saturating_mul(2) == pu.cu_h
+        && pu.part_idx == 1
+        && pu.cu_y.saturating_add(pu.h) <= y
+        && pu.cu_x.saturating_add(pu.w) > x)
 }
 
 /// Derive the merge candidate list (§8.5.3.2.1) and return the candidate at
@@ -133,39 +172,39 @@ pub(crate) fn derive_merge<N: Neighbors>(
     }
     // B1: top-right (x+w-1, y-1).
     let b1 = spatial(nb, x + w - 1, y - 1, pu, SpatialPos::B1);
-    if let Some(c) = b1
-        && a1.is_none_or(|a| !a.same_motion(&c))
-    {
-        push_unique(&mut cands, c, max_cand);
+    if let Some(c) = b1 {
+        if a1.map_or(true, |a| !a.same_motion(&c)) {
+            push_unique(&mut cands, c, max_cand);
+        }
     }
     // B0: top-right corner (x+w, y-1).
-    if let Some(c) = spatial(nb, x + w, y - 1, pu, SpatialPos::B0)
-        && b1.is_none_or(|b| !b.same_motion(&c))
-    {
-        push_unique(&mut cands, c, max_cand);
+    if let Some(c) = spatial(nb, x + w, y - 1, pu, SpatialPos::B0) {
+        if b1.map_or(true, |b| !b.same_motion(&c)) {
+            push_unique(&mut cands, c, max_cand);
+        }
     }
     // A0: left-bottom corner (x-1, y+h).
-    if let Some(c) = spatial(nb, x - 1, y + h, pu, SpatialPos::A0)
-        && a1.is_none_or(|a| !a.same_motion(&c))
-    {
-        push_unique(&mut cands, c, max_cand);
+    if let Some(c) = spatial(nb, x - 1, y + h, pu, SpatialPos::A0) {
+        if a1.map_or(true, |a| !a.same_motion(&c)) {
+            push_unique(&mut cands, c, max_cand);
+        }
     }
     // B2: top-left corner (x-1, y-1) — only if fewer than 4 spatial so far.
-    if cands.len() < 4
-        && let Some(c) = spatial(nb, x - 1, y - 1, pu, SpatialPos::B2)
-    {
-        let dup = a1.is_some_and(|a| a.same_motion(&c)) || b1.is_some_and(|b| b.same_motion(&c));
-        if !dup {
-            push_unique(&mut cands, c, max_cand);
+    if cands.len() < 4 {
+        if let Some(c) = spatial(nb, x - 1, y - 1, pu, SpatialPos::B2) {
+            let dup =
+                a1.is_some_and(|a| a.same_motion(&c)) || b1.is_some_and(|b| b.same_motion(&c));
+            if !dup {
+                push_unique(&mut cands, c, max_cand);
+            }
         }
     }
 
     // Temporal candidate (§8.5.3.2.7): collocated bottom-right then center.
-    if temporal_enabled
-        && cands.len() < max_cand
-        && let Some(tc) = temporal_merge(nb, pu, list0, list1)
-    {
-        cands.push(tc);
+    if temporal_enabled && cands.len() < max_cand {
+        if let Some(tc) = temporal_merge(nb, pu, list0, list1) {
+            cands.push(tc);
+        }
     }
 
     // Combined bi-predictive candidates (B slices).
@@ -173,8 +212,13 @@ pub(crate) fn derive_merge<N: Neighbors>(
         derive_combined(&mut cands, max_cand, list0, list1);
     }
 
-    // Zero motion candidates.
-    derive_zero(&mut cands, max_cand, pu.is_b, list0.len(), list1.len());
+    // SCC: the current picture (last L0 entry) is excluded from the zero-
+    // candidate ref-index count (HM-SCM / x265 getInterMergeCandidates does
+    // numRefIdx0-- when SCC; only the L0 count is reduced). A zero candidate on
+    // the current-picture entry would be a (0,0) block vector, which is never
+    // valid.
+    let n0 = list0.len().saturating_sub(usize::from(pu.curr_pic_ref));
+    derive_zero(&mut cands, max_cand, pu.is_b, n0, list1.len());
 
     cands
         .get(merge_idx)
@@ -217,17 +261,15 @@ fn spatial<N: Neighbors>(
     // Parallel merge estimation region (§8.5.3.2.2): a spatial neighbor that
     // falls in the same merge-estimation region as the PU is unavailable, so
     // that all PBs in the region can derive their merge lists in parallel.
-    if pu.par_mrg_level > 2 {
-        let lvl = pu.par_mrg_level;
-        if px >= 0
-            && py >= 0
-            && (pu.x as isize >> lvl) == (px >> lvl)
-            && (pu.y as isize >> lvl) == (py >> lvl)
-        {
-            return None;
-        }
+    let lvl = pu.par_mrg_level;
+    if px >= 0
+        && py >= 0
+        && (pu.x as isize >> lvl) == (px >> lvl)
+        && (pu.y as isize >> lvl) == (py >> lvl)
+    {
+        return None;
     }
-    if !nb.available(px, py) {
+    if !prediction_block_available(nb, pu, px, py) {
         return None;
     }
     let m = nb.motion_at(px, py)?;
@@ -332,6 +374,11 @@ fn derive_combined(
 /// Zero-motion candidates (§8.5.3.2.5).
 fn derive_zero(cands: &mut Vec<MergeCand>, max_cand: usize, is_b: bool, n0: usize, n1: usize) {
     let num_ref = if is_b { n0.min(n1) } else { n0 };
+    if num_ref == 0 {
+        // No eligible references (e.g. IBC-only list): no zero candidates are
+        // appended and the merge list stays short.
+        return;
+    }
     let mut zero_idx = 0i8;
     while cands.len() < max_cand {
         let r = if (zero_idx as usize) < num_ref {
@@ -383,12 +430,17 @@ pub(crate) fn derive_amvp<N: Neighbors>(
     let a_pos = [(x - 1, y + h), (x - 1, y + h - 1)];
     let b_pos = [(x + w, y - 1), (x + w - 1, y - 1), (x - 1, y - 1)];
 
+    // Current-picture references use the same normative AMVP candidate
+    // derivation as every other reference (§8.5.3.2.6–8). Their integer-unit
+    // MVD combination is applied by the caller after predictor selection.
+
     // isScaledFlagLX (§8.5.3.2.7): set when either A block is available for
     // motion — an available, non-intra neighbor. An intra A neighbor does not
     // set the flag (de265 available_pred_blk returns false for intra), which is
     // what lets the B group produce a *scaled* candidate when A is intra/absent.
     let a_inter = |px: isize, py: isize| -> bool {
-        nb.available(px, py) && nb.motion_at(px, py).is_some_and(|m| !m.is_intra)
+        prediction_block_available(nb, pu, px, py)
+            && nb.motion_at(px, py).is_some_and(|m| !m.is_intra)
     };
     let is_scaled_flag = a_inter(a_pos[0].0, a_pos[0].1) || a_inter(a_pos[1].0, a_pos[1].1);
 
@@ -403,9 +455,13 @@ pub(crate) fn derive_amvp<N: Neighbors>(
         .unwrap_or(false);
 
     // A candidate: same-POC pass over A0/A1, then same-type (scaled) pass.
-    let mut a = amvp_spatial(nb, &a_pos, list, ref_poc, cur_poc, true, true, target_lt);
+    let mut a = amvp_spatial(
+        nb, pu, &a_pos, list, ref_poc, cur_poc, true, true, target_lt,
+    );
     // B candidate: same-POC pass only (scaling gated on isScaledFlag below).
-    let mut b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, false, true, target_lt);
+    let mut b = amvp_spatial(
+        nb, pu, &b_pos, list, ref_poc, cur_poc, false, true, target_lt,
+    );
 
     if !is_scaled_flag {
         // No motion-available A block: the unscaled same-POC B result stands in
@@ -416,16 +472,18 @@ pub(crate) fn derive_amvp<N: Neighbors>(
         if a.is_none() {
             a = b;
         }
-        b = amvp_spatial(nb, &b_pos, list, ref_poc, cur_poc, true, false, target_lt);
+        b = amvp_spatial(
+            nb, pu, &b_pos, list, ref_poc, cur_poc, true, false, target_lt,
+        );
     }
 
     if let Some(mv) = a {
         preds.push(mv);
     }
-    if let Some(mv) = b
-        && a != Some(mv)
-    {
-        preds.push(mv);
+    if let Some(mv) = b {
+        if a != Some(mv) {
+            preds.push(mv);
+        }
     }
 
     // Temporal predictor.
@@ -456,6 +514,7 @@ pub(crate) fn derive_amvp<N: Neighbors>(
 #[allow(clippy::too_many_arguments)]
 fn amvp_spatial<N: Neighbors>(
     nb: &N,
+    pu: &PuGeom,
     positions: &[(isize, isize)],
     list: usize,
     ref_poc: i32,
@@ -467,7 +526,7 @@ fn amvp_spatial<N: Neighbors>(
     // First pass: exact ref (same-POC) match, no scaling.
     if do_same_ref {
         for &(px, py) in positions {
-            if !nb.available(px, py) {
+            if !prediction_block_available(nb, pu, px, py) {
                 continue;
             }
             if let Some(m) = nb.motion_at(px, py) {
@@ -491,7 +550,7 @@ fn amvp_spatial<N: Neighbors>(
         return None;
     }
     for &(px, py) in positions {
-        if !nb.available(px, py) {
+        if !prediction_block_available(nb, pu, px, py) {
             continue;
         }
         if let Some(m) = nb.motion_at(px, py) {
@@ -571,17 +630,51 @@ mod tests {
     }
 
     #[test]
+    fn current_picture_amvp_uses_normative_zero_padding() {
+        let pu = PuGeom {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+            cu_x: 0,
+            cu_y: 0,
+            is_b: false,
+            part_idx: 0,
+            cu_w: 16,
+            cu_h: 16,
+            par_mrg_level: 2,
+            curr_pic_ref: false,
+        };
+        let current = [RefEntry {
+            _dpb_index: usize::MAX,
+            poc: 8,
+            long_term: true,
+        }];
+
+        // With no available spatial or temporal candidate, §8.5.3.2.6 pads
+        // the AMVP list with zero MVs. Older SCM-only default block vectors
+        // must not be injected here: they alter the explicitly coded MVD.
+        assert_eq!(
+            derive_amvp(&L1OnlyTemporal, &pu, 0, 8, false, &current, &[]),
+            [Mv::default(), Mv::default()]
+        );
+    }
+
+    #[test]
     fn temporal_merge_keeps_l1_only_candidate() {
         let pu = PuGeom {
             x: 0,
             y: 0,
             w: 16,
             h: 16,
+            cu_x: 0,
+            cu_y: 0,
             is_b: true,
             part_idx: 0,
             cu_w: 16,
             cu_h: 16,
             par_mrg_level: 2,
+            curr_pic_ref: false,
         };
         let refs0 = [RefEntry {
             _dpb_index: 0,
@@ -604,5 +697,201 @@ mod tests {
         );
         assert_eq!(cand.mv, [Mv::default(), Mv::new(12, -4)]);
         assert_eq!(cand.ref_idx, [-1, 0]);
+    }
+
+    #[test]
+    fn default_parallel_merge_level_filters_same_region() {
+        struct OneNeighbor;
+        impl Neighbors for OneNeighbor {
+            fn motion_at(&self, _x: isize, _y: isize) -> Option<MotionInfo> {
+                Some(MotionInfo {
+                    pred: PredFlags {
+                        l0: true,
+                        l1: false,
+                    },
+                    ref_idx: [0, -1],
+                    ..Default::default()
+                })
+            }
+
+            fn available(&self, _x: isize, _y: isize) -> bool {
+                true
+            }
+
+            fn temporal(
+                &self,
+                _x: usize,
+                _y: usize,
+                _list: usize,
+                _ref_poc: i32,
+                _cur_poc: i32,
+            ) -> Option<Mv> {
+                None
+            }
+
+            fn cur_poc(&self) -> i32 {
+                0
+            }
+
+            fn ctb_log2(&self) -> u32 {
+                6
+            }
+        }
+
+        let pu = PuGeom {
+            x: 10,
+            y: 10,
+            w: 4,
+            h: 4,
+            cu_x: 8,
+            cu_y: 8,
+            is_b: false,
+            part_idx: 0,
+            cu_w: 4,
+            cu_h: 4,
+            par_mrg_level: 2,
+            curr_pic_ref: false,
+        };
+        assert!(spatial(&OneNeighbor, 9, 10, &pu, SpatialPos::A1).is_none());
+    }
+
+    #[test]
+    fn previous_pu_in_same_cu_does_not_require_decoded_map() {
+        struct SameCuNeighbor;
+        impl Neighbors for SameCuNeighbor {
+            fn motion_at(&self, _x: isize, _y: isize) -> Option<MotionInfo> {
+                Some(MotionInfo {
+                    pred: PredFlags {
+                        l0: true,
+                        l1: false,
+                    },
+                    ref_idx: [0, -1],
+                    ..Default::default()
+                })
+            }
+
+            fn available(&self, _x: isize, _y: isize) -> bool {
+                false
+            }
+
+            fn temporal(
+                &self,
+                _x: usize,
+                _y: usize,
+                _list: usize,
+                _ref_poc: i32,
+                _cur_poc: i32,
+            ) -> Option<Mv> {
+                None
+            }
+
+            fn cur_poc(&self) -> i32 {
+                0
+            }
+
+            fn ctb_log2(&self) -> u32 {
+                6
+            }
+        }
+
+        let pu = PuGeom {
+            x: 0,
+            y: 8,
+            w: 8,
+            h: 8,
+            cu_x: 0,
+            cu_y: 0,
+            is_b: false,
+            part_idx: 2,
+            cu_w: 16,
+            cu_h: 16,
+            par_mrg_level: 0,
+            curr_pic_ref: false,
+        };
+        assert!(prediction_block_available(&SameCuNeighbor, &pu, 7, 7));
+        assert!(spatial(&SameCuNeighbor, 7, 7, &pu, SpatialPos::B1).is_some());
+    }
+
+    #[test]
+    fn second_nxn_pu_rejects_unavailable_same_cu_region() {
+        struct AlwaysAvailable;
+        impl Neighbors for AlwaysAvailable {
+            fn motion_at(&self, _x: isize, _y: isize) -> Option<MotionInfo> {
+                Some(MotionInfo::default())
+            }
+
+            fn available(&self, _x: isize, _y: isize) -> bool {
+                true
+            }
+
+            fn temporal(
+                &self,
+                _x: usize,
+                _y: usize,
+                _list: usize,
+                _ref_poc: i32,
+                _cur_poc: i32,
+            ) -> Option<Mv> {
+                None
+            }
+
+            fn cur_poc(&self) -> i32 {
+                0
+            }
+
+            fn ctb_log2(&self) -> u32 {
+                6
+            }
+        }
+
+        let pu = PuGeom {
+            x: 8,
+            y: 0,
+            w: 8,
+            h: 8,
+            cu_x: 0,
+            cu_y: 0,
+            is_b: false,
+            part_idx: 1,
+            cu_w: 16,
+            cu_h: 16,
+            par_mrg_level: 0,
+            curr_pic_ref: false,
+        };
+        assert!(!prediction_block_available(&AlwaysAvailable, &pu, 7, 8));
+        assert!(prediction_block_available(&AlwaysAvailable, &pu, 8, 8));
+    }
+
+    #[test]
+    fn zero_merge_candidates_include_current_picture_reference_slot() {
+        let pu = PuGeom {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+            cu_x: 0,
+            cu_y: 0,
+            is_b: false,
+            part_idx: 0,
+            cu_w: 16,
+            cu_h: 16,
+            par_mrg_level: 2,
+            curr_pic_ref: false,
+        };
+        let refs = [
+            RefEntry {
+                _dpb_index: 0,
+                poc: 4,
+                long_term: false,
+            },
+            RefEntry {
+                _dpb_index: usize::MAX,
+                poc: 8,
+                long_term: true,
+            },
+        ];
+        let cand = derive_merge(&L1OnlyTemporal, &pu, 1, 2, false, &refs, &[]);
+        assert_eq!(cand.ref_idx, [1, -1]);
+        assert_eq!(cand.mv, [Mv::default(), Mv::default()]);
     }
 }

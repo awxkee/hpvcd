@@ -27,7 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#![deny(unreachable_pub)]
+#![allow(unreachable_pub)]
+mod act;
 #[cfg(all(feature = "avx", target_arch = "x86_64"))]
 mod avx;
 mod bitreader;
@@ -44,6 +45,7 @@ mod exec;
 mod fast_divide;
 mod fmt;
 mod heif;
+mod ibc;
 mod info;
 mod inter;
 mod intra;
@@ -53,6 +55,7 @@ mod metadata;
 mod motion;
 #[cfg(all(feature = "neon", target_arch = "aarch64"))]
 mod neon;
+mod palette;
 mod plane;
 mod reconstruct;
 mod rps;
@@ -634,15 +637,95 @@ fn decode_grid_yuv(
     })
 }
 
+#[inline]
+fn hvcc_nal_length_size(hvcc: &[u8]) -> Result<usize, DecodeError> {
+    // HEVCDecoderConfigurationRecord.lengthSizeMinusOne occupies the low two
+    // bits of byte 21; samples may therefore use 1, 2, 3, or 4-byte lengths.
+    let length_size_minus_one = *hvcc
+        .get(21)
+        .ok_or_else(|| DecodeError::ParamSet("hvcC too short for NAL length size".into()))?
+        & 0x03;
+    Ok(length_size_minus_one as usize + 1)
+}
+
+#[inline]
+fn read_length_prefixed_nal_size(
+    sample: &[u8],
+    pos: &mut usize,
+    length_size: usize,
+) -> Result<usize, DecodeError> {
+    let end = pos
+        .checked_add(length_size)
+        .ok_or_else(|| DecodeError::Bitstream("NAL length offset overflows usize".into()))?;
+    let bytes = sample
+        .get(*pos..end)
+        .ok_or_else(|| DecodeError::Bitstream("truncated HEIF NAL length prefix".into()))?;
+    *pos = end;
+
+    let mut size = 0usize;
+    for &byte in bytes {
+        size = size
+            .checked_shl(8)
+            .and_then(|v| v.checked_add(byte as usize))
+            .ok_or_else(|| DecodeError::Bitstream("HEIF NAL length overflows usize".into()))?;
+    }
+    Ok(size)
+}
+
+fn configure_still_inter_state(
+    decoder: &mut decode::FullDecoder<'_>,
+    sps: &config::Sps,
+    pps: &config::Pps,
+    hdr: &decode::SliceHeader,
+) -> Result<(), DecodeError> {
+    if !(sps.curr_pic_ref_enabled && pps.curr_pic_ref_enabled) {
+        return Ok(());
+    }
+
+    // HEVC image items are independently decodable, so an SCC still picture
+    // has no preceding DPB references. CurrPic is nevertheless a real active
+    // long-term entry in RefPicList0/1. The video driver installs this entry;
+    // the old HEIF path left both lists empty, causing every IBC PU to miss the
+    // current-picture path and fall back to mid-grey prediction.
+    let current = dpb::RefEntry {
+        _dpb_index: usize::MAX,
+        poc: 0,
+        long_term: true,
+    };
+    let empty_rps = dpb::RpsPocs {
+        before: Vec::new(),
+        after: Vec::new(),
+        lt: Vec::new(),
+    };
+    let (list0, list1) = dpb::Dpb::new(1).build_ref_lists(
+        &empty_rps,
+        hdr.num_ref_idx_l0,
+        hdr.num_ref_idx_l1,
+        hdr.slice_type == inter::SLICE_B,
+        Some(current),
+        &hdr.list_mod_l0,
+        &hdr.list_mod_l1,
+    )?;
+    decoder.set_inter_state(0, list0, list1, Vec::new());
+    Ok(())
+}
+
 fn decode_hevc_item(
     sample: &[u8],
     hvcc: &[u8],
     pool: Option<&threadpool::ThreadPool>,
 ) -> Result<(yuv::YuvPlanes, Cicp), DecodeError> {
     use config::parse_hvcc_full;
-    use decode::{FullDecoder, parse_slice_header_full};
+    use decode::{FullDecoder, SliceHeader, parse_slice_header_full};
+
+    struct StillSlice {
+        source: Vec<u8>,
+        rbsp: Vec<u8>,
+        hdr: SliceHeader,
+    }
 
     let (sps, pps) = parse_hvcc_full(hvcc)?;
+    let nal_length_size = hvcc_nal_length_size(hvcc)?;
 
     let vui_color = Cicp {
         primaries: Primaries::from_u8(sps.color_primaries),
@@ -651,77 +734,112 @@ fn decode_hevc_item(
         full_range: sps.video_full_range,
     };
 
-    // Collect every VCL NAL (types 0..=31) in stream order. A coded still image
-    // is one access unit, which may be split into several slice segments; each
-    // segment is its own VCL NAL and must be reconstructed into the same planes.
-    // Non-VCL NALs (VPS/SPS/PPS/SEI, types >= 32) are skipped — parameter sets
-    // come from the hvcC box.
-    let mut dec: Option<FullDecoder<'static>> = None;
-    let mut pos = 0;
-    while pos + 4 <= sample.len() {
-        let nlen = u32::from_be_bytes(sample[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + nlen > sample.len() || nlen < 2 {
-            break;
+    // Collect the complete access unit before decoding. Besides making malformed
+    // length prefixes fail loudly, this lets us enforce the same WPP rule as the
+    // video path: the whole-picture wavefront is valid only for one independent
+    // slice segment.
+    let mut slices = Vec::new();
+    let mut pos = 0usize;
+    while pos < sample.len() {
+        let nlen = read_length_prefixed_nal_size(sample, &mut pos, nal_length_size)?;
+        if nlen < 2 {
+            return Err(DecodeError::Bitstream(
+                "HEIF sample contains an undersized NAL unit".into(),
+            ));
         }
-        let nal_bytes = &sample[pos..pos + nlen];
-        pos += nlen;
+        let end = pos
+            .checked_add(nlen)
+            .ok_or_else(|| DecodeError::Bitstream("NAL payload offset overflows usize".into()))?;
+        let nal_bytes = sample
+            .get(pos..end)
+            .ok_or_else(|| DecodeError::Bitstream("truncated HEIF NAL payload".into()))?;
+        pos = end;
+
         let nal_type = (nal_bytes[0] >> 1) & 0x3f;
         if nal_type > 31 {
-            continue; // non-VCL
+            continue;
         }
 
-        let rbsp = bitreader::unescape_rbsp(nal_bytes);
-        let hdr = match parse_slice_header_full(&rbsp, &sps, &pps, nal_type) {
-            Ok(h) => h,
-            Err(_) => continue, // skip a slice we can't parse rather than failing whole image
+        let source = nal_bytes.to_vec();
+        let rbsp = bitreader::unescape_rbsp(&source);
+        let hdr = parse_slice_header_full(&rbsp, &sps, &pps, nal_type)?;
+        slices.push(StillSlice { source, rbsp, hdr });
+    }
+
+    let first = slices
+        .first()
+        .ok_or_else(|| DecodeError::Bitstream("no VCL slice NAL found".into()))?;
+    if !first.hdr.first_slice_in_pic || first.hdr.dependent_slice_segment {
+        return Err(DecodeError::Bitstream(
+            "HEIF item does not begin with an independent first slice".into(),
+        ));
+    }
+
+    let first_cabac = &first.rbsp[first.hdr.cabac_offset.min(first.rbsp.len())..];
+    let mut decoder = FullDecoder::new(first_cabac, sps.clone(), pps.clone(), &first.hdr)?;
+    configure_still_inter_state(&mut decoder, &sps, &pps, &first.hdr)?;
+
+    let first_sub_starts: Vec<usize> = if first.hdr.entry_points.is_empty() {
+        Vec::new()
+    } else {
+        let src_of = bitreader::rbsp_src_map(&first.source);
+        wpp::substream_starts_rbsp_rel(
+            &src_of,
+            first.hdr.cabac_offset,
+            &first.hdr.entry_points,
+            first.rbsp.len(),
+        )
+    };
+
+    // Match VideoDecoder: its row decoder currently supports only a single
+    // whole-picture I-slice. Running it for the first segment of a multi-slice
+    // HEIF item decodes past that segment and then decodes later segments again.
+    let ran_wavefront = if slices.len() == 1 && first.hdr.slice_type == inter::SLICE_I {
+        match pool {
+            Some(p) => decoder.try_decode_wavefront(&first.rbsp, &first.source, &first.hdr, p)?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    if !ran_wavefront {
+        let starts = if first_sub_starts.is_empty() {
+            None
+        } else {
+            Some((first_cabac, first_sub_starts.as_slice()))
         };
-        let cabac = &rbsp[hdr.cabac_offset.min(rbsp.len())..];
-        // Tile/WPP sub-stream starts (RBSP offsets relative to `cabac`),
-        // converted from NAL-domain entry points through the emulation map.
-        let sub_starts: Vec<usize> = if hdr.entry_points.is_empty() {
+        decoder.decode_slice_ctx(first.hdr.slice_segment_address, starts)?;
+    }
+
+    for segment in slices.iter().skip(1) {
+        if segment.hdr.first_slice_in_pic {
+            return Err(DecodeError::Bitstream(
+                "HEIF image item contains more than one coded picture".into(),
+            ));
+        }
+        if !segment.hdr.dependent_slice_segment {
+            configure_still_inter_state(&mut decoder, &sps, &pps, &segment.hdr)?;
+        }
+
+        let sub_starts: Vec<usize> = if segment.hdr.entry_points.is_empty() {
             Vec::new()
         } else {
-            let src_of = bitreader::rbsp_src_map(nal_bytes);
-            wpp::substream_starts_rbsp_rel(&src_of, hdr.cabac_offset, &hdr.entry_points, rbsp.len())
+            let src_of = bitreader::rbsp_src_map(&segment.source);
+            wpp::substream_starts_rbsp_rel(
+                &src_of,
+                segment.hdr.cabac_offset,
+                &segment.hdr.entry_points,
+                segment.rbsp.len(),
+            )
         };
-
-        match dec.as_mut() {
-            None => {
-                // The first VCL NAL must be an independent, first-in-picture
-                // segment; otherwise the bitstream is malformed for a still image.
-                if !hdr.first_slice_in_pic {
-                    continue;
-                }
-                let mut d = FullDecoder::new(cabac, sps.clone(), pps.clone(), &hdr)?;
-                // Try the parallel WPP wavefront first; it decodes the whole
-                // picture when eligible (single independent segment, WPP, entry
-                // points). Otherwise fall back to the serial per-row decode.
-                let ran_wavefront = match pool {
-                    Some(p) => d.try_decode_wavefront(&rbsp, nal_bytes, &hdr, p)?,
-                    None => false,
-                };
-                if !ran_wavefront {
-                    let starts = if sub_starts.is_empty() {
-                        None
-                    } else {
-                        Some((cabac, sub_starts.as_slice()))
-                    };
-                    d.decode_slice_ctx(hdr.slice_segment_address, starts)?;
-                }
-                dec = Some(d);
-            }
-            Some(d) => {
-                // Subsequent segment of the same picture.
-                d.decode_segment(cabac, &hdr, &sub_starts)?;
-            }
-        }
+        let cabac = &segment.rbsp[segment.hdr.cabac_offset.min(segment.rbsp.len())..];
+        decoder.decode_segment(cabac, &segment.hdr, &sub_starts)?;
     }
 
-    match dec {
-        Some(mut d) => Ok((d.finish(pool), vui_color)),
-        None => Err(DecodeError::Bitstream("no VCL slice NAL found".into())),
-    }
+    // Keep the still-image path bit-identical to VideoDecoder. The parallel
+    // chroma deblock kernel is intentionally not selected there because it is
+    // not yet bit-exact; SAO can remain parallel.
+    Ok((decoder.finish_with(None, pool), vui_color))
 }
 
 /// Decode a HEIF/HEIC file to display-ready pixels using a default [`Decoder`].
@@ -1234,9 +1352,7 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -
     match o {
         Orientation::Normal => px.to_vec(),
         Orientation::Rotate180 => px
-            .as_chunks::<3>()
-            .0
-            .iter()
+            .chunks_exact(3)
             .rev()
             .flat_map(|c| c.iter().copied())
             .collect(),
@@ -1244,11 +1360,9 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -
             let mut out = vec![T::default(); px.len()];
             for (src_row, dst_row) in px.chunks_exact(w * 3).zip(out.chunks_exact_mut(w * 3)) {
                 for (src, dst) in src_row
-                    .as_chunks::<3>()
-                    .0
-                    .iter()
+                    .chunks_exact(3)
                     .rev()
-                    .zip(dst_row.as_chunks_mut::<3>().0.iter_mut())
+                    .zip(dst_row.chunks_exact_mut(3))
                 {
                     dst.copy_from_slice(src);
                 }
