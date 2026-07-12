@@ -34,6 +34,25 @@ use crate::fmt::{BitDepth, ChromaFormat};
 use crate::heif;
 use crate::metadata::{CleanAperture, ContentLightLevel, Orientation, PixelAspectRatio};
 
+struct PrimaryImageDescription<'a> {
+    coded_width: u32,
+    coded_height: u32,
+    orientation: Orientation,
+    hvcc: &'a [u8],
+}
+
+impl PrimaryImageDescription<'_> {
+    fn display_dimensions(&self) -> (u32, u32) {
+        match self.orientation {
+            Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Transverse
+            | Orientation::Transpose => (self.coded_height, self.coded_width),
+            _ => (self.coded_width, self.coded_height),
+        }
+    }
+}
+
 /// Lightweight, decode-free description of a HEIF/HEIC image.
 ///
 /// Obtained from [`read_heic_info`]. Every field here is read straight from the
@@ -61,8 +80,11 @@ pub struct ImageInfo {
     /// Display orientation (`irot` / `imir`). `Normal` means the stored pixels
     /// are already upright.
     pub orientation: Orientation,
-    /// `true` when the file carries a decodable alpha auxiliary item (`auxl`).
+    /// `true` when the file carries a recognized alpha auxiliary item (`auxl`)
+    /// with an HEVC configuration property.
     pub has_alpha: bool,
+    /// `true` when the file carries an Apple HDR gain-map auxiliary image.
+    pub has_gain_map: bool,
     /// `true` when the primary item is a tiled `grid` derivation rather than a
     /// single coded image.
     pub is_grid: bool,
@@ -113,51 +135,54 @@ pub fn read_heic_info_with_limits(
     file: &[u8],
     limits: &crate::limits::ParseLimits,
 ) -> Result<ImageInfo, DecodeError> {
-    let heif = heif::parse(file, limits)?;
+    let heif = heif::parse(
+        file,
+        limits,
+        heif::HeifParseOptions {
+            load_alpha: false,
+            load_gain_map: false,
+        },
+    )?;
 
-    let (coded_w, coded_h, orientation, hvcc): (u32, u32, Orientation, &[u8]) =
-        if let Some(grid) = &heif.grid {
-            let hvcc = grid
-                .tiles
-                .iter()
-                .map(|t| t.hvcc.as_slice())
-                .find(|h| !h.is_empty())
-                .unwrap_or(&[]);
-            (
-                grid.output_width,
-                grid.output_height,
-                grid.orientation,
-                hvcc,
-            )
-        } else {
-            (
-                heif.primary.display_w,
-                heif.primary.display_h,
-                heif.primary.orientation,
-                heif.primary.hvcc.as_slice(),
-            )
-        };
+    let description = if let Some(grid) = &heif.grid {
+        let hvcc = grid
+            .tiles
+            .iter()
+            .map(|tile| tile.hvcc.as_slice())
+            .find(|hvcc| !hvcc.is_empty())
+            .unwrap_or(&[]);
+        PrimaryImageDescription {
+            coded_width: grid.output_width,
+            coded_height: grid.output_height,
+            orientation: grid.orientation,
+            hvcc,
+        }
+    } else {
+        PrimaryImageDescription {
+            coded_width: heif.primary.display_w,
+            coded_height: heif.primary.display_h,
+            orientation: heif.primary.orientation,
+            hvcc: heif.primary.hvcc.as_slice(),
+        }
+    };
 
-    let (sps, _pps) = config::parse_hvcc_full(hvcc)?;
+    let (sps, _pps) = config::parse_hvcc_full(description.hvcc)?;
     let bit_depth = sps.bit_depth()?;
     let chroma = sps.chroma;
 
-    let has_alpha = heif
-        .alpha
-        .as_ref()
-        .map(|a| !a.hvcc.is_empty())
-        .unwrap_or(false);
+    let (width, height) = description.display_dimensions();
 
     Ok(ImageInfo {
-        width: coded_w,
-        height: coded_h,
-        coded_width: coded_w,
-        coded_height: coded_h,
+        width,
+        height,
+        coded_width: description.coded_width,
+        coded_height: description.coded_height,
         bit_depth,
         chroma,
         color: heif.primary.color.clone(),
-        orientation,
-        has_alpha,
+        orientation: description.orientation,
+        has_alpha: heif.has_alpha,
+        has_gain_map: heif.has_gain_map,
         is_grid: heif.grid.is_some(),
         content_light_level: heif.primary.cll,
         clean_aperture: heif.primary.clap,
@@ -181,6 +206,7 @@ mod tests {
             color: ColorMetadata::default(),
             orientation: Orientation::Normal,
             has_alpha: alpha,
+            has_gain_map: false,
             is_grid: false,
             content_light_level: None,
             clean_aperture: None,

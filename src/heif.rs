@@ -31,6 +31,9 @@ use crate::color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferF
 use crate::error::DecodeError;
 use crate::limits::ParseLimits;
 use crate::metadata::{CleanAperture, ContentLightLevel, Orientation, PixelAspectRatio};
+use std::collections::HashMap;
+
+const APPLE_HDR_GAIN_MAP_URN: &[u8] = b"urn:com:apple:photo:2020:aux:hdrgainmap";
 
 /// Parsed image item — enough to decode one HEIF image item.
 #[derive(Debug, Clone)]
@@ -74,14 +77,46 @@ pub(crate) struct GridInfo {
     pub(crate) orientation: Orientation,
 }
 
+/// Coded image backing an auxiliary item. Apple gain maps may be a single
+/// `hvc1` item or a tiled `grid`, just like the primary image.
+#[derive(Debug)]
+pub(crate) enum HeifImageSource {
+    Item(HeifItem),
+    Grid(GridInfo),
+}
+
+/// Apple HDR gain-map auxiliary image and its opaque, directly associated
+/// metadata item. Current Apple files normally store an XMP packet here; the
+/// container layer intentionally does not parse that payload.
+#[derive(Debug)]
+pub(crate) struct HeifGainMap {
+    pub(crate) image: HeifImageSource,
+    pub(crate) metadata: Option<Vec<u8>>,
+}
+
+/// Controls which auxiliary image descriptions are materialized for decode.
+/// Auxiliary URNs are still detected when loading is disabled.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeifParseOptions {
+    pub(crate) load_alpha: bool,
+    pub(crate) load_gain_map: bool,
+}
+
 /// Top-level parse result.
 pub(crate) struct HeifFile {
     /// Primary (color) image.  For grid files this is a placeholder pointing
     /// at the first tile so existing single-image code keeps compiling; use
     /// `grid` for the full picture.
     pub(crate) primary: HeifItem,
-    /// Alpha auxiliary item, if present.
+    /// Whether a recognized alpha auxiliary item is present and has HEVC
+    /// configuration. The full item is loaded only when requested.
+    pub(crate) has_alpha: bool,
+    /// Alpha auxiliary item loaded for decoding, if requested and present.
     pub(crate) alpha: Option<HeifItem>,
+    /// Whether an Apple HDR gain-map auxiliary item is present.
+    pub(crate) has_gain_map: bool,
+    /// Gain-map auxiliary image loaded for decoding, if requested and present.
+    pub(crate) gain_map: Option<HeifGainMap>,
     /// Raw EXIF/TIFF bytes (after the 4-byte header-offset prefix), if present.
     pub(crate) exif: Option<Vec<u8>>,
     /// Grid descriptor — `Some` only when the primary item type is `grid`.
@@ -127,6 +162,48 @@ struct BoxEntry<'a> {
     payload: &'a [u8], // payload excluding the 8-byte header (size+fourcc)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FullBox<'a> {
+    version: u8,
+    #[allow(dead_code)]
+    flags: u32,
+    body: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ItemExtent {
+    offset: u64,
+    length: u64,
+}
+
+type ItemExtents = HashMap<u16, ItemExtent>;
+type PropertyAssociations = HashMap<u16, Vec<u8>>;
+
+#[derive(Debug)]
+struct ItemProperties {
+    properties: Vec<Prop>,
+    associations: PropertyAssociations,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GridDescriptor {
+    rows: u32,
+    cols: u32,
+    output_width: u32,
+    output_height: u32,
+}
+
+impl Default for GridDescriptor {
+    fn default() -> Self {
+        Self {
+            rows: 1,
+            cols: 1,
+            output_width: 0,
+            output_height: 0,
+        }
+    }
+}
+
 impl<'a> Iterator for Boxes<'a> {
     type Item = BoxEntry<'a>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -149,16 +226,22 @@ impl<'a> Iterator for Boxes<'a> {
     }
 }
 
-fn fullbox_header(payload: &[u8]) -> Option<(u8, u32, &[u8])> {
+fn fullbox_header(payload: &[u8]) -> Option<FullBox<'_>> {
     if payload.len() < 4 {
         return None;
     }
-    let version = payload[0];
-    let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
-    Some((version, flags, &payload[4..]))
+    Some(FullBox {
+        version: payload[0],
+        flags: u32::from_be_bytes([0, payload[1], payload[2], payload[3]]),
+        body: &payload[4..],
+    })
 }
 
-pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, DecodeError> {
+pub(crate) fn parse(
+    file: &[u8],
+    limits: &ParseLimits,
+    options: HeifParseOptions,
+) -> Result<HeifFile, DecodeError> {
     let mbs = limits.max_box_size;
     // Verify ftyp
     let mut has_heic = false;
@@ -186,7 +269,7 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
         .ok_or(DecodeError::MissingBox("meta"))?;
     // meta is a FullBox
     let meta = fullbox_header(meta_payload)
-        .map(|(_, _, rest)| rest)
+        .map(|header| header.body)
         .ok_or(DecodeError::MissingBox("meta body"))?;
 
     // Parse sub-boxes of meta
@@ -202,11 +285,11 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
     for b in Boxes::with_limit(meta, mbs) {
         match &b.fourcc {
             b"pitm" => {
-                if let Some((version, _, rest)) = fullbox_header(b.payload) {
-                    pitm = if version == 1 {
-                        read_u32(rest, 0).map(|v| v as u16).unwrap_or(pitm)
+                if let Some(header) = fullbox_header(b.payload) {
+                    pitm = if header.version == 1 {
+                        read_u32(header.body, 0).map(|v| v as u16).unwrap_or(pitm)
                     } else {
-                        read_u16(rest, 0).unwrap_or(pitm)
+                        read_u16(header.body, 0).unwrap_or(pitm)
                     };
                 }
             }
@@ -227,15 +310,22 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
         }
     }
 
-    // Parse iloc: collect (item_id → (absolute_file_offset, length))
-    let mut extents: std::collections::HashMap<u16, (u64, u64)> = std::collections::HashMap::new();
-    if let Some((version, _, rest)) = iloc_data.and_then(fullbox_header) {
-        parse_iloc(rest, version, idat_file_offset, &mut extents, limits);
+    // Parse iloc: collect each item's absolute file range.
+    let mut extents = ItemExtents::new();
+    if let Some(header) = iloc_data.and_then(fullbox_header) {
+        parse_iloc(
+            header.body,
+            header.version,
+            idat_file_offset,
+            &mut extents,
+            limits,
+        );
     }
 
     // Parse iinf: item types
-    let mut item_types: std::collections::HashMap<u16, [u8; 4]> = std::collections::HashMap::new();
-    if let Some((_, _, rest)) = iinf_data.and_then(fullbox_header) {
+    let mut item_types: HashMap<u16, [u8; 4]> = HashMap::new();
+    if let Some(header) = iinf_data.and_then(fullbox_header) {
+        let rest = header.body;
         let count = (read_u16(rest, 0).unwrap_or(0) as usize).min(limits.max_items);
         let mut pos = 2usize;
         for _ in 0..count {
@@ -260,12 +350,14 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
     }
 
     // Parse iref: find auxl (auxiliary images — alpha/depth/gainmap/etc.), cdsc
-    // (EXIF), and dimg (grid tiles) references
+    // (metadata describing an image), and dimg (grid tiles) references.
     let mut auxl_items: Vec<u16> = Vec::new();
-    let mut exif_item: Option<u16> = None;
+    // cdsc: from=metadata item id -> to=[described image ids]
+    let mut cdsc_map: HashMap<u16, Vec<u16>> = HashMap::new();
     // dimg: from=grid_item_id → to=[tile1, tile2, ...]
-    let mut dimg_map: std::collections::HashMap<u16, Vec<u16>> = std::collections::HashMap::new();
-    if let Some((_, _, rest)) = iref_data.and_then(fullbox_header) {
+    let mut dimg_map: HashMap<u16, Vec<u16>> = HashMap::new();
+    if let Some(header) = iref_data.and_then(fullbox_header) {
+        let rest = header.body;
         let mut pos = 0;
         while pos + 8 <= rest.len() {
             let bsz = read_u32(rest, pos).unwrap_or(0) as usize;
@@ -278,7 +370,11 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
                 auxl_items.push(from_id);
             }
             if fourcc == b"cdsc" {
-                exif_item = Some(from_id);
+                let n = read_u16(rest, pos + 10).unwrap_or(0) as usize;
+                let to: Vec<u16> = (0..n)
+                    .filter_map(|i| read_u16(rest, pos + 12 + i * 2))
+                    .collect();
+                cdsc_map.insert(from_id, to);
             }
             if fourcc == b"dimg" {
                 let n = read_u16(rest, pos + 10).unwrap_or(0) as usize;
@@ -292,10 +388,16 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
     }
 
     // Parse iprp: extract properties per item
-    let (props, prop_assoc) = if let Some(iprp) = iprp_data {
+    let ItemProperties {
+        properties: props,
+        associations: prop_assoc,
+    } = if let Some(iprp) = iprp_data {
         parse_iprp(iprp, limits)
     } else {
-        (vec![], std::collections::HashMap::new())
+        ItemProperties {
+            properties: Vec::new(),
+            associations: PropertyAssociations::new(),
+        }
     };
 
     // Detect if the primary item is a grid
@@ -323,29 +425,47 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
         .iter()
         .copied()
         .find(|&id| item_is_alpha(id, &props, &prop_assoc));
-    let alpha = if let Some(aid) = alpha_item {
-        build_item(aid, &extents, &props, &prop_assoc, true, file, limits).ok()
+    let has_alpha = alpha_item
+        .map(|item_id| item_has_property(item_id, b"hvcC", &props, &prop_assoc))
+        .unwrap_or(false);
+    let alpha = if options.load_alpha {
+        alpha_item
+            .and_then(|aid| build_item(aid, &extents, &props, &prop_assoc, true, file, limits).ok())
     } else {
         None
     };
 
-    // Extract EXIF bytes
-    let exif = if let Some(eid) = exif_item {
-        if let Some(&(off, len)) = extents.get(&eid) {
-            let sum = off.saturating_add(len);
-            let start = off as usize;
-            let end = sum as usize;
-            // Enforce the EXIF size cap (len includes the 4-byte header prefix).
-            if len.saturating_sub(4) > limits.max_exif_size as u64 {
-                return Err(DecodeError::LimitExceeded {
-                    what: "exif payload",
-                    value: len.saturating_sub(4),
-                    limit: limits.max_exif_size as u64,
-                });
-            }
-            if sum <= file.len() as u64 && len > 4 {
-                let raw = &file[start + 4..end];
-                Some(raw.to_vec())
+    // Apple HDR gain maps use a dedicated auxC URN. The auxiliary itself may
+    // be a regular hvc1 item or a tiled grid (modern iPhone files commonly use
+    // the latter), so preserve that distinction for the decode layer.
+    let gain_map_item = auxl_items
+        .iter()
+        .copied()
+        .find(|&id| item_is_gain_map(id, &props, &prop_assoc));
+    let has_gain_map = gain_map_item.is_some();
+    let gain_map = if options.load_gain_map {
+        if let Some(gain_id) = gain_map_item {
+            let image = if item_types.get(&gain_id) == Some(b"grid") {
+                parse_grid_item(
+                    gain_id,
+                    &extents,
+                    &dimg_map,
+                    &props,
+                    &prop_assoc,
+                    file,
+                    limits,
+                )
+                .ok()
+                .map(HeifImageSource::Grid)
+            } else {
+                build_item(gain_id, &extents, &props, &prop_assoc, false, file, limits)
+                    .ok()
+                    .map(HeifImageSource::Item)
+            };
+            if let Some(image) = image {
+                let metadata =
+                    associated_metadata(gain_id, &cdsc_map, &item_types, &extents, file, limits)?;
+                Some(HeifGainMap { image, metadata })
             } else {
                 None
             }
@@ -356,19 +476,103 @@ pub(crate) fn parse(file: &[u8], limits: &ParseLimits) -> Result<HeifFile, Decod
         None
     };
 
+    // Select an actual Exif item describing the primary image. Previously the
+    // parser treated the last cdsc source as Exif, which could expose an XMP
+    // packet instead on files carrying gain-map metadata.
+    let exif = cdsc_map
+        .iter()
+        .find_map(|(&metadata_id, targets)| {
+            (item_types.get(&metadata_id) == Some(b"Exif") && targets.contains(&pitm))
+                .then_some(metadata_id)
+        })
+        .map(|eid| extract_item_bytes(eid, &extents, file, limits, true))
+        .transpose()?
+        .flatten();
+
     Ok(HeifFile {
         primary,
+        has_alpha,
         alpha,
+        has_gain_map,
+        gain_map,
         exif,
         grid,
     })
+}
+
+fn extract_item_bytes(
+    item_id: u16,
+    extents: &ItemExtents,
+    file: &[u8],
+    limits: &ParseLimits,
+    strip_exif_offset: bool,
+) -> Result<Option<Vec<u8>>, DecodeError> {
+    let Some(extent) = extents.get(&item_id) else {
+        return Ok(None);
+    };
+    let ItemExtent {
+        offset: off,
+        length: len,
+    } = *extent;
+    let prefix = if strip_exif_offset { 4 } else { 0 };
+    if len < prefix as u64 {
+        return Ok(None);
+    }
+    let payload_len = len - prefix as u64;
+    if payload_len > limits.max_exif_size as u64 {
+        return Err(DecodeError::LimitExceeded {
+            what: if strip_exif_offset {
+                "exif payload"
+            } else {
+                "gain-map metadata"
+            },
+            value: payload_len,
+            limit: limits.max_exif_size as u64,
+        });
+    }
+    let Some(end) = off.checked_add(len) else {
+        return Ok(None);
+    };
+    if end > file.len() as u64 {
+        return Ok(None);
+    }
+    let start = off as usize + prefix;
+    Ok(Some(file[start..end as usize].to_vec()))
+}
+
+fn associated_metadata(
+    image_id: u16,
+    cdsc_map: &HashMap<u16, Vec<u16>>,
+    item_types: &HashMap<u16, [u8; 4]>,
+    extents: &ItemExtents,
+    file: &[u8],
+    limits: &ParseLimits,
+) -> Result<Option<Vec<u8>>, DecodeError> {
+    // Prefer MIME/XMP, which is how Apple stores HDRGainMapVersion/headroom,
+    // but accept another opaque metadata item if that is all the file has.
+    // Sorting keeps the choice deterministic if a file links several items of
+    // the same type to the gain map.
+    let mut candidates: Vec<u16> = cdsc_map
+        .iter()
+        .filter_map(|(&metadata_id, targets)| targets.contains(&image_id).then_some(metadata_id))
+        .collect();
+    candidates.sort_unstable_by_key(|&metadata_id| {
+        (item_types.get(&metadata_id) != Some(b"mime"), metadata_id)
+    });
+
+    for metadata_id in candidates {
+        if let Some(bytes) = extract_item_bytes(metadata_id, extents, file, limits, false)? {
+            return Ok(Some(bytes));
+        }
+    }
+    Ok(None)
 }
 
 fn parse_iloc(
     data: &[u8],
     version: u8,
     idat_file_offset: u64,
-    out: &mut std::collections::HashMap<u16, (u64, u64)>,
+    out: &mut ItemExtents,
     limits: &ParseLimits,
 ) {
     if data.len() < 4 {
@@ -438,7 +642,13 @@ fn parse_iloc(
             } else {
                 base_offset.saturating_add(ext_offset)
             };
-            out.insert(item_id, (abs_offset, ext_length));
+            out.insert(
+                item_id,
+                ItemExtent {
+                    offset: abs_offset,
+                    length: ext_length,
+                },
+            );
         }
         // Safety: if pos didn't advance at all, bump it to prevent infinite loop.
         if pos == pos_before {
@@ -463,12 +673,9 @@ struct Prop {
     data: Vec<u8>,
 }
 
-fn parse_iprp(
-    iprp: &[u8],
-    limits: &ParseLimits,
-) -> (Vec<Prop>, std::collections::HashMap<u16, Vec<u8>>) {
-    let mut props: Vec<Prop> = vec![Prop::default()]; // 1-indexed
-    let mut assoc: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
+fn parse_iprp(iprp: &[u8], limits: &ParseLimits) -> ItemProperties {
+    let mut properties: Vec<Prop> = vec![Prop::default()]; // 1-indexed
+    let mut associations = PropertyAssociations::new();
     let mbs = limits.max_box_size;
 
     for b in Boxes::with_limit(iprp, mbs) {
@@ -476,18 +683,19 @@ fn parse_iprp(
             for pb in Boxes::with_limit(b.payload, mbs) {
                 // Bound the number of properties we accumulate; treat max_items
                 // as the ceiling since each item can associate several.
-                if props.len() >= limits.max_items.saturating_mul(4).max(64) {
+                if properties.len() >= limits.max_items.saturating_mul(4).max(64) {
                     break;
                 }
-                props.push(Prop {
+                properties.push(Prop {
                     kind: pb.fourcc,
                     data: pb.payload.to_vec(),
                 });
             }
         }
         if &b.fourcc == b"ipma"
-            && let Some((_, _, rest)) = fullbox_header(b.payload)
+            && let Some(header) = fullbox_header(b.payload)
         {
+            let rest = header.body;
             let entry_count = read_u32(rest, 0).unwrap_or(0);
             let mut pos = 4usize;
             for _ in 0..entry_count {
@@ -508,21 +716,49 @@ fn parse_iprp(
                     let idx = raw & 0x7F;
                     indices.push(idx);
                 }
-                assoc.insert(item_id, indices);
+                associations.insert(item_id, indices);
             }
         }
     }
-    (props, assoc)
+    ItemProperties {
+        properties,
+        associations,
+    }
 }
 
-fn item_is_alpha(
+fn item_has_property(
     item_id: u16,
+    kind: &[u8; 4],
     props: &[Prop],
-    prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
+    prop_assoc: &PropertyAssociations,
 ) -> bool {
-    let Some(indices) = prop_assoc.get(&item_id) else {
-        return false;
-    };
+    prop_assoc.get(&item_id).is_some_and(|indices| {
+        indices.iter().any(|&property_index| {
+            let property_index = property_index as usize;
+            property_index != 0
+                && props
+                    .get(property_index)
+                    .is_some_and(|property| &property.kind == kind)
+        })
+    })
+}
+
+fn item_is_alpha(item_id: u16, props: &[Prop], prop_assoc: &PropertyAssociations) -> bool {
+    let aux_type = item_aux_type(item_id, props, prop_assoc);
+    aux_type == Some(b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha")
+        || aux_type == Some(b"urn:mpeg:hevc:2015:auxid:1")
+}
+
+fn item_is_gain_map(item_id: u16, props: &[Prop], prop_assoc: &PropertyAssociations) -> bool {
+    item_aux_type(item_id, props, prop_assoc) == Some(APPLE_HDR_GAIN_MAP_URN)
+}
+
+fn item_aux_type<'a>(
+    item_id: u16,
+    props: &'a [Prop],
+    prop_assoc: &PropertyAssociations,
+) -> Option<&'a [u8]> {
+    let indices = prop_assoc.get(&item_id)?;
     for &pidx in indices {
         let pidx = pidx as usize;
         if pidx == 0 || pidx >= props.len() {
@@ -541,14 +777,9 @@ fn item_is_alpha(
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(urn_bytes.len());
-        let urn = &urn_bytes[..end];
-        if urn == b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
-            || urn == b"urn:mpeg:hevc:2015:auxid:1"
-        {
-            return true;
-        }
+        return Some(&urn_bytes[..end]);
     }
-    false
+    None
 }
 
 /// Read orientation (irot/imir) for a given item from ipco/ipma — without
@@ -556,7 +787,7 @@ fn item_is_alpha(
 fn read_item_orientation(
     item_id: u16,
     props: &[Prop],
-    prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
+    prop_assoc: &PropertyAssociations,
 ) -> Orientation {
     use crate::metadata::Orientation;
     let mut orientation = Orientation::Normal;
@@ -585,6 +816,56 @@ fn read_item_orientation(
     orientation
 }
 
+/// Read the compact `grid` item descriptor.
+///
+/// The grid item's data follows ISO/IEC 23008-12 §6.6.2.3.2:
+/// ```text
+/// uint8  version (= 0)
+/// uint8  flags            bit 0 = 1 → 32-bit dimensions, 0 → 16-bit
+/// uint8  rows_minus_one
+/// uint8  columns_minus_one
+/// uint16/uint32  output_width
+/// uint16/uint32  output_height
+/// ```
+fn read_grid_descriptor(grid_id: u16, extents: &ItemExtents, file: &[u8]) -> GridDescriptor {
+    let Some(extent) = extents.get(&grid_id).copied() else {
+        return GridDescriptor::default();
+    };
+    let Ok(start) = usize::try_from(extent.offset) else {
+        return GridDescriptor::default();
+    };
+    let Some(end_offset) = extent.offset.checked_add(extent.length) else {
+        return GridDescriptor::default();
+    };
+    let Ok(end) = usize::try_from(end_offset) else {
+        return GridDescriptor::default();
+    };
+    let Some(data) = file.get(start..end).filter(|data| data.len() >= 4) else {
+        return GridDescriptor::default();
+    };
+
+    let rows = data[2] as u32 + 1;
+    let cols = data[3] as u32 + 1;
+    let (output_width, output_height) = if data[1] & 1 != 0 {
+        (
+            read_u32(data, 4).unwrap_or(0),
+            read_u32(data, 8).unwrap_or(0),
+        )
+    } else {
+        (
+            read_u16(data, 4).unwrap_or(0) as u32,
+            read_u16(data, 6).unwrap_or(0) as u32,
+        )
+    };
+
+    GridDescriptor {
+        rows,
+        cols,
+        output_width,
+        output_height,
+    }
+}
+
 /// Parse the `grid` item and return a fully populated [`GridInfo`].
 ///
 /// The grid item's data is a small binary descriptor (ISO/IEC 23008-12 §6.6.2.3.2):
@@ -598,59 +879,17 @@ fn read_item_orientation(
 /// ```
 fn parse_grid_item(
     grid_id: u16,
-    extents: &std::collections::HashMap<u16, (u64, u64)>,
-    dimg_map: &std::collections::HashMap<u16, Vec<u16>>,
+    extents: &ItemExtents,
+    dimg_map: &HashMap<u16, Vec<u16>>,
     props: &[Prop],
-    prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
+    prop_assoc: &PropertyAssociations,
     file: &[u8],
     limits: &ParseLimits,
 ) -> Result<GridInfo, DecodeError> {
-    // Read the grid descriptor blob
-    let (rows, cols, ow, oh) = if let Some(&(off, len)) = extents.get(&grid_id) {
-        let start = off as usize;
-        let end = off.saturating_add(len) as usize;
-        if end <= file.len() && len >= 4 {
-            let b = &file[start..end];
-            let flags = b[1];
-            let rows = b[2] as u32 + 1;
-            let cols = b[3] as u32 + 1;
-            let (ow, oh) = if flags & 1 != 0 {
-                // 32-bit dimensions
-                let w = if b.len() >= 8 {
-                    u32::from_be_bytes(b[4..8].try_into().unwrap_or([0; 4]))
-                } else {
-                    0
-                };
-                let h = if b.len() >= 12 {
-                    u32::from_be_bytes(b[8..12].try_into().unwrap_or([0; 4]))
-                } else {
-                    0
-                };
-                (w, h)
-            } else {
-                // 16-bit dimensions
-                let w = if b.len() >= 6 {
-                    u16::from_be_bytes(b[4..6].try_into().unwrap_or([0; 2])) as u32
-                } else {
-                    0
-                };
-                let h = if b.len() >= 8 {
-                    u16::from_be_bytes(b[6..8].try_into().unwrap_or([0; 2])) as u32
-                } else {
-                    0
-                };
-                (w, h)
-            };
-            (rows, cols, ow, oh)
-        } else {
-            (1, 1, 0, 0)
-        }
-    } else {
-        (1, 1, 0, 0)
-    };
+    let descriptor = read_grid_descriptor(grid_id, extents, file);
 
     // Reject oversized grid geometry up front (image-size limit).
-    limits.check_image(ow, oh)?;
+    limits.check_image(descriptor.output_width, descriptor.output_height)?;
 
     // Build a HeifItem for each tile (in row-major order from dimg references),
     // capping the number of tiles enumerated.
@@ -664,7 +903,7 @@ fn parse_grid_item(
     }
     // A grid never needs more tiles than rows*cols; drop any stragglers so a
     // bogus dimg list can't inflate work beyond the declared layout.
-    let max_needed = (rows as usize).saturating_mul(cols as usize);
+    let max_needed = (descriptor.rows as usize).saturating_mul(descriptor.cols as usize);
     tile_ids.truncate(max_needed);
     let tiles: Vec<HeifItem> = tile_ids
         .iter()
@@ -677,10 +916,10 @@ fn parse_grid_item(
     let orientation = read_item_orientation(grid_id, props, prop_assoc);
 
     Ok(GridInfo {
-        rows,
-        cols,
-        output_width: ow,
-        output_height: oh,
+        rows: descriptor.rows,
+        cols: descriptor.cols,
+        output_width: descriptor.output_width,
+        output_height: descriptor.output_height,
         tiles,
         orientation,
     })
@@ -706,16 +945,16 @@ fn build_fallback_item(item_id: u16) -> HeifItem {
 
 fn build_item(
     item_id: u16,
-    extents: &std::collections::HashMap<u16, (u64, u64)>,
-
+    extents: &ItemExtents,
     props: &[Prop],
-    prop_assoc: &std::collections::HashMap<u16, Vec<u8>>,
+    prop_assoc: &PropertyAssociations,
     is_alpha: bool,
     _file: &[u8],
     limits: &ParseLimits,
 ) -> Result<HeifItem, DecodeError> {
-    let &(offset, length) = extents
+    let ItemExtent { offset, length } = extents
         .get(&item_id)
+        .copied()
         .ok_or(DecodeError::MissingBox("iloc entry for item"))?;
 
     // Tag/data-size limit: reject an item whose declared coded size is absurd
@@ -919,7 +1158,17 @@ mod tests {
     fn non_heif_input_is_rejected() {
         let limits = ParseLimits::default();
         let junk = boxed(b"ftyp", b"mp42");
-        assert!(matches!(parse(&junk, &limits), Err(DecodeError::NotHeif)));
+        assert!(matches!(
+            parse(
+                &junk,
+                &limits,
+                HeifParseOptions {
+                    load_alpha: true,
+                    load_gain_map: true,
+                },
+            ),
+            Err(DecodeError::NotHeif)
+        ));
     }
 
     #[test]
@@ -927,10 +1176,16 @@ mod tests {
         // build_item should reject an item whose iloc length exceeds the cap.
         let mut limits = ParseLimits::default();
         limits.max_item_size = 100;
-        let mut extents = std::collections::HashMap::new();
-        extents.insert(1u16, (0u64, 200u64)); // 200 > 100
+        let mut extents = ItemExtents::new();
+        extents.insert(
+            1u16,
+            ItemExtent {
+                offset: 0,
+                length: 200,
+            },
+        ); // 200 > 100
         let props: Vec<Prop> = vec![Prop::default()];
-        let assoc = std::collections::HashMap::new();
+        let assoc = PropertyAssociations::new();
         let r = build_item(1, &extents, &props, &assoc, false, &[], &limits);
         assert!(matches!(
             r,
@@ -939,5 +1194,57 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn apple_gain_map_aux_type_is_detected() {
+        let mut auxc = vec![0, 0, 0, 0];
+        auxc.extend_from_slice(APPLE_HDR_GAIN_MAP_URN);
+        auxc.push(0);
+        let props = vec![
+            Prop::default(),
+            Prop {
+                kind: *b"auxC",
+                data: auxc,
+            },
+        ];
+        let assoc = PropertyAssociations::from([(7u16, vec![1u8])]);
+
+        assert!(item_is_gain_map(7, &props, &assoc));
+        assert!(!item_is_alpha(7, &props, &assoc));
+    }
+
+    #[test]
+    fn gain_map_metadata_prefers_linked_mime_item() {
+        let file = b"xmp!fallback";
+        let cdsc = HashMap::from([(9u16, vec![7u16]), (10u16, vec![7u16])]);
+        let item_types = HashMap::from([(9u16, *b"mime"), (10u16, *b"Exif")]);
+        let extents = ItemExtents::from([
+            (
+                9u16,
+                ItemExtent {
+                    offset: 0,
+                    length: 4,
+                },
+            ),
+            (
+                10u16,
+                ItemExtent {
+                    offset: 4,
+                    length: 8,
+                },
+            ),
+        ]);
+
+        let metadata = associated_metadata(
+            7,
+            &cdsc,
+            &item_types,
+            &extents,
+            file,
+            &ParseLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(metadata.as_deref(), Some(&b"xmp!"[..]));
     }
 }
