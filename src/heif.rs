@@ -75,6 +75,8 @@ pub(crate) struct GridInfo {
     pub(crate) tiles: Vec<HeifItem>,
     /// Orientation of the composed image (from the grid item's irot/imir properties).
     pub(crate) orientation: Orientation,
+    /// Color metadata associated with the grid item itself.
+    pub(crate) color: ColorMetadata,
 }
 
 /// Coded image backing an auxiliary item. Apple gain maps may be a single
@@ -914,6 +916,7 @@ fn parse_grid_item(
     // We can't use build_item() here because grid items have no hvcC property
     // and build_item() returns Err for items without hvcC.
     let orientation = read_item_orientation(grid_id, props, prop_assoc);
+    let color = read_item_color(grid_id, props, prop_assoc);
 
     Ok(GridInfo {
         rows: descriptor.rows,
@@ -922,7 +925,30 @@ fn parse_grid_item(
         output_height: descriptor.output_height,
         tiles,
         orientation,
+        color,
     })
+}
+
+fn read_item_color(
+    item_id: u16,
+    props: &[Prop],
+    prop_assoc: &PropertyAssociations,
+) -> ColorMetadata {
+    let mut color = ColorMetadata::default();
+    let Some(indices) = prop_assoc.get(&item_id) else {
+        return color;
+    };
+    for &pidx in indices {
+        let pidx = pidx as usize;
+        if pidx == 0 || pidx >= props.len() {
+            continue;
+        }
+        let property = &props[pidx];
+        if &property.kind == b"colr" {
+            color = parse_colr_into(color, &property.data);
+        }
+    }
+    color
 }
 
 /// A zeroed-out placeholder HeifItem used when a tile or grid item is missing.

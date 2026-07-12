@@ -105,8 +105,14 @@ struct YuvPlaneSamples {
 struct DecodedGainMapImage {
     width: u32,
     height: u32,
-    pixels: SampleBuf,
+    chroma_width: u32,
+    chroma_height: u32,
+    y: SampleBuf,
+    cb: Option<SampleBuf>,
+    cr: Option<SampleBuf>,
+    chroma: ChromaFormat,
     bit_depth: BitDepth,
+    color: ColorMetadata,
     orientation: Orientation,
 }
 
@@ -208,26 +214,45 @@ fn copy_visible_yuv_planes(
     YuvPlaneSamples { y, cb, cr }
 }
 
-/// Decoded Apple HDR gain map carried as a HEIF auxiliary image.
-///
-/// The samples are returned exactly as the gain-map image's luma plane; no
-/// color conversion, normalization, or HDR reconstruction is applied. Apple
-/// gain maps are normally 8-bit single-channel images, but the typed buffer and
-/// bit-depth field preserve other valid HEVC representations as well.
+/// Decoded HDR gain map carried as a HEIF auxiliary image.
 #[derive(Clone, Debug)]
 pub struct GainMap {
+    /// Luma-plane dimensions.
     pub width: u32,
     pub height: u32,
-    pub pixels: SampleBuf,
+    /// Dimensions of each chroma plane. Both are zero for monochrome maps.
+    pub chroma_width: u32,
+    pub chroma_height: u32,
+    /// Gain-map luma samples.
+    pub y: SampleBuf,
+    /// Gain-map blue-difference chroma samples. `None` for monochrome maps.
+    pub cb: Option<SampleBuf>,
+    /// Gain-map red-difference chroma samples. `None` for monochrome maps.
+    pub cr: Option<SampleBuf>,
+    /// Chroma subsampling signalled by the gain-map HEVC SPS. The explicit
+    /// chroma dimensions remain authoritative after display orientation; this
+    /// matters for a 90°/270° rotation of a coded 4:2:2 map.
+    pub chroma: ChromaFormat,
     pub bit_depth: BitDepth,
+    /// Color signalling attached to the gain-map item. This matters for
+    /// converting a three-channel gain map from YCbCr to RGB gains.
+    pub color: ColorMetadata,
     /// Source orientation from the gain-map item. Display-ready decode applies
-    /// it to `pixels`; raw-YUV decode leaves the samples in coded orientation,
-    /// matching the parent image planes.
+    /// it to all present gain-map planes; raw-YUV decode leaves the samples in
+    /// coded orientation, matching the parent image planes.
     pub orientation: Orientation,
     /// Opaque metadata item directly associated with the gain-map auxiliary
     /// image. Apple files normally store an XMP packet containing fields such
     /// as `HDRGainMapVersion` and `HDRGainMapHeadroom`.
     pub metadata: Option<Vec<u8>>,
+}
+
+impl GainMap {
+    /// Number of gain channels represented by the decoded auxiliary image.
+    #[inline]
+    pub fn channels(&self) -> usize {
+        if self.chroma.is_monochrome() { 1 } else { 3 }
+    }
 }
 
 /// Packed display-ready 8-bit RGB output.
@@ -322,32 +347,57 @@ impl DecodedGainMapImage {
         let Self {
             width,
             height,
-            pixels,
+            chroma_width,
+            chroma_height,
+            y,
+            cb,
+            cr,
+            chroma,
             bit_depth,
+            color,
             orientation,
         } = self;
         let (oriented_width, oriented_height) = oriented_dimensions(width, height, orientation);
-        let pixels = match pixels {
-            SampleBuf::U8(pixels) => SampleBuf::U8(rotate_luma(
-                width as usize,
-                height as usize,
-                &pixels,
-                orientation,
-            )),
-            SampleBuf::U16(pixels) => SampleBuf::U16(rotate_luma(
-                width as usize,
-                height as usize,
-                &pixels,
-                orientation,
-            )),
+        let (oriented_chroma_width, oriented_chroma_height) = if chroma.is_monochrome() {
+            (0, 0)
+        } else {
+            oriented_dimensions(chroma_width, chroma_height, orientation)
         };
         Self {
             width: oriented_width,
             height: oriented_height,
-            pixels,
+            chroma_width: oriented_chroma_width,
+            chroma_height: oriented_chroma_height,
+            y: rotate_sample_buf(y, width, height, orientation),
+            cb: cb.map(|plane| rotate_sample_buf(plane, chroma_width, chroma_height, orientation)),
+            cr: cr.map(|plane| rotate_sample_buf(plane, chroma_width, chroma_height, orientation)),
+            chroma,
             bit_depth,
+            color,
             orientation,
         }
+    }
+}
+
+fn rotate_sample_buf(
+    samples: SampleBuf,
+    width: u32,
+    height: u32,
+    orientation: Orientation,
+) -> SampleBuf {
+    match samples {
+        SampleBuf::U8(samples) => SampleBuf::U8(rotate_luma(
+            width as usize,
+            height as usize,
+            &samples,
+            orientation,
+        )),
+        SampleBuf::U16(samples) => SampleBuf::U16(rotate_luma(
+            width as usize,
+            height as usize,
+            &samples,
+            orientation,
+        )),
     }
 }
 
@@ -370,11 +420,25 @@ fn decode_gain_map(
     Some(GainMap {
         width: decoded.width,
         height: decoded.height,
-        pixels: decoded.pixels,
+        chroma_width: decoded.chroma_width,
+        chroma_height: decoded.chroma_height,
+        y: decoded.y,
+        cb: decoded.cb,
+        cr: decoded.cr,
+        chroma: decoded.chroma,
         bit_depth: decoded.bit_depth,
+        color: decoded.color,
         orientation: decoded.orientation,
         metadata: gain.metadata.clone(),
     })
+}
+
+fn gain_map_color_metadata(item_color: &ColorMetadata, vui_color: Cicp) -> ColorMetadata {
+    let mut color = item_color.clone();
+    if vui_color.matrix != MatrixCoefficients::Unspecified {
+        color.cicp = Some(vui_color);
+    }
+    color
 }
 
 fn decode_gain_map_item(
@@ -392,7 +456,8 @@ fn decode_gain_map_item(
     let sample = file
         .get(start..end)
         .ok_or_else(|| DecodeError::Bitstream("gain-map data extends past file end".into()))?;
-    let (planes, _) = decode_hevc_item(sample, &item.hvcc, decoder.exec(), Some(decoder.pool()))?;
+    let (planes, vui_color) =
+        decode_hevc_item(sample, &item.hvcc, decoder.exec(), Some(decoder.pool()))?;
     let crop = visible_crop_from_hvcc(&item.hvcc);
     let (fallback_w, fallback_h) = config::parse_hvcc_full(&item.hvcc)
         .ok()
@@ -414,20 +479,27 @@ fn decode_gain_map_item(
         fallback_h
     };
     decoder.check_dims(width as usize, height as usize)?;
-    let luma = copy_plane_window(
-        &planes.y,
-        planes.width,
-        planes.height,
-        crop.left,
-        crop.top,
-        width as usize,
-        height as usize,
-    );
+    let samples = copy_visible_yuv_planes(&planes, width as usize, height as usize, crop);
+    let chroma = planes.chroma;
+    let (chroma_width, chroma_height) = if chroma.is_monochrome() {
+        (0, 0)
+    } else {
+        (
+            width.div_ceil(chroma.sub_w() as u32),
+            height.div_ceil(chroma.sub_h() as u32),
+        )
+    };
     Ok(DecodedGainMapImage {
         width,
         height,
-        pixels: plane_to_buf(luma, planes.bit_depth),
+        chroma_width,
+        chroma_height,
+        y: plane_to_buf(samples.y, planes.bit_depth),
+        cb: (!chroma.is_monochrome()).then(|| plane_to_buf(samples.cb, planes.bit_depth)),
+        cr: (!chroma.is_monochrome()).then(|| plane_to_buf(samples.cr, planes.bit_depth)),
+        chroma,
         bit_depth: planes.bit_depth,
+        color: gain_map_color_metadata(&item.color, vui_color),
         orientation: item.orientation,
     })
 }
@@ -460,30 +532,43 @@ fn decode_gain_map_grid(
         return Err(DecodeError::MissingBox("gain-map hvcC property"));
     }
 
-    let parsed = config::parse_hvcc_full(hvcc).ok();
-    let (tile_w, tile_h) = parsed
-        .as_ref()
-        .and_then(|(sps, _)| {
-            let width = sps.width.saturating_sub(sps.crop_left + sps.crop_right) as usize;
-            let height = sps.height.saturating_sub(sps.crop_top + sps.crop_bottom) as usize;
-            (width != 0 && height != 0).then_some((width, height))
-        })
-        .unwrap_or_else(|| (out_w.div_ceil(cols), out_h.div_ceil(rows)));
-    let crop = parsed
-        .as_ref()
-        .map(|(sps, _)| HevcVisibleCrop {
-            left: sps.crop_left as usize,
-            top: sps.crop_top as usize,
-        })
-        .unwrap_or_default();
-    let bit_depth = parsed
-        .as_ref()
-        .map(|(sps, _)| match sps.bit_depth_luma {
-            10 => BitDepth::Ten,
-            12 => BitDepth::Twelve,
-            _ => BitDepth::Eight,
-        })
-        .unwrap_or(BitDepth::Eight);
+    let (sps, _) = config::parse_hvcc_full(hvcc)?;
+    let tile_w = sps.width.saturating_sub(sps.crop_left + sps.crop_right) as usize;
+    let tile_h = sps.height.saturating_sub(sps.crop_top + sps.crop_bottom) as usize;
+    let (tile_w, tile_h) = if tile_w != 0 && tile_h != 0 {
+        (tile_w, tile_h)
+    } else {
+        (out_w.div_ceil(cols), out_h.div_ceil(rows))
+    };
+    let crop = HevcVisibleCrop {
+        left: sps.crop_left as usize,
+        top: sps.crop_top as usize,
+    };
+    let bit_depth = match sps.bit_depth_luma {
+        10 => BitDepth::Ten,
+        12 => BitDepth::Twelve,
+        _ => BitDepth::Eight,
+    };
+    let chroma = sps.chroma;
+    let has_chroma = !chroma.is_monochrome();
+    let sub_w = chroma.sub_w();
+    let sub_h = chroma.sub_h();
+    let (cw, ch, tile_cw, tile_ch) = if has_chroma {
+        (
+            out_w.div_ceil(sub_w),
+            out_h.div_ceil(sub_h),
+            tile_w.div_ceil(sub_w),
+            tile_h.div_ceil(sub_h),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let vui_color = Cicp {
+        primaries: Primaries::from_u8(sps.color_primaries),
+        transfer: TransferFunction::from_u8(sps.transfer_characteristics),
+        matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
+        full_range: sps.video_full_range,
+    };
 
     let ctx = YuvGridCtx {
         file,
@@ -493,24 +578,39 @@ fn decode_gain_map_grid(
         cols,
         out_w,
         out_h,
-        cw: 0,
-        ch: 0,
+        cw,
+        ch,
         tile_w,
         tile_h,
-        tile_cw: 0,
-        tile_ch: 0,
+        tile_cw,
+        tile_ch,
         tile_crop_left: crop.left,
         tile_crop_top: crop.top,
-        sub_w: 1,
-        sub_h: 1,
-        has_chroma: false,
+        sub_w,
+        sub_h,
+        has_chroma,
     };
-    let samples = fill_grid_yuv_bands(decoder, out_w * out_h, 0, rows, &ctx);
+    let samples = fill_grid_yuv_bands(decoder, out_w * out_h, cw * ch, rows, &ctx);
+    let item_color = if grid.color.is_empty() {
+        grid.tiles
+            .iter()
+            .find(|tile| !tile.color.is_empty())
+            .map(|tile| &tile.color)
+            .unwrap_or(&grid.tiles[0].color)
+    } else {
+        &grid.color
+    };
     Ok(DecodedGainMapImage {
         width: grid.output_width,
         height: grid.output_height,
-        pixels: plane_to_buf(samples.y, bit_depth),
+        chroma_width: cw as u32,
+        chroma_height: ch as u32,
+        y: plane_to_buf(samples.y, bit_depth),
+        cb: has_chroma.then(|| plane_to_buf(samples.cb, bit_depth)),
+        cr: has_chroma.then(|| plane_to_buf(samples.cr, bit_depth)),
+        chroma,
         bit_depth,
+        color: gain_map_color_metadata(item_color, vui_color),
         orientation: grid.orientation,
     })
 }
