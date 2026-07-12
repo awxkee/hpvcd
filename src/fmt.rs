@@ -227,6 +227,355 @@ impl SampleBuf {
         self.len() == 0
     }
 }
+
+/// Visible layout of one owned image plane. `stride` and `offset` are measured
+/// in samples, not bytes. The backing allocation may include coded padding
+/// before, after, or between visible rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneLayout {
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub offset: usize,
+}
+
+/// An owning, typed, strided image plane.
+///
+/// Row access exposes only visible samples and hides coded padding. Use
+/// [`PlaneBuffer::data`] together with [`PlaneBuffer::stride`] when passing the
+/// visible plane to a strided image-processing API. [`PlaneBuffer::storage`]
+/// exposes the complete coded allocation, including prefix and trailing padding.
+#[derive(Clone, Debug)]
+pub struct PlaneBuffer<T> {
+    data: Vec<T>,
+    layout: PlaneLayout,
+}
+
+impl<T> PlaneBuffer<T> {
+    pub(crate) fn from_parts(data: Vec<T>, layout: PlaneLayout) -> Self {
+        debug_assert!(layout.stride >= layout.width);
+        debug_assert!(layout.height == 0 || layout.width == 0 || layout.offset < data.len());
+        debug_assert!(
+            layout.height == 0
+                || (layout.height - 1)
+                    .checked_mul(layout.stride)
+                    .and_then(|rows| layout.offset.checked_add(rows))
+                    .and_then(|v| v.checked_add(layout.width))
+                    .is_some_and(|end| end <= data.len())
+        );
+        Self { data, layout }
+    }
+
+    pub(crate) fn tight(data: Vec<T>, width: usize, height: usize) -> Self {
+        debug_assert_eq!(data.len(), width.saturating_mul(height));
+        Self::from_parts(
+            data,
+            PlaneLayout {
+                width,
+                height,
+                stride: width,
+                offset: 0,
+            },
+        )
+    }
+
+    #[inline]
+    pub fn layout(&self) -> PlaneLayout {
+        self.layout
+    }
+
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.layout.width
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.layout.height
+    }
+
+    #[inline]
+    pub fn stride(&self) -> usize {
+        self.layout.stride
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.layout.offset
+    }
+
+    /// Distance between rows in bytes.
+    #[inline]
+    pub fn stride_bytes(&self) -> usize {
+        self.layout.stride.saturating_mul(size_of::<T>())
+    }
+
+    /// Byte offset of the first visible sample within the allocation.
+    #[inline]
+    pub fn offset_bytes(&self) -> usize {
+        self.layout.offset.saturating_mul(size_of::<T>())
+    }
+
+    /// Number of visible samples.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.layout.width.saturating_mul(self.layout.height)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.layout.width == 0 || self.layout.height == 0
+    }
+
+    /// Visible width and height in samples.
+    #[inline]
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.layout.width, self.layout.height)
+    }
+
+    /// Whether the visible rows are adjacent with no stride padding.
+    ///
+    /// A tightly packed plane may still be a subrange of a larger coded
+    /// allocation. Use [`PlaneBuffer::as_tight`] to obtain that subrange.
+    #[inline]
+    pub fn is_tightly_packed(&self) -> bool {
+        self.layout.stride == self.layout.width
+    }
+
+    /// Plane storage beginning at the visible top-left sample.
+    ///
+    /// The slice includes any padding between visible rows, but excludes coded
+    /// samples before the visible origin and unused storage after the final
+    /// visible row. This is the convenient representation for APIs that accept
+    /// a plane slice plus a stride measured in samples.
+    #[inline]
+    pub fn data(&self) -> &[T] {
+        let range = self.visible_data_range();
+        &self.data[range]
+    }
+
+    /// Mutable plane storage beginning at the visible top-left sample.
+    ///
+    /// As with [`PlaneBuffer::data`], row padding is retained and the caller
+    /// must use [`PlaneBuffer::stride`] to advance between rows.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [T] {
+        let range = self.visible_data_range();
+        &mut self.data[range]
+    }
+
+    /// Complete backing allocation, including coded padding.
+    #[inline]
+    pub fn storage(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Consume the plane and return the complete backing allocation.
+    #[inline]
+    pub fn into_storage(self) -> Vec<T> {
+        self.data
+    }
+
+    #[inline]
+    fn visible_data_range(&self) -> core::ops::Range<usize> {
+        if self.is_empty() {
+            return self.layout.offset..self.layout.offset;
+        }
+        let span = (self.layout.height - 1)
+            .saturating_mul(self.layout.stride)
+            .saturating_add(self.layout.width);
+        self.layout.offset..self.layout.offset.saturating_add(span)
+    }
+
+    /// One visible row, excluding stride padding.
+    pub fn row(&self, y: usize) -> Option<&[T]> {
+        if y >= self.layout.height {
+            return None;
+        }
+        let start = y
+            .checked_mul(self.layout.stride)
+            .and_then(|v| self.layout.offset.checked_add(v))?;
+        let end = start.checked_add(self.layout.width)?;
+        self.data.get(start..end)
+    }
+
+    /// Iterate visible rows while hiding stride and crop offsets.
+    #[inline]
+    pub fn rows(&self) -> PlaneRows<'_, T> {
+        PlaneRows {
+            plane: self,
+            row: 0,
+        }
+    }
+
+    /// Contiguous visible samples when rows have no padding. The returned slice
+    /// may be a subrange of a larger coded allocation.
+    pub fn as_tight(&self) -> Option<&[T]> {
+        if !self.is_tightly_packed() {
+            return None;
+        }
+        let len = self.layout.width.checked_mul(self.layout.height)?;
+        let end = self.layout.offset.checked_add(len)?;
+        self.data.get(self.layout.offset..end)
+    }
+}
+
+impl<T: Copy + Default> PlaneBuffer<T> {
+    /// Consume the plane and return tightly packed visible samples. This is
+    /// allocation-free when the visible plane already occupies the full
+    /// backing vector; otherwise only the visible rows are copied.
+    pub fn into_tight(self) -> Result<Vec<T>, crate::DecodeError> {
+        let len = self
+            .layout
+            .width
+            .checked_mul(self.layout.height)
+            .ok_or_else(|| {
+                crate::DecodeError::Bitstream("plane dimensions overflow usize".into())
+            })?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if self.layout.offset == 0
+            && self.layout.stride == self.layout.width
+            && self.data.len() == len
+        {
+            return Ok(self.data);
+        }
+
+        let mut out = try_vec![T::default(); len, "tightly packed image plane"];
+        for (src, dst) in self.rows().zip(out.chunks_exact_mut(self.layout.width)) {
+            dst.copy_from_slice(src);
+        }
+        Ok(out)
+    }
+}
+
+/// Exact-size iterator over visible rows of a [`PlaneBuffer`].
+pub struct PlaneRows<'a, T> {
+    plane: &'a PlaneBuffer<T>,
+    row: usize,
+}
+
+impl<'a, T> Iterator for PlaneRows<'a, T> {
+    type Item = &'a [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = self.plane.row(self.row)?;
+        self.row += 1;
+        Some(row)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.plane.height().saturating_sub(self.row);
+        (left, Some(left))
+    }
+}
+
+impl<T> ExactSizeIterator for PlaneRows<'_, T> {}
+
+/// Three planar components with a single sample type. Chroma planes are absent
+/// for monochrome images.
+#[derive(Clone, Debug)]
+pub struct PlanarImage<T> {
+    pub y: PlaneBuffer<T>,
+    pub cb: Option<PlaneBuffer<T>>,
+    pub cr: Option<PlaneBuffer<T>>,
+}
+
+impl<T> PlanarImage<T> {
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.y.width()
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.y.height()
+    }
+}
+
+/// Typed planar YCbCr storage. Callers match once for the complete image rather
+/// than independently matching Y, Cb, and Cr buffers.
+#[derive(Clone, Debug)]
+pub enum YuvBuffer {
+    U8(PlanarImage<u8>),
+    U16(PlanarImage<u16>),
+}
+
+impl YuvBuffer {
+    #[inline]
+    pub fn as_u8(&self) -> Option<&PlanarImage<u8>> {
+        match self {
+            Self::U8(planes) => Some(planes),
+            Self::U16(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_u16(&self) -> Option<&PlanarImage<u16>> {
+        match self {
+            Self::U8(_) => None,
+            Self::U16(planes) => Some(planes),
+        }
+    }
+
+    #[inline]
+    pub fn width(&self) -> usize {
+        match self {
+            Self::U8(planes) => planes.width(),
+            Self::U16(planes) => planes.width(),
+        }
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        match self {
+            Self::U8(planes) => planes.height(),
+            Self::U16(planes) => planes.height(),
+        }
+    }
+}
+
+/// One typed plane, used for auxiliary alpha images.
+#[derive(Clone, Debug)]
+pub enum SamplePlane {
+    U8(PlaneBuffer<u8>),
+    U16(PlaneBuffer<u16>),
+}
+
+impl SamplePlane {
+    #[inline]
+    pub fn width(&self) -> usize {
+        match self {
+            Self::U8(plane) => plane.width(),
+            Self::U16(plane) => plane.width(),
+        }
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        match self {
+            Self::U8(plane) => plane.height(),
+            Self::U16(plane) => plane.height(),
+        }
+    }
+
+    #[inline]
+    pub fn as_u8(&self) -> Option<&PlaneBuffer<u8>> {
+        match self {
+            Self::U8(plane) => Some(plane),
+            Self::U16(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_u16(&self) -> Option<&PlaneBuffer<u16>> {
+        match self {
+            Self::U8(_) => None,
+            Self::U16(plane) => Some(plane),
+        }
+    }
+}
 //
 // /// Full pixel-format description: chroma subsampling and sample bit depth.
 // #[derive(Clone, Copy, Debug)]
@@ -275,5 +624,72 @@ mod tests {
     #[should_panic]
     fn bitdepth_rejects_unsupported() {
         let _ = BitDepth::from_bits(16);
+    }
+}
+
+#[cfg(test)]
+mod plane_tests {
+    use super::*;
+
+    #[test]
+    fn strided_rows_hide_padding_and_offset() {
+        let plane = PlaneBuffer::from_parts(
+            (0u8..20).collect(),
+            PlaneLayout {
+                width: 3,
+                height: 2,
+                stride: 5,
+                offset: 6,
+            },
+        );
+        let rows: Vec<&[u8]> = plane.rows().collect();
+        assert_eq!(rows, vec![&[6, 7, 8][..], &[11, 12, 13][..]]);
+        assert_eq!(plane.stride_bytes(), 5);
+        assert_eq!(plane.offset_bytes(), 6);
+        assert_eq!(plane.dimensions(), (3, 2));
+        assert!(!plane.is_tightly_packed());
+        assert_eq!(plane.data(), &[6, 7, 8, 9, 10, 11, 12, 13]);
+        assert!(plane.as_tight().is_none());
+    }
+
+    #[test]
+    fn mutable_data_starts_at_visible_origin() {
+        let mut plane = PlaneBuffer::from_parts(
+            (0u8..20).collect(),
+            PlaneLayout {
+                width: 3,
+                height: 2,
+                stride: 5,
+                offset: 6,
+            },
+        );
+        plane.data_mut()[0] = 42;
+        plane.data_mut()[5] = 43;
+        assert_eq!(plane.row(0), Some(&[42, 7, 8][..]));
+        assert_eq!(plane.row(1), Some(&[43, 12, 13][..]));
+        assert_eq!(plane.storage()[5], 5);
+        assert_eq!(plane.storage()[14], 14);
+    }
+
+    #[test]
+    fn tight_conversion_copies_only_visible_samples() {
+        let plane = PlaneBuffer::from_parts(
+            (0u16..20).collect(),
+            PlaneLayout {
+                width: 3,
+                height: 2,
+                stride: 5,
+                offset: 6,
+            },
+        );
+        assert_eq!(plane.into_tight().unwrap(), vec![6, 7, 8, 11, 12, 13]);
+    }
+
+    #[test]
+    fn tight_plane_exposes_contiguous_slice() {
+        let plane = PlaneBuffer::tight(vec![1u8, 2, 3, 4], 2, 2);
+        assert!(plane.is_tightly_packed());
+        assert_eq!(plane.data(), &[1, 2, 3, 4]);
+        assert_eq!(plane.as_tight(), Some(&[1, 2, 3, 4][..]));
     }
 }

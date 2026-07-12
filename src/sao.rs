@@ -803,18 +803,29 @@ pub(crate) fn apply_sao_parallel(
     mut y: Vec<u16>,
     mut cb: Vec<u16>,
     mut cr: Vec<u16>,
-) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+) -> Result<(Vec<u16>, Vec<u16>, Vec<u16>), crate::DecodeError> {
     let ctb = 1usize << ctx.log2_ctb;
     let rows = ctx.ctb_rows;
     let usage = sao_usage(ctx);
 
     if !usage.active.iter().any(|&x| x) {
-        return (y, cb, cr);
+        return Ok((y, cb, cr));
     }
 
-    let src_y = usage.needs_src[0].then(|| y.clone());
-    let src_cb = usage.needs_src[1].then(|| cb.clone());
-    let src_cr = usage.needs_src[2].then(|| cr.clone());
+    let snapshot = |src: &[u16], what: &'static str| -> Result<Vec<u16>, crate::DecodeError> {
+        let mut out = try_vec![0u16; src.len(), what];
+        out.copy_from_slice(src);
+        Ok(out)
+    };
+    let src_y = usage.needs_src[0]
+        .then(|| snapshot(&y, "parallel SAO luma snapshot"))
+        .transpose()?;
+    let src_cb = usage.needs_src[1]
+        .then(|| snapshot(&cb, "parallel SAO Cb snapshot"))
+        .transpose()?;
+    let src_cr = usage.needs_src[2]
+        .then(|| snapshot(&cr, "parallel SAO Cr snapshot"))
+        .transpose()?;
 
     // Serial fallback: no benefit from dispatch.
     if pool.threads() <= 1 || rows <= 1 {
@@ -835,7 +846,7 @@ pub(crate) fn apply_sao_parallel(
                 cy0,
             );
         }
-        return (y, cb, cr);
+        return Ok((y, cb, cr));
     }
 
     let y_dm = crate::threadpool::DisjointMut::new(y);
@@ -889,7 +900,7 @@ pub(crate) fn apply_sao_parallel(
         }
     });
 
-    (y_dm.into_inner(), cb_dm.into_inner(), cr_dm.into_inner())
+    Ok((y_dm.into_inner(), cb_dm.into_inner(), cr_dm.into_inner()))
 }
 
 #[cfg(test)]

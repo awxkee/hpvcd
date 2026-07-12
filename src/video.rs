@@ -1318,7 +1318,7 @@ impl VideoDecoder {
         // Deblock/SAO once the whole picture is reconstructed, then store it.
         // Deblock runs serially (its parallel chroma kernel is not yet bit-exact
         // vs the serial reference); SAO runs on the pool.
-        let planes = d.finish_with(None, Some(&self.pool));
+        let planes = d.finish_with(None, Some(&self.pool))?;
         let (motion, width4, height4) = d.take_motion();
 
         let is_ref = nal::is_reference(first_nal);

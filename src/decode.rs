@@ -458,9 +458,9 @@ impl FullDecoder<'static> {
             log2_min_tb: sps.log2_min_tb,
             log2_max_tb: sps.log2_max_tb,
             max_trafo_depth_intra: sps.max_transform_hierarchy_intra,
-            y: crate::plane::Plane::owned(vec![0; w * h]),
-            cb: crate::plane::Plane::owned(vec![0; cw * ch]),
-            cr: crate::plane::Plane::owned(vec![0; cw * ch]),
+            y: crate::plane::Plane::owned(try_vec![0; w * h, "decoded luma plane"]),
+            cb: crate::plane::Plane::owned(try_vec![0; cw * ch, "decoded Cb plane"]),
+            cr: crate::plane::Plane::owned(try_vec![0; cw * ch, "decoded Cr plane"]),
             w,
             h,
             cw,
@@ -469,20 +469,44 @@ impl FullDecoder<'static> {
             sub_h,
             sub_w_div: FastDivU32::new(sub_w as u32),
             sub_h_div: FastDivU32::new(sub_h as u32),
-            mode_y: crate::plane::Plane::owned(vec![MODE_DC; grid_w * grid_h]),
-            decoded: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            tqb: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            pcm: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            bs_v: crate::plane::Plane::owned(vec![0u8; grid_w * grid_h]),
-            bs_h: crate::plane::Plane::owned(vec![0u8; grid_w * grid_h]),
-            nz_coeff: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            tu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            tu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            pu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            pu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            slice_idx: crate::plane::Plane::owned(vec![0u16; grid_w * grid_h]),
+            mode_y: crate::plane::Plane::owned(
+                try_vec![MODE_DC; grid_w * grid_h, "intra mode map"],
+            ),
+            decoded: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            tqb: crate::plane::Plane::owned(try_vec![false; grid_w * grid_h, "decoder block map"]),
+            pcm: crate::plane::Plane::owned(try_vec![false; grid_w * grid_h, "decoder block map"]),
+            edge_v: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            edge_h: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            bs_v: crate::plane::Plane::owned(
+                try_vec![0u8; grid_w * grid_h, "deblock strength map"],
+            ),
+            bs_h: crate::plane::Plane::owned(
+                try_vec![0u8; grid_w * grid_h, "deblock strength map"],
+            ),
+            nz_coeff: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            tu_edge_v: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            tu_edge_h: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            pu_edge_v: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            pu_edge_h: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            slice_idx: crate::plane::Plane::owned(
+                try_vec![0u16; grid_w * grid_h, "slice ownership map"],
+            ),
             cur_slice_idx: 1,
             // Index 0 unused; index 1 is the first (independent) slice.
             slice_lf_across: vec![
@@ -516,12 +540,14 @@ impl FullDecoder<'static> {
             cu_intra_y0: 0,
             cu_intra_pu: 64,
             cur_tu_rdpcm: None,
-            ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
+            ct_depth: crate::plane::Plane::owned(try_vec![0; grid_w * grid_h, "coding depth map"]),
             grid_w,
             grid_h,
             slice_qp,
             qp_y_prev: slice_qp,
-            qp_y_map: crate::plane::Plane::owned(vec![slice_qp as i16; grid_w * grid_h]),
+            qp_y_map: crate::plane::Plane::owned(
+                try_vec![slice_qp as i16; grid_w * grid_h, "QP map"],
+            ),
             cu_qp_delta_val: 0,
             is_cu_qp_delta_coded: false,
             is_cu_chroma_qp_offset_coded: false,
@@ -531,7 +557,9 @@ impl FullDecoder<'static> {
             log2_qg,
             log2_chroma_qp_offset,
             cur_qp: slice_qp,
-            sao: crate::plane::Plane::owned(vec![SaoCtb::default(); ctb_cols * ctb_rows]),
+            sao: crate::plane::Plane::owned(
+                try_vec![SaoCtb::default(); ctb_cols * ctb_rows, "SAO CTB map"],
+            ),
             ctb_cols,
             ctb_rows,
             sao_luma,
@@ -562,7 +590,9 @@ impl FullDecoder<'static> {
             slice_type: hdr.slice_type,
             cabac_init: hdr.cabac_init,
             pred_weights: hdr.pred_weights.clone(),
-            motion: crate::plane::Plane::owned(vec![MotionInfo::intra(); grid_w * grid_h]),
+            motion: crate::plane::Plane::owned(
+                try_vec![MotionInfo::intra(); grid_w * grid_h, "motion map"],
+            ),
             ref_list0: Vec::new(),
             ref_list1: Vec::new(),
             cur_poc: 0,
@@ -573,7 +603,7 @@ impl FullDecoder<'static> {
             cur_cu_inter: false,
             _curr_pic_ref_active: sps.curr_pic_ref_enabled && pps.curr_pic_ref_enabled,
             last_pu_merge: false,
-            cu_skip_map: vec![false; grid_w * grid_h],
+            cu_skip_map: try_vec![false; grid_w * grid_h, "CU skip map"],
             collocated_from_l0: hdr.collocated_from_l0,
             collocated_ref_idx: hdr.collocated_ref_idx,
             ref_frames: Vec::new(),
@@ -1341,7 +1371,7 @@ impl<'cab> FullDecoder<'cab> {
         &mut self,
         deblock_pool: Option<&crate::threadpool::ThreadPool>,
         sao_pool: Option<&crate::threadpool::ThreadPool>,
-    ) -> YuvPlanes {
+    ) -> Result<YuvPlanes, DecodeError> {
         // In-loop filters run in HEVC order: deblocking first, then SAO. They
         // are independently gated: deblocking runs unless it is disabled (PPS or
         // a slice-level override), while SAO runs only when the SPS enables it.
@@ -1377,12 +1407,12 @@ impl<'cab> FullDecoder<'cab> {
             let restricted = self.sao_boundary_restricted();
             match sao_pool {
                 Some(p) if p.threads() > 1 && self.ctb_rows > 1 && !restricted => {
-                    self.apply_sao_parallel(p)
+                    self.apply_sao_parallel(p)?
                 }
-                _ => self.apply_sao(),
+                _ => self.apply_sao()?,
             }
         }
-        YuvPlanes {
+        Ok(YuvPlanes {
             y: self.y.take_vec(),
             cb: self.cb.take_vec(),
             cr: self.cr.take_vec(),
@@ -1390,7 +1420,18 @@ impl<'cab> FullDecoder<'cab> {
             height: self.h,
             chroma: self.sps.chroma,
             bit_depth: self.sps.bit_depth().unwrap_or(BitDepth::Eight),
-        }
+        })
+    }
+
+    /// Finish a still-picture decode in the sample type exposed by the HEIC
+    /// YUV API. The prediction/filter pipeline remains `u16`; 8-bit output
+    /// is narrowed exactly once while ownership leaves the decoder.
+    pub(crate) fn finish_native_with(
+        &mut self,
+        deblock_pool: Option<&crate::threadpool::ThreadPool>,
+        sao_pool: Option<&crate::threadpool::ThreadPool>,
+    ) -> Result<crate::yuv::NativeYuvPlanes, DecodeError> {
+        self.finish_with(deblock_pool, sao_pool)?.into_native()
     }
 
     fn parse_sao(&mut self, rx: usize, ry: usize) {
@@ -1969,17 +2010,23 @@ impl<'cab> FullDecoder<'cab> {
     /// Parallel SAO: flatten per-CTB params and dispatch CTB-row bands across
     /// the pool. Bit-identical to [`Self::apply_sao`]; see
     /// [`crate::sao::apply_sao_parallel`].
-    fn apply_sao_parallel(&mut self, pool: &crate::threadpool::ThreadPool) {
-        let params: Vec<crate::sao::SaoCtbParams> = self
-            .sao
-            .iter()
-            .map(|s| crate::sao::SaoCtbParams {
-                type_idx: s.type_idx,
-                offsets: s.offsets,
-                band_pos: s.band_pos,
-                eo_class: s.eo_class,
-            })
-            .collect();
+    fn apply_sao_parallel(
+        &mut self,
+        pool: &crate::threadpool::ThreadPool,
+    ) -> Result<(), DecodeError> {
+        let mut params = try_vec![
+            crate::sao::SaoCtbParams::default();
+            self.sao.len(),
+            "parallel SAO parameter map"
+        ];
+        for (dst, src) in params.iter_mut().zip(self.sao.iter()) {
+            *dst = crate::sao::SaoCtbParams {
+                type_idx: src.type_idx,
+                offsets: src.offsets,
+                band_pos: src.band_pos,
+                eo_class: src.eo_class,
+            };
+        }
         let ctx = crate::sao::SaoPlanesCtx {
             exec: self.exec.clone(),
             params: &params,
@@ -2000,10 +2047,11 @@ impl<'cab> FullDecoder<'cab> {
         let y = self.y.take_vec();
         let cb = self.cb.take_vec();
         let cr = self.cr.take_vec();
-        let (y, cb, cr) = crate::sao::apply_sao_parallel(pool, &ctx, y, cb, cr);
+        let (y, cb, cr) = crate::sao::apply_sao_parallel(pool, &ctx, y, cb, cr)?;
         self.y = crate::plane::Plane::owned(y);
         self.cb = crate::plane::Plane::owned(cb);
         self.cr = crate::plane::Plane::owned(cr);
+        Ok(())
     }
 
     fn sao_usage(&self) -> ([bool; 3], [bool; 3]) {
@@ -2068,18 +2116,36 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    fn apply_sao(&mut self) {
+    fn apply_sao(&mut self) -> Result<(), DecodeError> {
         let ctb = 1usize << self.log2_ctb;
         let (active, needs_src) = self.sao_usage();
         if !active.iter().any(|&x| x) {
-            return;
+            return Ok(());
         }
 
         // Only EO needs an untouched source snapshot. BO is pointwise and can
         // run in place, avoiding full-plane clones for common BO-only pictures.
-        let orig_y = needs_src[0].then(|| self.y.to_vec_clone());
-        let orig_cb = needs_src[1].then(|| self.cb.to_vec_clone());
-        let orig_cr = needs_src[2].then(|| self.cr.to_vec_clone());
+        let orig_y = if needs_src[0] {
+            let mut snapshot = try_vec![0u16; self.y.len(), "SAO luma snapshot"];
+            snapshot.copy_from_slice(&self.y);
+            Some(snapshot)
+        } else {
+            None
+        };
+        let orig_cb = if needs_src[1] {
+            let mut snapshot = try_vec![0u16; self.cb.len(), "SAO Cb snapshot"];
+            snapshot.copy_from_slice(&self.cb);
+            Some(snapshot)
+        } else {
+            None
+        };
+        let orig_cr = if needs_src[2] {
+            let mut snapshot = try_vec![0u16; self.cr.len(), "SAO Cr snapshot"];
+            snapshot.copy_from_slice(&self.cr);
+            Some(snapshot)
+        } else {
+            None
+        };
 
         let restricted = self.sao_boundary_restricted();
         // Take the planes out so the boundary map borrows (slice_idx/tqb/pcm/
@@ -2225,6 +2291,7 @@ impl<'cab> FullDecoder<'cab> {
         self.y = crate::plane::Plane::owned(y);
         self.cb = crate::plane::Plane::owned(cb);
         self.cr = crate::plane::Plane::owned(cr);
+        Ok(())
     }
 
     fn coding_quadtree(&mut self, x0: usize, y0: usize, log2_cb: u32, depth: u8) {
@@ -5351,8 +5418,12 @@ impl RowFactory {
             tu_edge_v: mkb(self.tu_edge_v),
             tu_edge_h: mkb(self.tu_edge_h),
             // WPP rows are intra I-slices with no inter PU edges.
-            pu_edge_v: crate::plane::Plane::owned(vec![false; self.grid_w * self.grid_h]),
-            pu_edge_h: crate::plane::Plane::owned(vec![false; self.grid_w * self.grid_h]),
+            pu_edge_v: crate::plane::Plane::owned(
+                try_vec![false; self.grid_w * self.grid_h, "WPP PU edge map"],
+            ),
+            pu_edge_h: crate::plane::Plane::owned(
+                try_vec![false; self.grid_w * self.grid_h, "WPP PU edge map"],
+            ),
             slice_idx: mku16(self.slice_idx),
             cur_slice_idx: 1,
             // WPP rows belong to a single slice; cross-slice filtering is not

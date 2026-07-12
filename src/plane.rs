@@ -77,15 +77,6 @@ impl<T> Plane<T> {
     }
 }
 
-impl<T: Clone> Plane<T> {
-    /// Clone the plane's contents into a fresh `Vec` (used by SAO for the
-    /// untouched-source snapshot). Works for both variants.
-    #[inline]
-    pub(crate) fn to_vec_clone(&self) -> Vec<T> {
-        self.deref().to_vec()
-    }
-}
-
 impl<T> Deref for Plane<T> {
     type Target = [T];
     #[inline]
@@ -103,7 +94,7 @@ impl<T> DerefMut for Plane<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         match self {
             Plane::Owned(v) => v.as_mut_slice(),
-            // SAFETY: valid-for-`len`; disjointness upheld by the lag discipline.
+            // SAFETY: valid-for-`len`; disjointness upheld by the lag.
             Plane::Shared(p, len) => unsafe { std::slice::from_raw_parts_mut(*p, *len) },
         }
     }

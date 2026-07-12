@@ -28,6 +28,25 @@
  */
 
 #![allow(unreachable_pub)]
+
+/// Allocate and fill a vector without aborting the process on allocation
+/// failure. Use this only for image-sized or otherwise potentially large
+/// buffers; small fixed/scratch allocations should keep ordinary `vec!`.
+macro_rules! try_vec {
+    ($value:expr; $len:expr, $what:expr) => {{
+        let len = $len;
+        let value = $value;
+        let element_size = core::mem::size_of_val(&value);
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| $crate::error::DecodeError::AllocationFailed {
+                what: $what,
+                bytes: len.saturating_mul(element_size),
+            })?;
+        out.resize(len, value);
+        out
+    }};
+}
 mod act;
 #[cfg(all(feature = "avx", target_arch = "x86_64"))]
 mod avx;
@@ -73,33 +92,20 @@ mod yuv;
 pub use color::{Cicp, ColorMetadata, MatrixCoefficients, Primaries, TransferFunction};
 pub use decoder::Decoder;
 pub use error::DecodeError;
-pub use fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
+pub use fmt::{
+    BitDepth, ChromaFormat, ImageBuffer, PlanarImage, PlaneBuffer, PlaneLayout, SampleBuf,
+    SamplePlane, YuvBuffer,
+};
 pub use info::{ImageInfo, read_heic_info, read_heic_info_with_limits};
 pub use limits::ParseLimits;
 pub use metadata::{CleanAperture, ContentLightLevel, Metadata, Orientation, PixelAspectRatio};
 pub use settings::{DecodeThreads, HeicSettings};
 pub use video::{FrameYuv, VideoDecoder, VideoFrame, decode_hevc, decode_hevc_frame_at};
 
-/// Convert a decoded u16 YUV plane to the appropriate typed buffer.
-/// 8-bit images produce `SampleBuf::U8` (direct cast, no precision loss).
-fn plane_to_buf(plane: Vec<u16>, bd: BitDepth) -> SampleBuf {
-    if bd == BitDepth::Eight {
-        SampleBuf::U8(plane.into_iter().map(|v| v as u8).collect())
-    } else {
-        SampleBuf::U16(plane)
-    }
-}
-
 #[derive(Clone, Copy, Default)]
 struct HevcVisibleCrop {
     left: usize,
     top: usize,
-}
-
-struct YuvPlaneSamples {
-    y: Vec<u16>,
-    cb: Vec<u16>,
-    cr: Vec<u16>,
 }
 
 struct DecodedGainMapImage {
@@ -134,84 +140,135 @@ fn visible_crop_from_hvcc(hvcc: &[u8]) -> HevcVisibleCrop {
         .unwrap_or_default()
 }
 
-fn copy_plane_window(
-    src: &[u16],
+fn plane_window<T: Copy + Default>(
+    data: Vec<T>,
     src_w: usize,
     src_h: usize,
     crop_left: usize,
     crop_top: usize,
     dst_w: usize,
     dst_h: usize,
-) -> Vec<u16> {
-    let mut out = vec![0u16; dst_w * dst_h];
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 || src.is_empty() {
-        return out;
+) -> Result<PlaneBuffer<T>, DecodeError> {
+    if dst_w == 0 || dst_h == 0 {
+        return Ok(PlaneBuffer::tight(Vec::new(), dst_w, dst_h));
     }
 
-    let rows_in_src = (src.len() / src_w).min(src_h);
-    if rows_in_src == 0 {
-        return out;
+    let rows = if src_w == 0 {
+        0
+    } else {
+        (data.len() / src_w).min(src_h)
+    };
+    let direct = rows != 0
+        && crop_left.checked_add(dst_w).is_some_and(|end| end <= src_w)
+        && crop_top.checked_add(dst_h).is_some_and(|end| end <= rows)
+        && crop_top
+            .checked_mul(src_w)
+            .and_then(|v| v.checked_add(crop_left))
+            .and_then(|offset| {
+                (dst_h - 1)
+                    .checked_mul(src_w)
+                    .and_then(|rows| offset.checked_add(rows))
+                    .and_then(|v| v.checked_add(dst_w))
+                    .map(|end| (offset, end))
+            })
+            .is_some_and(|(_, end)| end <= data.len());
+
+    if direct {
+        let offset = crop_top * src_w + crop_left;
+        return Ok(PlaneBuffer::from_parts(
+            data,
+            PlaneLayout {
+                width: dst_w,
+                height: dst_h,
+                stride: src_w,
+                offset,
+            },
+        ));
     }
 
-    let src_y0 = crop_top.min(rows_in_src - 1);
+    let len = dst_w
+        .checked_mul(dst_h)
+        .ok_or_else(|| DecodeError::Bitstream("visible plane dimensions overflow usize".into()))?;
+    let mut out = try_vec![T::default(); len, "visible image plane"];
+    if rows == 0 || src_w == 0 || data.is_empty() {
+        return Ok(PlaneBuffer::tight(out, dst_w, dst_h));
+    }
+    let src_y0 = crop_top.min(rows - 1);
     let src_x0 = crop_left.min(src_w - 1);
-
-    for (r, dst_row) in out.chunks_exact_mut(dst_w).enumerate() {
-        let src_y = (src_y0 + r).min(rows_in_src - 1);
+    for (row, dst) in out.chunks_exact_mut(dst_w).enumerate() {
+        let src_y = (src_y0 + row).min(rows - 1);
         let src_base = src_y * src_w;
-        let available = (src.len() - src_base).min(src_w);
+        let available = (data.len() - src_base).min(src_w);
         if available == 0 {
             continue;
         }
-
         let src_x = src_x0.min(available - 1);
-        let copy_w = dst_w.min(available - src_x);
-        let (dst_copy, dst_edge) = dst_row.split_at_mut(copy_w);
-        dst_copy.copy_from_slice(&src[src_base + src_x..src_base + src_x + copy_w]);
-        if !dst_edge.is_empty() {
-            dst_edge.fill(src[src_base + src_x + copy_w - 1]);
+        let copy = dst_w.min(available - src_x);
+        let (exact, pad) = dst.split_at_mut(copy);
+        exact.copy_from_slice(&data[src_base + src_x..src_base + src_x + copy]);
+        if !pad.is_empty() {
+            pad.fill(data[src_base + src_x + copy - 1]);
         }
     }
-
-    out
+    Ok(PlaneBuffer::tight(out, dst_w, dst_h))
 }
 
-fn copy_visible_yuv_planes(
-    planes: &yuv::YuvPlanes,
+fn visible_native_planes<T: Copy + Default>(
+    planes: yuv::NativePlanes<T>,
     dw: usize,
     dh: usize,
     crop: HevcVisibleCrop,
-) -> YuvPlaneSamples {
-    let y = copy_plane_window(
-        &planes.y,
+) -> Result<PlanarImage<T>, DecodeError> {
+    let y = plane_window(
+        planes.y,
         planes.width,
         planes.height,
         crop.left,
         crop.top,
         dw,
         dh,
-    );
-
+    )?;
     if planes.chroma.is_monochrome() {
-        return YuvPlaneSamples {
+        return Ok(PlanarImage {
             y,
-            cb: Vec::new(),
-            cr: Vec::new(),
-        };
+            cb: None,
+            cr: None,
+        });
     }
 
     let sub_w = planes.chroma.sub_w();
     let sub_h = planes.chroma.sub_h();
-    let cw = dw.div_ceil(sub_w);
-    let ch = dh.div_ceil(sub_h);
     let coded_cw = planes.width.div_ceil(sub_w);
     let coded_ch = planes.height.div_ceil(sub_h);
+    let cw = dw.div_ceil(sub_w);
+    let ch = dh.div_ceil(sub_h);
     let crop_cx = crop.left / sub_w;
     let crop_cy = crop.top / sub_h;
+    Ok(PlanarImage {
+        y,
+        cb: Some(plane_window(
+            planes.cb, coded_cw, coded_ch, crop_cx, crop_cy, cw, ch,
+        )?),
+        cr: Some(plane_window(
+            planes.cr, coded_cw, coded_ch, crop_cx, crop_cy, cw, ch,
+        )?),
+    })
+}
 
-    let cb = copy_plane_window(&planes.cb, coded_cw, coded_ch, crop_cx, crop_cy, cw, ch);
-    let cr = copy_plane_window(&planes.cr, coded_cw, coded_ch, crop_cx, crop_cy, cw, ch);
-    YuvPlaneSamples { y, cb, cr }
+fn native_to_visible_buffer(
+    planes: yuv::NativeYuvPlanes,
+    dw: usize,
+    dh: usize,
+    crop: HevcVisibleCrop,
+) -> Result<YuvBuffer, DecodeError> {
+    match planes {
+        yuv::NativeYuvPlanes::U8(planes) => {
+            Ok(YuvBuffer::U8(visible_native_planes(planes, dw, dh, crop)?))
+        }
+        yuv::NativeYuvPlanes::U16(planes) => {
+            Ok(YuvBuffer::U16(visible_native_planes(planes, dw, dh, crop)?))
+        }
+    }
 }
 
 /// Decoded HDR gain map carried as a HEIF auxiliary image.
@@ -255,6 +312,118 @@ impl GainMap {
     }
 }
 
+/// Strided, typed gain-map planes returned by [`Decoder::decode_yuv`].
+#[derive(Clone, Debug)]
+pub struct GainMapFrame {
+    pub planes: YuvBuffer,
+    pub bit_depth: BitDepth,
+    pub chroma: ChromaFormat,
+    pub color: ColorMetadata,
+    pub orientation: Orientation,
+    pub metadata: Option<Vec<u8>>,
+}
+
+impl GainMapFrame {
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.planes.width()
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.planes.height()
+    }
+
+    #[inline]
+    pub fn channels(&self) -> usize {
+        if self.chroma.is_monochrome() { 1 } else { 3 }
+    }
+
+    pub fn into_packed(self) -> Result<GainMap, DecodeError> {
+        let width = self.planes.width() as u32;
+        let height = self.planes.height() as u32;
+        let (chroma_width, chroma_height) = match &self.planes {
+            YuvBuffer::U8(planes) => planes
+                .cb
+                .as_ref()
+                .map(|plane| (plane.width() as u32, plane.height() as u32))
+                .unwrap_or((0, 0)),
+            YuvBuffer::U16(planes) => planes
+                .cb
+                .as_ref()
+                .map(|plane| (plane.width() as u32, plane.height() as u32))
+                .unwrap_or((0, 0)),
+        };
+        let (y, cb, cr) = match self.planes {
+            YuvBuffer::U8(planes) => (
+                SampleBuf::U8(planes.y.into_tight()?),
+                planes
+                    .cb
+                    .map(|plane| plane.into_tight().map(SampleBuf::U8))
+                    .transpose()?,
+                planes
+                    .cr
+                    .map(|plane| plane.into_tight().map(SampleBuf::U8))
+                    .transpose()?,
+            ),
+            YuvBuffer::U16(planes) => (
+                SampleBuf::U16(planes.y.into_tight()?),
+                planes
+                    .cb
+                    .map(|plane| plane.into_tight().map(SampleBuf::U16))
+                    .transpose()?,
+                planes
+                    .cr
+                    .map(|plane| plane.into_tight().map(SampleBuf::U16))
+                    .transpose()?,
+            ),
+        };
+        Ok(GainMap {
+            width,
+            height,
+            chroma_width,
+            chroma_height,
+            y,
+            cb,
+            cr,
+            chroma: self.chroma,
+            bit_depth: self.bit_depth,
+            color: self.color,
+            orientation: self.orientation,
+            metadata: self.metadata,
+        })
+    }
+}
+
+/// Zero-copy-or-minimal-copy raw YCbCr result. Single-item HEIC images retain
+/// their decoder allocation and expose the visible crop through plane offsets
+/// and strides. Grid images are naturally tightly packed.
+#[derive(Clone, Debug)]
+pub struct DecodedYuv {
+    pub planes: YuvBuffer,
+    pub alpha: Option<SamplePlane>,
+    pub gain_map: Option<GainMapFrame>,
+    pub bit_depth: BitDepth,
+    pub chroma: ChromaFormat,
+    pub color: ColorMetadata,
+    pub orientation: Orientation,
+    pub clean_aperture: Option<CleanAperture>,
+    pub pixel_aspect_ratio: Option<PixelAspectRatio>,
+    pub exif: Option<Vec<u8>>,
+}
+
+impl DecodedYuv {
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.planes.width()
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.planes.height()
+    }
+}
+
 /// Packed display-ready 8-bit RGB output.
 #[derive(Clone, Debug)]
 pub struct Rgb8Image {
@@ -284,66 +453,95 @@ pub struct DecodedImage {
     pub exif: Option<Vec<u8>>,
 }
 
-/// Raw YCbCr planes from a HEIF/HEIC file; no color conversion applied.
-pub struct DecodedYuv {
-    pub y: SampleBuf,
-    pub cb: SampleBuf,
-    pub cr: SampleBuf,
-    /// Optional alpha plane (luma-only), decoded from the `auxl` auxiliary item.
-    /// Same dimensions and bit depth as the luma plane.
-    pub alpha: Option<SampleBuf>,
-    /// Optional Apple HDR gain-map auxiliary image.
-    pub gain_map: Option<GainMap>,
-    /// Luma plane width (display-cropped; equals coded width minus conformance window).
-    pub width: u32,
-    /// Luma plane height.
-    pub height: u32,
-    pub bit_depth: BitDepth,
-    pub chroma: ChromaFormat,
-    pub color: ColorMetadata,
-    pub orientation: Orientation,
-    /// Clean aperture (`clap` property) read from the item properties, if present.
-    pub clean_aperture: Option<CleanAperture>,
-    /// Pixel aspect ratio (`pasp` property). `None` means assume 1:1 (square pixels).
-    pub pixel_aspect_ratio: Option<PixelAspectRatio>,
-    pub exif: Option<Vec<u8>>,
+/// Keep malformed optional auxiliary images non-fatal, while still surfacing
+/// allocation failure instead of aborting the process.
+fn optional_auxiliary<T>(result: Result<T, DecodeError>) -> Result<Option<T>, DecodeError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err @ DecodeError::AllocationFailed { .. }) => Err(err),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Decode the optional alpha auxiliary item (`auxl`) into a luma-only plane,
-/// applying the alpha HEVC conformance-window offset and returning exactly
-/// `dw*dh` display samples. `clap` is intentionally not applied here.
+/// applying the alpha HEVC conformance-window offset. `clap` is intentionally
+/// not applied here.
+fn decode_alpha_plane_native(
+    decoder: &Decoder,
+    file: &[u8],
+    heif: &heif::HeifFile,
+    dw: usize,
+    dh: usize,
+) -> Result<Option<SamplePlane>, DecodeError> {
+    let Some(alpha) = heif.alpha.as_ref() else {
+        return Ok(None);
+    };
+    if alpha.hvcc.is_empty() {
+        return Ok(None);
+    }
+    let (Ok(start), Ok(length)) = (
+        usize::try_from(alpha.data_offset),
+        usize::try_from(alpha.data_length),
+    ) else {
+        return Ok(None);
+    };
+    let Some(end) = start.checked_add(length) else {
+        return Ok(None);
+    };
+    let Some(sample) = file.get(start..end) else {
+        return Ok(None);
+    };
+    let Some((planes, _)) = optional_auxiliary(decode_hevc_item_native(
+        sample,
+        &alpha.hvcc,
+        decoder.exec(),
+        Some(decoder.pool()),
+    ))?
+    else {
+        return Ok(None);
+    };
+    let crop = visible_crop_from_hvcc(&alpha.hvcc);
+    let plane = match planes {
+        yuv::NativeYuvPlanes::U8(planes) => SamplePlane::U8(plane_window(
+            planes.y,
+            planes.width,
+            planes.height,
+            crop.left,
+            crop.top,
+            dw,
+            dh,
+        )?),
+        yuv::NativeYuvPlanes::U16(planes) => SamplePlane::U16(plane_window(
+            planes.y,
+            planes.width,
+            planes.height,
+            crop.left,
+            crop.top,
+            dw,
+            dh,
+        )?),
+    };
+    Ok(Some(plane))
+}
+
+/// Decode alpha for display-ready RGB output and tightly pack the visible rows.
 fn decode_alpha_plane(
     decoder: &Decoder,
     file: &[u8],
     heif: &heif::HeifFile,
     dw: usize,
     dh: usize,
-) -> Option<SampleBuf> {
-    let a = heif.alpha.as_ref()?;
-    if a.hvcc.is_empty() {
-        return None;
-    }
-    let astart = a.data_offset as usize;
-    let aend = astart.checked_add(a.data_length as usize)?;
-    if aend > file.len() {
-        return None;
-    }
-    decode_hevc_item(
-        &file[astart..aend],
-        &a.hvcc,
-        decoder.exec(),
-        Some(decoder.pool()),
-    )
-    .ok()
-    .map(|(ap, _)| {
-        let crop = visible_crop_from_hvcc(&a.hvcc);
-        let plane = copy_plane_window(&ap.y, ap.width, ap.height, crop.left, crop.top, dw, dh);
-        plane_to_buf(plane, ap.bit_depth)
-    })
+) -> Result<Option<SampleBuf>, DecodeError> {
+    decode_alpha_plane_native(decoder, file, heif, dw, dh)?
+        .map(|plane| match plane {
+            SamplePlane::U8(plane) => plane.into_tight().map(SampleBuf::U8),
+            SamplePlane::U16(plane) => plane.into_tight().map(SampleBuf::U16),
+        })
+        .transpose()
 }
 
 impl DecodedGainMapImage {
-    fn apply_orientation(self) -> Self {
+    fn apply_orientation(self) -> Result<Self, DecodeError> {
         let Self {
             width,
             height,
@@ -363,19 +561,23 @@ impl DecodedGainMapImage {
         } else {
             oriented_dimensions(chroma_width, chroma_height, orientation)
         };
-        Self {
+        Ok(Self {
             width: oriented_width,
             height: oriented_height,
             chroma_width: oriented_chroma_width,
             chroma_height: oriented_chroma_height,
-            y: rotate_sample_buf(y, width, height, orientation),
-            cb: cb.map(|plane| rotate_sample_buf(plane, chroma_width, chroma_height, orientation)),
-            cr: cr.map(|plane| rotate_sample_buf(plane, chroma_width, chroma_height, orientation)),
+            y: rotate_sample_buf(y, width, height, orientation)?,
+            cb: cb
+                .map(|plane| rotate_sample_buf(plane, chroma_width, chroma_height, orientation))
+                .transpose()?,
+            cr: cr
+                .map(|plane| rotate_sample_buf(plane, chroma_width, chroma_height, orientation))
+                .transpose()?,
             chroma,
             bit_depth,
             color,
             orientation,
-        }
+        })
     }
 }
 
@@ -384,68 +586,22 @@ fn rotate_sample_buf(
     width: u32,
     height: u32,
     orientation: Orientation,
-) -> SampleBuf {
+) -> Result<SampleBuf, DecodeError> {
     match samples {
-        SampleBuf::U8(samples) => SampleBuf::U8(rotate_luma(
-            width as usize,
-            height as usize,
-            &samples,
-            orientation,
-        )),
-        SampleBuf::U16(samples) => SampleBuf::U16(rotate_luma(
-            width as usize,
-            height as usize,
-            &samples,
-            orientation,
-        )),
+        SampleBuf::U8(samples) => {
+            rotate_luma(width as usize, height as usize, samples, orientation).map(SampleBuf::U8)
+        }
+        SampleBuf::U16(samples) => {
+            rotate_luma(width as usize, height as usize, samples, orientation).map(SampleBuf::U16)
+        }
     }
 }
 
-fn decode_gain_map(
-    decoder: &Decoder,
-    file: &[u8],
-    heif: &heif::HeifFile,
-    apply_orientation: bool,
-) -> Option<GainMap> {
-    let gain = heif.gain_map.as_ref()?;
-    let decoded = match &gain.image {
-        heif::HeifImageSource::Item(item) => decode_gain_map_item(decoder, file, item).ok()?,
-        heif::HeifImageSource::Grid(grid) => decode_gain_map_grid(decoder, file, grid).ok()?,
-    };
-    let decoded = if apply_orientation {
-        decoded.apply_orientation()
-    } else {
-        decoded
-    };
-    Some(GainMap {
-        width: decoded.width,
-        height: decoded.height,
-        chroma_width: decoded.chroma_width,
-        chroma_height: decoded.chroma_height,
-        y: decoded.y,
-        cb: decoded.cb,
-        cr: decoded.cr,
-        chroma: decoded.chroma,
-        bit_depth: decoded.bit_depth,
-        color: decoded.color,
-        orientation: decoded.orientation,
-        metadata: gain.metadata.clone(),
-    })
-}
-
-fn gain_map_color_metadata(item_color: &ColorMetadata, vui_color: Cicp) -> ColorMetadata {
-    let mut color = item_color.clone();
-    if vui_color.matrix != MatrixCoefficients::Unspecified {
-        color.cicp = Some(vui_color);
-    }
-    color
-}
-
-fn decode_gain_map_item(
+fn decode_gain_map_frame_item(
     decoder: &Decoder,
     file: &[u8],
     item: &heif::HeifItem,
-) -> Result<DecodedGainMapImage, DecodeError> {
+) -> Result<GainMapFrame, DecodeError> {
     let start = usize::try_from(item.data_offset)
         .map_err(|_| DecodeError::Bitstream("gain-map data offset exceeds usize".into()))?;
     let length = usize::try_from(item.data_length)
@@ -457,8 +613,9 @@ fn decode_gain_map_item(
         .get(start..end)
         .ok_or_else(|| DecodeError::Bitstream("gain-map data extends past file end".into()))?;
     let (planes, vui_color) =
-        decode_hevc_item(sample, &item.hvcc, decoder.exec(), Some(decoder.pool()))?;
+        decode_hevc_item_native(sample, &item.hvcc, decoder.exec(), Some(decoder.pool()))?;
     let crop = visible_crop_from_hvcc(&item.hvcc);
+    let (coded_w, coded_h) = planes.dims();
     let (fallback_w, fallback_h) = config::parse_hvcc_full(&item.hvcc)
         .ok()
         .map(|(sps, _)| {
@@ -467,130 +624,36 @@ fn decode_gain_map_item(
                 sps.height.saturating_sub(sps.crop_top + sps.crop_bottom),
             )
         })
-        .unwrap_or((planes.width as u32, planes.height as u32));
-    let width = if item.display_w != 0 {
-        item.display_w
-    } else {
+        .unwrap_or((coded_w as u32, coded_h as u32));
+    let width = if item.display_w == 0 {
         fallback_w
-    };
-    let height = if item.display_h != 0 {
-        item.display_h
     } else {
+        item.display_w
+    };
+    let height = if item.display_h == 0 {
         fallback_h
+    } else {
+        item.display_h
     };
     decoder.check_dims(width as usize, height as usize)?;
-    let samples = copy_visible_yuv_planes(&planes, width as usize, height as usize, crop);
-    let chroma = planes.chroma;
-    let (chroma_width, chroma_height) = if chroma.is_monochrome() {
-        (0, 0)
-    } else {
-        (
-            width.div_ceil(chroma.sub_w() as u32),
-            height.div_ceil(chroma.sub_h() as u32),
-        )
-    };
-    Ok(DecodedGainMapImage {
-        width,
-        height,
-        chroma_width,
-        chroma_height,
-        y: plane_to_buf(samples.y, planes.bit_depth),
-        cb: (!chroma.is_monochrome()).then(|| plane_to_buf(samples.cb, planes.bit_depth)),
-        cr: (!chroma.is_monochrome()).then(|| plane_to_buf(samples.cr, planes.bit_depth)),
+    let bit_depth = planes.bit_depth();
+    let chroma = planes.chroma();
+    Ok(GainMapFrame {
+        planes: native_to_visible_buffer(planes, width as usize, height as usize, crop)?,
+        bit_depth,
         chroma,
-        bit_depth: planes.bit_depth,
         color: gain_map_color_metadata(&item.color, vui_color),
         orientation: item.orientation,
+        metadata: None,
     })
 }
 
-fn decode_gain_map_grid(
+fn decode_gain_map_frame_grid(
     decoder: &Decoder,
     file: &[u8],
     grid: &heif::GridInfo,
-) -> Result<DecodedGainMapImage, DecodeError> {
-    let out_w = grid.output_width as usize;
-    let out_h = grid.output_height as usize;
-    decoder.check_dims(out_w, out_h)?;
-    if grid.tiles.is_empty() {
-        return Err(DecodeError::Bitstream("gain-map grid has no tiles".into()));
-    }
-    let cols = grid.cols as usize;
-    let rows = grid.rows as usize;
-    let fallback_hvcc = grid
-        .tiles
-        .iter()
-        .find(|tile| !tile.hvcc.is_empty())
-        .map(|tile| tile.hvcc.clone())
-        .unwrap_or_default();
-    let hvcc = if !grid.tiles[0].hvcc.is_empty() {
-        &grid.tiles[0].hvcc
-    } else {
-        &fallback_hvcc
-    };
-    if hvcc.is_empty() {
-        return Err(DecodeError::MissingBox("gain-map hvcC property"));
-    }
-
-    let (sps, _) = config::parse_hvcc_full(hvcc)?;
-    let tile_w = sps.width.saturating_sub(sps.crop_left + sps.crop_right) as usize;
-    let tile_h = sps.height.saturating_sub(sps.crop_top + sps.crop_bottom) as usize;
-    let (tile_w, tile_h) = if tile_w != 0 && tile_h != 0 {
-        (tile_w, tile_h)
-    } else {
-        (out_w.div_ceil(cols), out_h.div_ceil(rows))
-    };
-    let crop = HevcVisibleCrop {
-        left: sps.crop_left as usize,
-        top: sps.crop_top as usize,
-    };
-    let bit_depth = match sps.bit_depth_luma {
-        10 => BitDepth::Ten,
-        12 => BitDepth::Twelve,
-        _ => BitDepth::Eight,
-    };
-    let chroma = sps.chroma;
-    let has_chroma = !chroma.is_monochrome();
-    let sub_w = chroma.sub_w();
-    let sub_h = chroma.sub_h();
-    let (cw, ch, tile_cw, tile_ch) = if has_chroma {
-        (
-            out_w.div_ceil(sub_w),
-            out_h.div_ceil(sub_h),
-            tile_w.div_ceil(sub_w),
-            tile_h.div_ceil(sub_h),
-        )
-    } else {
-        (0, 0, 0, 0)
-    };
-    let vui_color = Cicp {
-        primaries: Primaries::from_u8(sps.color_primaries),
-        transfer: TransferFunction::from_u8(sps.transfer_characteristics),
-        matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
-        full_range: sps.video_full_range,
-    };
-
-    let ctx = YuvGridCtx {
-        file,
-        exec: decoder.exec(),
-        tiles: &grid.tiles,
-        fallback_hvcc: &fallback_hvcc,
-        cols,
-        out_w,
-        out_h,
-        cw,
-        ch,
-        tile_w,
-        tile_h,
-        tile_cw,
-        tile_ch,
-        tile_crop_left: crop.left,
-        tile_crop_top: crop.top,
-        sub_w,
-        sub_h,
-        has_chroma,
-    };
-    let samples = fill_grid_yuv_bands(decoder, out_w * out_h, cw * ch, rows, &ctx);
+) -> Result<GainMapFrame, DecodeError> {
+    let decoded = decode_native_grid_image(decoder, file, grid)?;
     let item_color = if grid.color.is_empty() {
         grid.tiles
             .iter()
@@ -600,31 +663,94 @@ fn decode_gain_map_grid(
     } else {
         &grid.color
     };
-    Ok(DecodedGainMapImage {
-        width: grid.output_width,
-        height: grid.output_height,
-        chroma_width: cw as u32,
-        chroma_height: ch as u32,
-        y: plane_to_buf(samples.y, bit_depth),
-        cb: has_chroma.then(|| plane_to_buf(samples.cb, bit_depth)),
-        cr: has_chroma.then(|| plane_to_buf(samples.cr, bit_depth)),
-        chroma,
-        bit_depth,
-        color: gain_map_color_metadata(item_color, vui_color),
+    Ok(GainMapFrame {
+        planes: decoded.planes,
+        bit_depth: decoded.bit_depth,
+        chroma: decoded.chroma,
+        color: gain_map_color_metadata(item_color, decoded.vui_color),
         orientation: grid.orientation,
+        metadata: None,
     })
 }
 
-/// Decode a HEIF/HEIC file and return raw YCbCr planes (no color conversion),
-/// using a default [`Decoder`]. For a display-ready 8-bit image use
-/// [`decode_heic_rgb8`].
+fn decode_gain_map_frame(
+    decoder: &Decoder,
+    file: &[u8],
+    heif: &heif::HeifFile,
+) -> Result<Option<GainMapFrame>, DecodeError> {
+    let Some(gain) = heif.gain_map.as_ref() else {
+        return Ok(None);
+    };
+    let result = match &gain.image {
+        heif::HeifImageSource::Item(item) => decode_gain_map_frame_item(decoder, file, item),
+        heif::HeifImageSource::Grid(grid) => decode_gain_map_frame_grid(decoder, file, grid),
+    };
+    let Some(mut decoded) = optional_auxiliary(result)? else {
+        return Ok(None);
+    };
+    decoded.metadata = gain.metadata.clone();
+    Ok(Some(decoded))
+}
+
+fn decode_gain_map(
+    decoder: &Decoder,
+    file: &[u8],
+    heif: &heif::HeifFile,
+    apply_orientation: bool,
+) -> Result<Option<GainMap>, DecodeError> {
+    let Some(frame) = decode_gain_map_frame(decoder, file, heif)? else {
+        return Ok(None);
+    };
+    let packed = frame.into_packed()?;
+    if !apply_orientation {
+        return Ok(Some(packed));
+    }
+    let decoded = DecodedGainMapImage {
+        width: packed.width,
+        height: packed.height,
+        chroma_width: packed.chroma_width,
+        chroma_height: packed.chroma_height,
+        y: packed.y,
+        cb: packed.cb,
+        cr: packed.cr,
+        chroma: packed.chroma,
+        bit_depth: packed.bit_depth,
+        color: packed.color,
+        orientation: packed.orientation,
+    }
+    .apply_orientation()?;
+    Ok(Some(GainMap {
+        width: decoded.width,
+        height: decoded.height,
+        chroma_width: decoded.chroma_width,
+        chroma_height: decoded.chroma_height,
+        y: decoded.y,
+        cb: decoded.cb,
+        cr: decoded.cr,
+        chroma: decoded.chroma,
+        bit_depth: decoded.bit_depth,
+        color: decoded.color,
+        orientation: decoded.orientation,
+        metadata: packed.metadata,
+    }))
+}
+
+fn gain_map_color_metadata(item_color: &ColorMetadata, vui_color: Cicp) -> ColorMetadata {
+    let mut color = item_color.clone();
+    if vui_color.matrix != MatrixCoefficients::Unspecified {
+        color.cicp = Some(vui_color);
+    }
+    color
+}
+
+/// Decode a HEIF/HEIC file and return typed, owning, strided raw YCbCr
+/// planes using a default [`Decoder`]. Eight-bit items use `u8`; 10/12-bit
+/// items use `u16`. Single-item images retain coded stride and padding.
 pub fn decode_heic_yuv(file: &[u8]) -> Result<DecodedYuv, DecodeError> {
     Decoder::default().decode_yuv(file)
 }
 
-/// Decode raw YCbCr planes with one explicit settings value. This constructs a
-/// decoder and worker pool for the call; reuse [`Decoder::from_settings`] when
-/// decoding multiple images.
+/// Decode typed, strided raw YCbCr planes with one explicit settings value.
 pub fn decode_heic_yuv_with_settings(
     file: &[u8],
     settings: &HeicSettings,
@@ -649,51 +775,46 @@ pub(crate) fn decode_heic_yuv_with(
         return decode_grid_yuv(decoder, file, grid, &heif);
     }
 
-    // Single-tile path
-    let start = heif.primary.data_offset as usize;
-    let Some(end) = start.checked_add(heif.primary.data_length as usize) else {
-        return Err(DecodeError::Bitstream(
-            "image data offset/length overflows usize".into(),
-        ));
-    };
-    if end > file.len() {
-        return Err(DecodeError::Bitstream(
-            "image data extends past file end".into(),
-        ));
-    }
-    let (planes, _) = decode_hevc_item(
-        &file[start..end],
+    let start = usize::try_from(heif.primary.data_offset)
+        .map_err(|_| DecodeError::Bitstream("image data offset exceeds usize".into()))?;
+    let length = usize::try_from(heif.primary.data_length)
+        .map_err(|_| DecodeError::Bitstream("image data length exceeds usize".into()))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| DecodeError::Bitstream("image data range overflows usize".into()))?;
+    let sample = file
+        .get(start..end)
+        .ok_or_else(|| DecodeError::Bitstream("image data extends past file end".into()))?;
+    let (planes, _) = decode_hevc_item_native(
+        sample,
         &heif.primary.hvcc,
         decoder.exec(),
         Some(decoder.pool()),
     )?;
-    let dw = heif.primary.display_w as usize;
-    let dh = heif.primary.display_h as usize;
-    decoder.check_dims(dw, dh)?;
-    // HEIF `ispe` gives the consumer-visible dimensions; HEVC conformance
-    // window gives the origin inside the coded planes.  Do not apply `clap`
-    // here; it is exposed as metadata for the caller.
+    let width = heif.primary.display_w as usize;
+    let height = heif.primary.display_h as usize;
+    decoder.check_dims(width, height)?;
+    let bit_depth = planes.bit_depth();
+    let chroma = planes.chroma();
     let crop = visible_crop_from_hvcc(&heif.primary.hvcc);
-    let samples = copy_visible_yuv_planes(&planes, dw, dh, crop);
+    let visible = native_to_visible_buffer(planes, width, height, crop)?;
+    let alpha = if decoder.decodes_alpha() {
+        decode_alpha_plane_native(decoder, file, &heif, width, height)?
+    } else {
+        None
+    };
+    let gain_map = if decoder.decodes_gain_map() {
+        decode_gain_map_frame(decoder, file, &heif)?
+    } else {
+        None
+    };
 
-    let bd = planes.bit_depth;
-    let gain_map = decoder
-        .decodes_gain_map()
-        .then(|| decode_gain_map(decoder, file, &heif, false))
-        .flatten();
     Ok(DecodedYuv {
-        y: plane_to_buf(samples.y, bd),
-        cb: plane_to_buf(samples.cb, bd),
-        cr: plane_to_buf(samples.cr, bd),
-        alpha: decoder
-            .decodes_alpha()
-            .then(|| decode_alpha_plane(decoder, file, &heif, dw, dh))
-            .flatten(),
+        planes: visible,
+        alpha,
         gain_map,
-        width: dw as u32,
-        height: dh as u32,
-        bit_depth: bd,
-        chroma: planes.chroma,
+        bit_depth,
+        chroma,
         color: heif.primary.color,
         orientation: heif.primary.orientation,
         clean_aperture: heif.primary.clap,
@@ -724,62 +845,81 @@ struct YuvGridCtx<'a> {
     has_chroma: bool,
 }
 
-/// Stitch all tiles of grid-row `band_row` into the three plane bands. Each band
-/// is that grid-row's contiguous slice of its plane; local row 0 maps to the
-/// band's first global row, so vertical offsets within a band are just `y`.
-/// Edge tiles are right/bottom-padded with their last sample (matching the
-/// original serial behavior).
-fn stitch_yuv_band(
+trait NativeGridSample: Copy + Default + Send {
+    fn select(planes: &yuv::NativeYuvPlanes) -> Option<&yuv::NativePlanes<Self>>;
+}
+
+impl NativeGridSample for u8 {
+    fn select(planes: &yuv::NativeYuvPlanes) -> Option<&yuv::NativePlanes<Self>> {
+        match planes {
+            yuv::NativeYuvPlanes::U8(planes) => Some(planes),
+            yuv::NativeYuvPlanes::U16(_) => None,
+        }
+    }
+}
+
+impl NativeGridSample for u16 {
+    fn select(planes: &yuv::NativeYuvPlanes) -> Option<&yuv::NativePlanes<Self>> {
+        match planes {
+            yuv::NativeYuvPlanes::U8(_) => None,
+            yuv::NativeYuvPlanes::U16(planes) => Some(planes),
+        }
+    }
+}
+
+fn stitch_native_yuv_band<T: NativeGridSample>(
     ctx: &YuvGridCtx<'_>,
     band_row: usize,
-    y_band: &mut [u16],
-    cb_band: &mut [u16],
-    cr_band: &mut [u16],
-) {
+    y_band: &mut [T],
+    cb_band: &mut [T],
+    cr_band: &mut [T],
+) -> Result<(), DecodeError> {
     for col in 0..ctx.cols {
         let tile_idx = band_row * ctx.cols + col;
-        let tile = match ctx.tiles.get(tile_idx) {
-            Some(t) => t,
-            None => break,
+        let Some(tile) = ctx.tiles.get(tile_idx) else {
+            break;
         };
-        let start = tile.data_offset as usize;
-        let Some(end) = start.checked_add(tile.data_length as usize) else {
+        let Ok(start) = usize::try_from(tile.data_offset) else {
             continue;
         };
-        if end > ctx.file.len() {
+        let Ok(length) = usize::try_from(tile.data_length) else {
             continue;
-        }
-        let hvcc = if !tile.hvcc.is_empty() {
-            &tile.hvcc
-        } else {
+        };
+        let Some(end) = start.checked_add(length) else {
+            continue;
+        };
+        let Some(sample) = ctx.file.get(start..end) else {
+            continue;
+        };
+        let hvcc = if tile.hvcc.is_empty() {
             ctx.fallback_hvcc
+        } else {
+            &tile.hvcc
         };
         if hvcc.is_empty() {
             continue;
         }
-        let (planes, _) = match decode_hevc_item(&ctx.file[start..end], hvcc, ctx.exec, None) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Some((native, _)) =
+            optional_auxiliary(decode_hevc_item_native(sample, hvcc, ctx.exec, None))?
+        else {
+            continue;
         };
-
-        let p_cw = planes.width.div_ceil(ctx.sub_w);
-        let p_ch = planes.height.div_ceil(ctx.sub_h);
+        let Some(planes) = T::select(&native) else {
+            continue;
+        };
 
         let dst_x = col * ctx.tile_w;
         let dst_y_base = band_row * ctx.tile_h;
         let copy_w = ctx.tile_w.min(ctx.out_w.saturating_sub(dst_x));
         let copy_h = ctx.tile_h.min(ctx.out_h.saturating_sub(dst_y_base));
-
-        let tile_crop_left = ctx.tile_crop_left.min(planes.width.saturating_sub(1));
-        let tile_crop_top = ctx.tile_crop_top.min(planes.height.saturating_sub(1));
-
+        if copy_w == 0 || copy_h == 0 || planes.width == 0 || planes.height == 0 {
+            continue;
+        }
+        let crop_left = ctx.tile_crop_left.min(planes.width - 1);
+        let crop_top = ctx.tile_crop_top.min(planes.height - 1);
         for y in 0..copy_h {
-            let dst_start = y * ctx.out_w + dst_x;
-            let dst = &mut y_band[dst_start..dst_start + copy_w];
-            if planes.width == 0 || planes.height == 0 || planes.y.is_empty() {
-                continue;
-            }
-            let src_y = (tile_crop_top + y).min(planes.height - 1);
+            let dst = &mut y_band[y * ctx.out_w + dst_x..][..copy_w];
+            let src_y = (crop_top + y).min(planes.height - 1);
             let src_base = src_y * planes.width;
             if src_base >= planes.y.len() {
                 continue;
@@ -788,148 +928,166 @@ fn stitch_yuv_band(
             if available == 0 {
                 continue;
             }
-            let src_x = tile_crop_left.min(available - 1);
-            let copy = copy_w.min(available - src_x);
-            let (exact, pad) = dst.split_at_mut(copy);
-            exact.copy_from_slice(&planes.y[src_base + src_x..src_base + src_x + copy]);
+            let src_x = crop_left.min(available - 1);
+            let exact = copy_w.min(available - src_x);
+            let (copied, pad) = dst.split_at_mut(exact);
+            copied.copy_from_slice(&planes.y[src_base + src_x..src_base + src_x + exact]);
             if !pad.is_empty() {
-                pad.fill(planes.y[src_base + src_x + copy - 1]);
+                pad.fill(planes.y[src_base + src_x + exact - 1]);
             }
         }
 
-        if !ctx.has_chroma || planes.cb.is_empty() {
+        if !ctx.has_chroma || planes.cb.is_empty() || planes.cr.is_empty() {
             continue;
         }
-
-        let c_dst_x = col * ctx.tile_cw;
-        let c_dst_y_base = band_row * ctx.tile_ch;
-        let c_copy_w = ctx.tile_cw.min(ctx.cw.saturating_sub(c_dst_x));
-        let c_copy_h = ctx.tile_ch.min(ctx.ch.saturating_sub(c_dst_y_base));
-
-        let crop_cx = ctx.tile_crop_left / ctx.sub_w;
-        let crop_cy = ctx.tile_crop_top / ctx.sub_h;
-
-        for y in 0..c_copy_h {
-            let c_start = y * ctx.cw + c_dst_x;
-            if p_cw == 0 || p_ch == 0 || planes.cb.is_empty() || planes.cr.is_empty() {
-                continue;
-            }
-            let src_y = (crop_cy + y).min(p_ch - 1);
-            let src_base = src_y * p_cw;
+        let plane_cw = planes.width.div_ceil(ctx.sub_w);
+        let plane_ch = planes.height.div_ceil(ctx.sub_h);
+        if plane_cw == 0 || plane_ch == 0 {
+            continue;
+        }
+        let dst_x = col * ctx.tile_cw;
+        let copy_w = ctx.tile_cw.min(ctx.cw.saturating_sub(dst_x));
+        let copy_h = ctx
+            .tile_ch
+            .min(ctx.ch.saturating_sub(band_row * ctx.tile_ch));
+        if copy_w == 0 || copy_h == 0 {
+            continue;
+        }
+        let crop_left = (ctx.tile_crop_left / ctx.sub_w).min(plane_cw - 1);
+        let crop_top = (ctx.tile_crop_top / ctx.sub_h).min(plane_ch - 1);
+        for y in 0..copy_h {
+            let dst_start = y * ctx.cw + dst_x;
+            let src_y = (crop_top + y).min(plane_ch - 1);
+            let src_base = src_y * plane_cw;
             if src_base >= planes.cb.len() || src_base >= planes.cr.len() {
                 continue;
             }
-            let cb_available = (planes.cb.len() - src_base).min(p_cw);
-            let cr_available = (planes.cr.len() - src_base).min(p_cw);
-            let available = cb_available.min(cr_available);
+            let available = (planes.cb.len() - src_base)
+                .min(plane_cw)
+                .min((planes.cr.len() - src_base).min(plane_cw));
             if available == 0 {
                 continue;
             }
-            let src_x = crop_cx.min(available - 1);
-            let copy = c_copy_w.min(available - src_x);
+            let src_x = crop_left.min(available - 1);
+            let exact = copy_w.min(available - src_x);
 
-            let cb_row = &mut cb_band[c_start..c_start + c_copy_w];
-            let (cb_exact, cb_pad) = cb_row.split_at_mut(copy);
-            cb_exact.copy_from_slice(&planes.cb[src_base + src_x..src_base + src_x + copy]);
-            if !cb_pad.is_empty() {
-                cb_pad.fill(planes.cb[src_base + src_x + copy - 1]);
+            let cb_dst = &mut cb_band[dst_start..dst_start + copy_w];
+            let (copied, pad) = cb_dst.split_at_mut(exact);
+            copied.copy_from_slice(&planes.cb[src_base + src_x..src_base + src_x + exact]);
+            if !pad.is_empty() {
+                pad.fill(planes.cb[src_base + src_x + exact - 1]);
             }
 
-            let cr_row = &mut cr_band[c_start..c_start + c_copy_w];
-            let (cr_exact, cr_pad) = cr_row.split_at_mut(copy);
-            cr_exact.copy_from_slice(&planes.cr[src_base + src_x..src_base + src_x + copy]);
-            if !cr_pad.is_empty() {
-                cr_pad.fill(planes.cr[src_base + src_x + copy - 1]);
+            let cr_dst = &mut cr_band[dst_start..dst_start + copy_w];
+            let (copied, pad) = cr_dst.split_at_mut(exact);
+            copied.copy_from_slice(&planes.cr[src_base + src_x..src_base + src_x + exact]);
+            if !pad.is_empty() {
+                pad.fill(planes.cr[src_base + src_x + exact - 1]);
             }
         }
     }
+    Ok(())
 }
 
-/// Allocate the three YUV planes and fill them band-by-band. Grid rows are
-/// stitched concurrently via the decoder's work-stealing pool, each band getting
-/// exclusive `&mut` regions from three [`threadpool::DisjointMut`] wrappers (one
-/// per plane). Single-threaded pools and single-band images take a serial path
-/// that skips pool dispatch; the output is byte-identical either way.
-fn fill_grid_yuv_bands(
+fn fill_native_grid_yuv<T: NativeGridSample>(
     decoder: &Decoder,
-    y_total: usize,
-    c_total: usize,
     rows: usize,
     ctx: &YuvGridCtx<'_>,
-) -> YuvPlaneSamples {
-    let y_stride = ctx.tile_h * ctx.out_w;
-    let c_stride = ctx.tile_ch * ctx.cw;
-
+) -> Result<PlanarImage<T>, DecodeError> {
+    let y_total = ctx
+        .out_w
+        .checked_mul(ctx.out_h)
+        .ok_or_else(|| DecodeError::Bitstream("grid luma dimensions overflow usize".into()))?;
+    let c_total = ctx
+        .cw
+        .checked_mul(ctx.ch)
+        .ok_or_else(|| DecodeError::Bitstream("grid chroma dimensions overflow usize".into()))?;
+    let y_stride = ctx.tile_h.saturating_mul(ctx.out_w);
+    let c_stride = ctx.tile_ch.saturating_mul(ctx.cw);
     let pool = decoder.pool();
-    if pool.threads() > 1 && rows > 1 {
-        let y_dm = threadpool::DisjointMut::new(vec![0u16; y_total]);
-        let cb_dm = threadpool::DisjointMut::new(vec![0u16; c_total]);
-        let cr_dm = threadpool::DisjointMut::new(vec![0u16; c_total]);
-        threadpool::parallel_for(pool, rows, |r| {
-            let y_lo = r * y_stride;
-            let y_hi = ((r + 1) * y_stride).min(y_total);
-            let c_lo = r * c_stride;
-            let c_hi = ((r + 1) * c_stride).min(c_total);
+
+    let (y, cb, cr) = if pool.threads() > 1 && rows > 1 {
+        let y = threadpool::DisjointMut::new(try_vec![T::default(); y_total, "grid luma plane"]);
+        let cb = threadpool::DisjointMut::new(try_vec![T::default(); c_total, "grid Cb plane"]);
+        let cr = threadpool::DisjointMut::new(try_vec![T::default(); c_total, "grid Cr plane"]);
+        let error = std::sync::Mutex::new(None);
+        threadpool::parallel_for(pool, rows, |row| {
+            if error.lock().unwrap().is_some() {
+                return;
+            }
+            let y_lo = row * y_stride;
+            let y_hi = ((row + 1) * y_stride).min(y_total);
             if y_lo >= y_hi {
                 return;
             }
-            let mut y_band = y_dm.slice_mut(y_lo..y_hi);
-            if c_total > 0 && c_lo < c_hi {
-                let mut cb_band = cb_dm.slice_mut(c_lo..c_hi);
-                let mut cr_band = cr_dm.slice_mut(c_lo..c_hi);
-                stitch_yuv_band(ctx, r, &mut y_band, &mut cb_band, &mut cr_band);
+            let mut y_band = y.slice_mut(y_lo..y_hi);
+            let c_lo = row * c_stride;
+            let c_hi = ((row + 1) * c_stride).min(c_total);
+            let result = if c_lo < c_hi {
+                let mut cb_band = cb.slice_mut(c_lo..c_hi);
+                let mut cr_band = cr.slice_mut(c_lo..c_hi);
+                stitch_native_yuv_band(ctx, row, &mut y_band, &mut cb_band, &mut cr_band)
             } else {
-                stitch_yuv_band(ctx, r, &mut y_band, &mut [], &mut []);
+                stitch_native_yuv_band(ctx, row, &mut y_band, &mut [], &mut [])
+            };
+            if let Err(err) = result {
+                *error.lock().unwrap() = Some(err);
             }
         });
-        return YuvPlaneSamples {
-            y: y_dm.into_inner(),
-            cb: cb_dm.into_inner(),
-            cr: cr_dm.into_inner(),
-        };
-    }
+        if let Some(err) = error.into_inner().unwrap() {
+            return Err(err);
+        }
+        (y.into_inner(), cb.into_inner(), cr.into_inner())
+    } else {
+        let mut y = try_vec![T::default(); y_total, "grid luma plane"];
+        let mut cb = try_vec![T::default(); c_total, "grid Cb plane"];
+        let mut cr = try_vec![T::default(); c_total, "grid Cr plane"];
+        for row in 0..rows {
+            let y_lo = row * y_stride;
+            let y_hi = ((row + 1) * y_stride).min(y_total);
+            if y_lo >= y_hi {
+                continue;
+            }
+            let c_lo = row * c_stride;
+            let c_hi = ((row + 1) * c_stride).min(c_total);
+            if c_lo < c_hi {
+                stitch_native_yuv_band(
+                    ctx,
+                    row,
+                    &mut y[y_lo..y_hi],
+                    &mut cb[c_lo..c_hi],
+                    &mut cr[c_lo..c_hi],
+                )?;
+            } else {
+                stitch_native_yuv_band(ctx, row, &mut y[y_lo..y_hi], &mut [], &mut [])?;
+            }
+        }
+        (y, cb, cr)
+    };
 
-    // Serial path — used for single-threaded pools or single-band images, where
-    // dispatching to the pool would only add overhead.
-    let mut out_y = vec![0u16; y_total];
-    let mut out_cb = vec![0u16; c_total];
-    let mut out_cr = vec![0u16; c_total];
-    for r in 0..rows {
-        let y_lo = r * y_stride;
-        let y_hi = ((r + 1) * y_stride).min(y_total);
-        let c_lo = r * c_stride;
-        let c_hi = ((r + 1) * c_stride).min(c_total);
-        if y_lo >= y_hi {
-            continue;
-        }
-        if c_total > 0 && c_lo < c_hi {
-            stitch_yuv_band(
-                ctx,
-                r,
-                &mut out_y[y_lo..y_hi],
-                &mut out_cb[c_lo..c_hi],
-                &mut out_cr[c_lo..c_hi],
-            );
-        } else {
-            let empty: &mut [u16] = &mut [];
-            let empty2: &mut [u16] = &mut [];
-            stitch_yuv_band(ctx, r, &mut out_y[y_lo..y_hi], empty, empty2);
-        }
-    }
-    YuvPlaneSamples {
-        y: out_y,
-        cb: out_cb,
-        cr: out_cr,
-    }
+    Ok(PlanarImage {
+        y: PlaneBuffer::tight(y, ctx.out_w, ctx.out_h),
+        cb: ctx
+            .has_chroma
+            .then(|| PlaneBuffer::tight(cb, ctx.cw, ctx.ch)),
+        cr: ctx
+            .has_chroma
+            .then(|| PlaneBuffer::tight(cr, ctx.cw, ctx.ch)),
+    })
 }
 
-/// Composite a tiled grid into a single YUV image (no RGB conversion).
-fn decode_grid_yuv(
+struct NativeGridImage {
+    planes: YuvBuffer,
+    bit_depth: BitDepth,
+    chroma: ChromaFormat,
+    vui_color: Cicp,
+}
+
+fn decode_native_grid_image(
     decoder: &Decoder,
     file: &[u8],
     grid: &heif::GridInfo,
-    heif_file: &heif::HeifFile,
-) -> Result<DecodedYuv, DecodeError> {
+) -> Result<NativeGridImage, DecodeError> {
     let out_w = grid.output_width as usize;
     let out_h = grid.output_height as usize;
     decoder.check_dims(out_w, out_h)?;
@@ -938,68 +1096,43 @@ fn decode_grid_yuv(
     }
     let cols = grid.cols as usize;
     let rows = grid.rows as usize;
-
-    let fallback_hvcc: Vec<u8> = grid
+    let fallback_hvcc = grid
         .tiles
         .iter()
-        .find(|t| !t.hvcc.is_empty())
-        .map(|t| t.hvcc.clone())
+        .find(|tile| !tile.hvcc.is_empty())
+        .map(|tile| tile.hvcc.clone())
         .unwrap_or_default();
-
-    // Tile size and chroma format from the SPS (all tiles in a grid share one).
-    let hvcc_ref = if !grid.tiles[0].hvcc.is_empty() {
-        &grid.tiles[0].hvcc
-    } else {
+    let hvcc = if grid.tiles[0].hvcc.is_empty() {
         &fallback_hvcc
+    } else {
+        &grid.tiles[0].hvcc
     };
-    let parsed = config::parse_hvcc_full(hvcc_ref).ok();
-    let chroma_fmt = parsed
-        .as_ref()
-        .map(|(sps, _)| sps.chroma)
-        .unwrap_or(ChromaFormat::Yuv420);
-    let (tile_w, tile_h) = parsed
-        .as_ref()
-        .and_then(|(sps, _)| {
-            let w = sps.width.saturating_sub(sps.crop_left + sps.crop_right) as usize;
-            let h = sps.height.saturating_sub(sps.crop_top + sps.crop_bottom) as usize;
-            if w > 0 && h > 0 { Some((w, h)) } else { None }
-        })
-        .unwrap_or_else(|| (out_w.div_ceil(cols), out_h.div_ceil(rows)));
-
-    // Chroma dimensions follow the actual subsampling, not a fixed 4:2:0.
-    // Monochrome has no chroma planes (zero-sized), matching the per-tile decoder.
-    let sub_w = chroma_fmt.sub_w();
-    let sub_h = chroma_fmt.sub_h();
-    let has_chroma = !chroma_fmt.is_monochrome();
+    if hvcc.is_empty() {
+        return Err(DecodeError::MissingBox("grid hvcC property"));
+    }
+    let (sps, _) = config::parse_hvcc_full(hvcc)?;
+    let chroma = sps.chroma;
+    let bit_depth = match sps.bit_depth_luma {
+        10 => BitDepth::Ten,
+        12 => BitDepth::Twelve,
+        _ => BitDepth::Eight,
+    };
+    let tile_w = sps.width.saturating_sub(sps.crop_left + sps.crop_right) as usize;
+    let tile_h = sps.height.saturating_sub(sps.crop_top + sps.crop_bottom) as usize;
+    let (tile_w, tile_h) = if tile_w != 0 && tile_h != 0 {
+        (tile_w, tile_h)
+    } else {
+        (out_w.div_ceil(cols), out_h.div_ceil(rows))
+    };
+    let sub_w = chroma.sub_w();
+    let sub_h = chroma.sub_h();
+    let has_chroma = !chroma.is_monochrome();
     let (cw, ch) = if has_chroma {
         (out_w.div_ceil(sub_w), out_h.div_ceil(sub_h))
     } else {
         (0, 0)
     };
-    let tile_cw = tile_w.div_ceil(sub_w);
-    let tile_ch = tile_h.div_ceil(sub_h);
-    let tile_crop = parsed
-        .as_ref()
-        .map(|(sps, _)| HevcVisibleCrop {
-            left: sps.crop_left as usize,
-            top: sps.crop_top as usize,
-        })
-        .unwrap_or_default();
-
-    // All tiles in a grid share one SPS, so the sample bit depth is fixed for
-    // the whole grid; derive it once from the reference hvcC instead of reading
-    // it back inside the (possibly parallel) stitch loop.
-    let bit_depth = parsed
-        .as_ref()
-        .map(|(sps, _)| match sps.bit_depth_luma {
-            10 => BitDepth::Ten,
-            12 => BitDepth::Twelve,
-            _ => BitDepth::Eight,
-        })
-        .unwrap_or(BitDepth::Eight);
-
-    // Shared, immutable context for the band workers.
-    let yctx = YuvGridCtx {
+    let ctx = YuvGridCtx {
         file,
         exec: decoder.exec(),
         tiles: &grid.tiles,
@@ -1011,37 +1144,59 @@ fn decode_grid_yuv(
         ch,
         tile_w,
         tile_h,
-        tile_cw,
-        tile_ch,
-        tile_crop_left: tile_crop.left,
-        tile_crop_top: tile_crop.top,
+        tile_cw: tile_w.div_ceil(sub_w),
+        tile_ch: tile_h.div_ceil(sub_h),
+        tile_crop_left: sps.crop_left as usize,
+        tile_crop_top: sps.crop_top as usize,
         sub_w,
         sub_h,
         has_chroma,
     };
-
-    // Band `r` (grid-row r) owns contiguous, disjoint ranges of each plane:
-    //   luma:   [r*tile_h*out_w, ..)     spanning tile_h output rows
-    //   chroma: [r*tile_ch*cw, ..)       spanning tile_ch chroma rows
-    let samples = fill_grid_yuv_bands(decoder, out_w * out_h, cw * ch, rows, &yctx);
-    let gain_map = decoder
-        .decodes_gain_map()
-        .then(|| decode_gain_map(decoder, file, heif_file, false))
-        .flatten();
-
-    Ok(DecodedYuv {
-        y: plane_to_buf(samples.y, bit_depth),
-        cb: plane_to_buf(samples.cb, bit_depth),
-        cr: plane_to_buf(samples.cr, bit_depth),
-        alpha: decoder
-            .decodes_alpha()
-            .then(|| decode_alpha_plane(decoder, file, heif_file, out_w, out_h))
-            .flatten(),
-        gain_map,
-        width: out_w as u32,
-        height: out_h as u32,
+    let planes = if bit_depth == BitDepth::Eight {
+        YuvBuffer::U8(fill_native_grid_yuv::<u8>(decoder, rows, &ctx)?)
+    } else {
+        YuvBuffer::U16(fill_native_grid_yuv::<u16>(decoder, rows, &ctx)?)
+    };
+    Ok(NativeGridImage {
+        planes,
         bit_depth,
-        chroma: chroma_fmt,
+        chroma,
+        vui_color: Cicp {
+            primaries: Primaries::from_u8(sps.color_primaries),
+            transfer: TransferFunction::from_u8(sps.transfer_characteristics),
+            matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
+            full_range: sps.video_full_range,
+        },
+    })
+}
+
+/// Composite a tiled grid into a strided typed YUV frame. Grid output is
+/// tightly packed because stitching writes directly into final-sized planes.
+fn decode_grid_yuv(
+    decoder: &Decoder,
+    file: &[u8],
+    grid: &heif::GridInfo,
+    heif_file: &heif::HeifFile,
+) -> Result<DecodedYuv, DecodeError> {
+    let decoded = decode_native_grid_image(decoder, file, grid)?;
+    let width = grid.output_width as usize;
+    let height = grid.output_height as usize;
+    let alpha = if decoder.decodes_alpha() {
+        decode_alpha_plane_native(decoder, file, heif_file, width, height)?
+    } else {
+        None
+    };
+    let gain_map = if decoder.decodes_gain_map() {
+        decode_gain_map_frame(decoder, file, heif_file)?
+    } else {
+        None
+    };
+    Ok(DecodedYuv {
+        planes: decoded.planes,
+        alpha,
+        gain_map,
+        bit_depth: decoded.bit_depth,
+        chroma: decoded.chroma,
         color: heif_file.primary.color.clone(),
         orientation: grid.orientation,
         clean_aperture: heif_file.primary.clap,
@@ -1123,12 +1278,48 @@ fn configure_still_inter_state(
     Ok(())
 }
 
-fn decode_hevc_item(
+trait StillPictureOutput {
+    type Planes;
+
+    fn finish(
+        decoder: &mut decode::FullDecoder<'_>,
+        pool: Option<&threadpool::ThreadPool>,
+    ) -> Result<Self::Planes, DecodeError>;
+}
+
+struct U16StillPicture;
+struct NativeStillPicture;
+
+impl StillPictureOutput for U16StillPicture {
+    type Planes = yuv::YuvPlanes;
+
+    #[inline]
+    fn finish(
+        decoder: &mut decode::FullDecoder<'_>,
+        pool: Option<&threadpool::ThreadPool>,
+    ) -> Result<Self::Planes, DecodeError> {
+        decoder.finish_with(None, pool)
+    }
+}
+
+impl StillPictureOutput for NativeStillPicture {
+    type Planes = yuv::NativeYuvPlanes;
+
+    #[inline]
+    fn finish(
+        decoder: &mut decode::FullDecoder<'_>,
+        pool: Option<&threadpool::ThreadPool>,
+    ) -> Result<Self::Planes, DecodeError> {
+        decoder.finish_native_with(None, pool)
+    }
+}
+
+fn decode_hevc_item_as<O: StillPictureOutput>(
     sample: &[u8],
     hvcc: &[u8],
     exec: &exec::ExecContext,
     pool: Option<&threadpool::ThreadPool>,
-) -> Result<(yuv::YuvPlanes, Cicp), DecodeError> {
+) -> Result<(O::Planes, Cicp), DecodeError> {
     use config::parse_hvcc_full;
     use decode::{FullDecoder, SliceHeader, parse_slice_header_full};
 
@@ -1259,7 +1450,25 @@ fn decode_hevc_item(
     // Keep the still-image path bit-identical to VideoDecoder. The parallel
     // chroma deblock kernel is intentionally not selected there because it is
     // not yet bit-exact; SAO can remain parallel.
-    Ok((decoder.finish_with(None, pool), vui_color))
+    Ok((O::finish(&mut decoder, pool)?, vui_color))
+}
+
+fn decode_hevc_item(
+    sample: &[u8],
+    hvcc: &[u8],
+    exec: &exec::ExecContext,
+    pool: Option<&threadpool::ThreadPool>,
+) -> Result<(yuv::YuvPlanes, Cicp), DecodeError> {
+    decode_hevc_item_as::<U16StillPicture>(sample, hvcc, exec, pool)
+}
+
+fn decode_hevc_item_native(
+    sample: &[u8],
+    hvcc: &[u8],
+    exec: &exec::ExecContext,
+    pool: Option<&threadpool::ThreadPool>,
+) -> Result<(yuv::NativeYuvPlanes, Cicp), DecodeError> {
+    decode_hevc_item_as::<NativeStillPicture>(sample, hvcc, exec, pool)
 }
 
 /// Decode a HEIF/HEIC file to display-ready pixels using a default [`Decoder`].
@@ -1343,16 +1552,20 @@ fn decode_heic_impl(
         crop.top,
         &color_enc,
         Some(decoder.pool()),
-    );
+    )?;
 
-    let alpha = (decode_auxiliary_images && decoder.decodes_alpha())
-        .then(|| decode_alpha_plane(decoder, file, &heif, dw, dh))
-        .flatten();
-    let gain_map = (decode_auxiliary_images && decoder.decodes_gain_map())
-        .then(|| decode_gain_map(decoder, file, &heif, true))
-        .flatten();
+    let alpha = if decode_auxiliary_images && decoder.decodes_alpha() {
+        decode_alpha_plane(decoder, file, &heif, dw, dh)?
+    } else {
+        None
+    };
+    let gain_map = if decode_auxiliary_images && decoder.decodes_gain_map() {
+        decode_gain_map(decoder, file, &heif, true)?
+    } else {
+        None
+    };
 
-    let oriented = apply_orientation(dw as u32, dh as u32, rgb, alpha, heif.primary.orientation);
+    let oriented = apply_orientation(dw as u32, dh as u32, rgb, alpha, heif.primary.orientation)?;
 
     Ok(DecodedImage {
         width: oriented.width,
@@ -1398,12 +1611,12 @@ fn stitch_grid_band<T: Copy>(
     band_row: usize,
     band: &mut [T],
     pick: &(dyn Fn(&ImageBuffer) -> Option<&[T]> + Sync),
-) {
+) -> Result<(), DecodeError> {
     let dst_y_base = band_row * ctx.tile_h;
     for col in 0..ctx.cols {
         let tile_idx = band_row * ctx.cols + col;
         let tile = match ctx.tiles.get(tile_idx) {
-            Some(t) => t,
+            Some(tile) => tile,
             None => break,
         };
         let start = tile.data_offset as usize;
@@ -1421,9 +1634,14 @@ fn stitch_grid_band<T: Copy>(
         if hvcc.is_empty() {
             continue;
         }
-        let (yuv, _) = match decode_hevc_item(&ctx.file[start..end], hvcc, ctx.exec, None) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Some((yuv, _)) = optional_auxiliary(decode_hevc_item(
+            &ctx.file[start..end],
+            hvcc,
+            ctx.exec,
+            None,
+        ))?
+        else {
+            continue;
         };
 
         let dst_x = col * ctx.tile_w;
@@ -1433,25 +1651,28 @@ fn stitch_grid_band<T: Copy>(
             continue;
         }
 
-        let tile_buf = yuv::yuv_to_rgb_window_with_color(
+        let tile_buf = yuv::yuv_to_rgb_window_with_color_pool(
             &yuv,
             ctx.tile_w,
             ctx.tile_h,
             ctx.tile_crop_left,
             ctx.tile_crop_top,
             ctx.color_enc,
-        );
+            None,
+        )?;
         let src = match pick(&tile_buf) {
-            Some(s) => s,
-            None => continue, // depth mismatch — shouldn't happen within one grid
+            Some(samples) => samples,
+            None => continue,
         };
-        let ch = ctx.channels;
+        let channels = ctx.channels;
         for y in 0..copy_h {
-            let s = y * ctx.tile_w * ch;
-            let d = (y * ctx.out_w + dst_x) * ch;
-            band[d..d + copy_w * ch].copy_from_slice(&src[s..s + copy_w * ch]);
+            let src_start = y * ctx.tile_w * channels;
+            let dst_start = (y * ctx.out_w + dst_x) * channels;
+            band[dst_start..dst_start + copy_w * channels]
+                .copy_from_slice(&src[src_start..src_start + copy_w * channels]);
         }
     }
+    Ok(())
 }
 
 /// Allocate the output plane and fill each of the `rows` horizontal bands.
@@ -1462,34 +1683,40 @@ fn fill_grid_bands<T: Copy + Default + Send>(
     band_stride: usize,
     ctx: &GridCtx<'_>,
     pick: &(dyn Fn(&ImageBuffer) -> Option<&[T]> + Sync),
-) -> Vec<T> {
+) -> Result<Vec<T>, DecodeError> {
     let pool = decoder.pool();
     if pool.threads() > 1 && rows > 1 {
-        let dm = threadpool::DisjointMut::new(vec![T::default(); total]);
-        threadpool::parallel_for(pool, rows, |r| {
-            let lo = r * band_stride;
-            let hi = ((r + 1) * band_stride).min(total);
+        let output = threadpool::DisjointMut::new(try_vec![T::default(); total, "grid RGB output"]);
+        let error = std::sync::Mutex::new(None);
+        threadpool::parallel_for(pool, rows, |row| {
+            if error.lock().unwrap().is_some() {
+                return;
+            }
+            let lo = row * band_stride;
+            let hi = ((row + 1) * band_stride).min(total);
             if lo >= hi {
                 return;
             }
-            let mut band = dm.slice_mut(lo..hi);
-            stitch_grid_band(ctx, r, &mut band, pick);
+            let mut band = output.slice_mut(lo..hi);
+            if let Err(err) = stitch_grid_band(ctx, row, &mut band, pick) {
+                *error.lock().unwrap() = Some(err);
+            }
         });
-        return dm.into_inner();
+        if let Some(err) = error.into_inner().unwrap() {
+            return Err(err);
+        }
+        return Ok(output.into_inner());
     }
 
-    // Serial path — used for single-threaded pools or single-band images, where
-    // dispatching to the pool would only add overhead.
-    let mut out = vec![T::default(); total];
-    for r in 0..rows {
-        let lo = r * band_stride;
-        let hi = ((r + 1) * band_stride).min(total);
-        if lo >= hi {
-            continue;
+    let mut output = try_vec![T::default(); total, "grid RGB output"];
+    for row in 0..rows {
+        let lo = row * band_stride;
+        let hi = ((row + 1) * band_stride).min(total);
+        if lo < hi {
+            stitch_grid_band(ctx, row, &mut output[lo..hi], pick)?;
         }
-        stitch_grid_band(ctx, r, &mut out[lo..hi], pick);
     }
-    out
+    Ok(output)
 }
 
 /// Decode a tiled (grid) HEIC: decode each tile independently then stitch.
@@ -1662,7 +1889,7 @@ fn decode_grid(
                 ImageBuffer::Rgb8(s) | ImageBuffer::Luma8(s) => Some(s.as_slice()),
                 _ => None,
             },
-        );
+        )?;
         if is_mono {
             ImageBuffer::Luma8(v)
         } else {
@@ -1679,7 +1906,7 @@ fn decode_grid(
                 ImageBuffer::Rgb16(s) | ImageBuffer::Luma16(s) => Some(s.as_slice()),
                 _ => None,
             },
-        );
+        )?;
         if is_mono {
             ImageBuffer::Luma16(v)
         } else {
@@ -1687,13 +1914,17 @@ fn decode_grid(
         }
     };
 
-    let alpha = (decode_auxiliary_images && decoder.decodes_alpha())
-        .then(|| decode_alpha_plane(decoder, file, heif_file, out_w, out_h))
-        .flatten();
-    let gain_map = (decode_auxiliary_images && decoder.decodes_gain_map())
-        .then(|| decode_gain_map(decoder, file, heif_file, true))
-        .flatten();
-    let oriented = apply_orientation(out_w as u32, out_h as u32, out_buf, alpha, grid.orientation);
+    let alpha = if decode_auxiliary_images && decoder.decodes_alpha() {
+        decode_alpha_plane(decoder, file, heif_file, out_w, out_h)?
+    } else {
+        None
+    };
+    let gain_map = if decode_auxiliary_images && decoder.decodes_gain_map() {
+        decode_gain_map(decoder, file, heif_file, true)?
+    } else {
+        None
+    };
+    let oriented = apply_orientation(out_w as u32, out_h as u32, out_buf, alpha, grid.orientation)?;
 
     Ok(DecodedImage {
         width: oriented.width,
@@ -1736,14 +1967,34 @@ pub(crate) fn decode_heic_rgb8_with(
     let img = decode_heic_impl(decoder, file, false)?;
     let shift = img.bit_depth.minus8();
     let pixels = match img.pixels {
-        ImageBuffer::Rgb8(v) => v, // 8-bit color: direct move
-        ImageBuffer::Rgb16(v) => v.into_iter().map(|x| (x >> shift) as u8).collect(),
-        ImageBuffer::Luma8(v) => v.into_iter().flat_map(|l| [l, l, l]).collect(),
-        ImageBuffer::Luma16(v) => v
-            .into_iter()
-            .map(|x| (x >> shift) as u8)
-            .flat_map(|l| [l, l, l])
-            .collect(),
+        ImageBuffer::Rgb8(pixels) => pixels,
+        ImageBuffer::Rgb16(samples) => {
+            let mut pixels = try_vec![0u8; samples.len(), "RGB8 output"];
+            for (dst, sample) in pixels.iter_mut().zip(samples) {
+                *dst = (sample >> shift) as u8;
+            }
+            pixels
+        }
+        ImageBuffer::Luma8(samples) => {
+            let len = samples.len().checked_mul(3).ok_or_else(|| {
+                DecodeError::Bitstream("RGB8 output length overflows usize".into())
+            })?;
+            let mut pixels = try_vec![0u8; len, "RGB8 output"];
+            for (luma, rgb) in samples.into_iter().zip(pixels.as_chunks_mut::<3>().0) {
+                *rgb = [luma; 3];
+            }
+            pixels
+        }
+        ImageBuffer::Luma16(samples) => {
+            let len = samples.len().checked_mul(3).ok_or_else(|| {
+                DecodeError::Bitstream("RGB8 output length overflows usize".into())
+            })?;
+            let mut pixels = try_vec![0u8; len, "RGB8 output"];
+            for (luma, rgb) in samples.into_iter().zip(pixels.as_chunks_mut::<3>().0) {
+                *rgb = [(luma >> shift) as u8; 3];
+            }
+            pixels
+        }
     };
     Ok(Rgb8Image {
         pixels,
@@ -1768,113 +2019,120 @@ fn apply_orientation(
     pixels: ImageBuffer,
     alpha: Option<SampleBuf>,
     orientation: Orientation,
-) -> OrientedImage {
+) -> Result<OrientedImage, DecodeError> {
     let (oriented_width, oriented_height) = oriented_dimensions(width, height, orientation);
     let pixels = match pixels {
         ImageBuffer::Luma8(samples) => ImageBuffer::Luma8(rotate_luma(
             width as usize,
             height as usize,
-            &samples,
+            samples,
             orientation,
-        )),
+        )?),
         ImageBuffer::Luma16(samples) => ImageBuffer::Luma16(rotate_luma(
             width as usize,
             height as usize,
-            &samples,
+            samples,
             orientation,
-        )),
+        )?),
         ImageBuffer::Rgb8(samples) => ImageBuffer::Rgb8(rotate_buf(
             width as usize,
             height as usize,
-            &samples,
+            samples,
             orientation,
-        )),
+        )?),
         ImageBuffer::Rgb16(samples) => ImageBuffer::Rgb16(rotate_buf(
             width as usize,
             height as usize,
-            &samples,
+            samples,
             orientation,
-        )),
+        )?),
     };
-    let alpha = alpha.map(|samples| match samples {
-        SampleBuf::U8(samples) => SampleBuf::U8(rotate_luma(
-            width as usize,
-            height as usize,
-            &samples,
-            orientation,
-        )),
-        SampleBuf::U16(samples) => SampleBuf::U16(rotate_luma(
-            width as usize,
-            height as usize,
-            &samples,
-            orientation,
-        )),
-    });
-    OrientedImage {
+    let alpha = alpha
+        .map(|samples| rotate_sample_buf(samples, width, height, orientation))
+        .transpose()?;
+    Ok(OrientedImage {
         width: oriented_width,
         height: oriented_height,
         pixels,
         alpha,
-    }
+    })
 }
 
-/// Single-channel rotation for luma-only buffers (stride = 1, not 3).
-fn rotate_luma<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -> Vec<T> {
-    match o {
-        Orientation::Normal => px.to_vec(),
-        Orientation::Rotate180 => px.iter().copied().rev().collect::<Vec<_>>(),
+/// Single-channel rotation for luma-only buffers. Normal and 180° orientation
+/// reuse the original allocation; orientations requiring a new layout allocate
+/// through `try_vec!`.
+fn rotate_luma<T: Copy + Default>(
+    w: usize,
+    h: usize,
+    mut pixels: Vec<T>,
+    orientation: Orientation,
+) -> Result<Vec<T>, DecodeError> {
+    match orientation {
+        Orientation::Normal => Ok(pixels),
+        Orientation::Rotate180 => {
+            pixels.reverse();
+            Ok(pixels)
+        }
         Orientation::FlipH => {
-            let mut out = vec![T::default(); px.len()];
-            for (src_row, dst_row) in px.chunks_exact(w).zip(out.chunks_exact_mut(w)) {
-                for (dst, &src) in dst_row.iter_mut().rev().zip(src_row.iter()) {
+            let mut out = try_vec![T::default(); pixels.len(), "oriented luma image"];
+            for (src_row, dst_row) in pixels.chunks_exact(w).zip(out.chunks_exact_mut(w)) {
+                for (dst, &src) in dst_row.iter_mut().rev().zip(src_row) {
                     *dst = src;
                 }
             }
-            out
+            Ok(out)
         }
         Orientation::FlipV => {
-            let mut out = vec![T::default(); px.len()];
-            for (src_row, dst_row) in px.chunks_exact(w).zip(out.chunks_exact_mut(w).rev()) {
+            let mut out = try_vec![T::default(); pixels.len(), "oriented luma image"];
+            for (src_row, dst_row) in pixels.chunks_exact(w).zip(out.chunks_exact_mut(w).rev()) {
                 dst_row.copy_from_slice(src_row);
             }
-            out
+            Ok(out)
         }
         Orientation::Rotate90 => {
-            let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                for c in 0..w {
-                    out[c * h + (h - 1 - r)] = px[r * w + c];
+            let mut out = try_vec![T::default(); pixels.len(), "oriented luma image"];
+            for row in 0..h {
+                for col in 0..w {
+                    out[col * h + (h - 1 - row)] = pixels[row * w + col];
                 }
             }
-            out
+            Ok(out)
         }
         Orientation::Rotate270 => {
-            let mut out = vec![T::default(); px.len()];
-            for r in 0..h {
-                for c in 0..w {
-                    out[(w - 1 - c) * h + r] = px[r * w + c];
+            let mut out = try_vec![T::default(); pixels.len(), "oriented luma image"];
+            for row in 0..h {
+                for col in 0..w {
+                    out[(w - 1 - col) * h + row] = pixels[row * w + col];
                 }
             }
-            out
+            Ok(out)
         }
-        _ => px.to_vec(),
+        _ => Ok(pixels),
     }
 }
 
-/// Generic pixel-buffer rotation; works for both `u8` and `u16` samples.
-fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -> Vec<T> {
-    match o {
-        Orientation::Normal => px.to_vec(),
-        Orientation::Rotate180 => px
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .rev()
-            .flat_map(|c| c.iter().copied())
-            .collect(),
+/// Generic three-channel pixel-buffer rotation.
+fn rotate_buf<T: Copy + Default>(
+    w: usize,
+    h: usize,
+    mut pixels: Vec<T>,
+    orientation: Orientation,
+) -> Result<Vec<T>, DecodeError> {
+    match orientation {
+        Orientation::Normal => Ok(pixels),
+        Orientation::Rotate180 => {
+            let count = pixels.len() / 3;
+            for left in 0..count / 2 {
+                let right = count - 1 - left;
+                for channel in 0..3 {
+                    pixels.swap(left * 3 + channel, right * 3 + channel);
+                }
+            }
+            Ok(pixels)
+        }
         Orientation::FlipH => {
-            let mut out = vec![T::default(); px.len()];
-            for (src_row, dst_row) in px.chunks_exact(w * 3).zip(out.chunks_exact_mut(w * 3)) {
+            let mut out = try_vec![T::default(); pixels.len(), "oriented RGB image"];
+            for (src_row, dst_row) in pixels.chunks_exact(w * 3).zip(out.chunks_exact_mut(w * 3)) {
                 for (src, dst) in src_row
                     .as_chunks::<3>()
                     .0
@@ -1885,73 +2143,66 @@ fn rotate_buf<T: Copy + Default>(w: usize, h: usize, px: &[T], o: Orientation) -
                     dst.copy_from_slice(src);
                 }
             }
-            out
+            Ok(out)
         }
         Orientation::FlipV => {
-            let mut out = vec![T::default(); px.len()];
-            for (src_row, dst_row) in px
+            let mut out = try_vec![T::default(); pixels.len(), "oriented RGB image"];
+            for (src_row, dst_row) in pixels
                 .chunks_exact(w * 3)
                 .rev()
                 .zip(out.chunks_exact_mut(w * 3))
             {
                 dst_row.copy_from_slice(src_row);
             }
-            out
+            Ok(out)
         }
         Orientation::Rotate90 => {
-            // 90° CW: (r,c) → (c, h-1-r). Blocked to keep both the source and
-            // the transposed destination regions cache-resident.
-            let mut out = vec![T::default(); px.len()];
-            const BS: usize = 32;
-            let mut rb = 0;
-            while rb < h {
-                let r_end = (rb + BS).min(h);
-                let mut cb = 0;
-                while cb < w {
-                    let c_end = (cb + BS).min(w);
-                    for r in rb..r_end {
-                        let s_row = r * w * 3;
-                        let d_col = h - 1 - r;
-                        for c in cb..c_end {
-                            let s = s_row + c * 3;
-                            let d = (c * h + d_col) * 3;
-                            out[d] = px[s];
-                            out[d + 1] = px[s + 1];
-                            out[d + 2] = px[s + 2];
+            let mut out = try_vec![T::default(); pixels.len(), "oriented RGB image"];
+            const BLOCK: usize = 32;
+            let mut row_base = 0;
+            while row_base < h {
+                let row_end = (row_base + BLOCK).min(h);
+                let mut col_base = 0;
+                while col_base < w {
+                    let col_end = (col_base + BLOCK).min(w);
+                    for row in row_base..row_end {
+                        let src_row = row * w * 3;
+                        let dst_col = h - 1 - row;
+                        for col in col_base..col_end {
+                            let src = src_row + col * 3;
+                            let dst = (col * h + dst_col) * 3;
+                            out[dst..dst + 3].copy_from_slice(&pixels[src..src + 3]);
                         }
                     }
-                    cb = c_end;
+                    col_base = col_end;
                 }
-                rb = r_end;
+                row_base = row_end;
             }
-            out
+            Ok(out)
         }
         Orientation::Rotate270 => {
-            // 90° CCW: (r,c) → (w-1-c, r). Blocked transpose (see Rotate90).
-            let mut out = vec![T::default(); px.len()];
-            const BS: usize = 32;
-            let mut rb = 0;
-            while rb < h {
-                let r_end = (rb + BS).min(h);
-                let mut cb = 0;
-                while cb < w {
-                    let c_end = (cb + BS).min(w);
-                    for r in rb..r_end {
-                        let s_row = r * w * 3;
-                        for c in cb..c_end {
-                            let s = s_row + c * 3;
-                            let d = ((w - 1 - c) * h + r) * 3;
-                            out[d] = px[s];
-                            out[d + 1] = px[s + 1];
-                            out[d + 2] = px[s + 2];
+            let mut out = try_vec![T::default(); pixels.len(), "oriented RGB image"];
+            const BLOCK: usize = 32;
+            let mut row_base = 0;
+            while row_base < h {
+                let row_end = (row_base + BLOCK).min(h);
+                let mut col_base = 0;
+                while col_base < w {
+                    let col_end = (col_base + BLOCK).min(w);
+                    for row in row_base..row_end {
+                        let src_row = row * w * 3;
+                        for col in col_base..col_end {
+                            let src = src_row + col * 3;
+                            let dst = ((w - 1 - col) * h + row) * 3;
+                            out[dst..dst + 3].copy_from_slice(&pixels[src..src + 3]);
                         }
                     }
-                    cb = c_end;
+                    col_base = col_end;
                 }
-                rb = r_end;
+                row_base = row_end;
             }
-            out
+            Ok(out)
         }
-        _ => px.to_vec(),
+        _ => Ok(pixels),
     }
 }
