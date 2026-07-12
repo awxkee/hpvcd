@@ -347,6 +347,16 @@ impl FullDecoder<'static> {
         pps: Pps,
         hdr: &SliceHeader,
     ) -> Result<Self, DecodeError> {
+        Self::new_with_exec(cabac, sps, pps, hdr, ExecContext::new())
+    }
+
+    pub(crate) fn new_with_exec(
+        cabac: &[u8],
+        sps: Sps,
+        pps: Pps,
+        hdr: &SliceHeader,
+        exec: ExecContext,
+    ) -> Result<Self, DecodeError> {
         let hdr_slice_qp = hdr.slice_qp;
         let sao_luma = hdr.sao_luma;
         let sao_chroma = hdr.sao_chroma;
@@ -440,7 +450,7 @@ impl FullDecoder<'static> {
             ictx,
             pctx: crate::cabac::PaletteContexts::init(slice_qp.clamp(0, 51) as u8),
             palette_predictor: initial_palette_predictor(&sps, &pps),
-            exec: ExecContext::new(),
+            exec,
             bd: sps.bit_depth_luma,
             bd_c: sps.bit_depth_chroma,
             log2_ctb,
@@ -1343,7 +1353,7 @@ impl<'cab> FullDecoder<'cab> {
         // then consults the parameters of the slice that owns its q-side sample
         // (§8.7.2), rather than a single global copy overwritten by the last
         // slice. `slice_deblock[1..]` holds the per-slice records; index 0 is a
-        // placeholder. The single-slice fast path keeps the original behaviour.
+        // placeholder. The single-slice fast path keeps the original behavior.
         let any_deblock = if self.slice_deblock.len() > 1 {
             self.slice_deblock[1..].iter().any(|d| !d.disabled)
         } else {
@@ -1587,7 +1597,7 @@ impl<'cab> FullDecoder<'cab> {
     #[inline]
     fn filter_across_boundary(&self, pxp: usize, pyp: usize, pxq: usize, pyq: usize) -> bool {
         // Transquant-bypass (lossless) blocks are never deblocked on the side
-        // that is bypass (§8.7.2 restore_tqb behaviour ≈ skip).
+        // that is bypass (§8.7.2 restore_tqb behavior ≈ skip).
         if self.tqb_at(pxp, pyp) || self.tqb_at(pxq, pyq) {
             return false;
         }

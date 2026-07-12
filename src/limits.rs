@@ -45,7 +45,8 @@
 //!   [`max_item_size`](ParseLimits::max_item_size),
 //!   [`max_hvcc_size`](ParseLimits::max_hvcc_size), and
 //!   [`max_exif_size`](ParseLimits::max_exif_size) bound the sizes of
-//!   individual boxes and the variable-length blobs copied out of them, while
+//!   individual boxes and the variable-length metadata blobs copied out of
+//!   them, while
 //!   [`max_items`](ParseLimits::max_items),
 //!   [`max_extents_per_item`](ParseLimits::max_extents_per_item), and
 //!   [`max_tiles`](ParseLimits::max_tiles) bound how many of each the parser
@@ -68,7 +69,8 @@ pub struct ParseLimits {
     pub max_item_size: u64,
     /// Maximum size, in bytes, of an `hvcC` property blob copied out of `ipco`.
     pub max_hvcc_size: usize,
-    /// Maximum size, in bytes, of EXIF payload copied out of the file.
+    /// Maximum size, in bytes, of an EXIF or auxiliary gain-map metadata
+    /// payload copied out of the file.
     pub max_exif_size: usize,
     /// Maximum number of items enumerated from `iloc` / `iinf`.
     pub max_items: usize,
@@ -90,7 +92,7 @@ impl ParseLimits {
     /// The default `hvcC` blob cap (64 KiB — real hvcC boxes are a few hundred
     /// bytes).
     pub const DEFAULT_MAX_HVCC_SIZE: usize = 64 * 1024;
-    /// The default EXIF blob cap (1 MiB).
+    /// The default copied-metadata blob cap (1 MiB).
     pub const DEFAULT_MAX_EXIF_SIZE: usize = 1024 * 1024;
     /// The default item-count cap.
     pub const DEFAULT_MAX_ITEMS: usize = 4096;

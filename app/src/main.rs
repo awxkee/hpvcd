@@ -22,13 +22,20 @@ fn main() {
     // .unwrap();
     // iamge.save("./out_v.jpg").unwrap();
 
-    let bytes = fs::read("./assets/Zero_and_One_Palette_Size_A_Canon_2.heic").unwrap();
+    let bytes = fs::read("./assets/IMG_0073.HEIC").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
         let decoded = hpvcd::decode_heic(&bytes).unwrap();
         let elapsed = instant.elapsed();
-        println!("Iteration {i}: {:?}", elapsed);
+        if let Some(metadata) = decoded
+            .gain_map
+            .and_then(|x| x.metadata)
+            .and_then(|x| String::from_utf8(x).ok())
+        {
+            println!("{:?}", metadata);
+        }
+        println!("Iteration {i}: {:?} w:{}", elapsed, decoded.width);
         durations.push(elapsed);
     }
 
