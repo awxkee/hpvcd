@@ -70,7 +70,7 @@ fn main() {
     );
     img.save("./out.jpg").unwrap();
 
-    let bytes1 = fs::read("./assets/Zero_and_One_Palette_Size_A_Canon_2.bit").unwrap();
+    let bytes1 = fs::read("./assets/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2.bit").unwrap();
     let decoded = hpvcd::decode_hevc(&bytes1).unwrap();
     let rgb_image = decoded[0].to_rgb8();
     let iamge = RgbImage::from_vec(

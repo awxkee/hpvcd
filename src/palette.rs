@@ -68,11 +68,15 @@ impl PalettePredictor {
     /// Reset to the SPS/PPS initialiser table (§9.3.2.3).
     pub(crate) fn reset_from(&mut self, init: &[Vec<u16>], num_comps: usize) {
         self.num_comps = num_comps;
-        for c in 0..MAX_COMPONENTS {
-            self.entries[c].clear();
+        for c in self.entries[..MAX_COMPONENTS].iter_mut() {
+            c.clear();
         }
-        for (c, col) in init.iter().enumerate().take(MAX_COMPONENTS) {
-            self.entries[c].extend_from_slice(col);
+        for (col, entry) in init
+            .iter()
+            .zip(self.entries.iter_mut())
+            .take(MAX_COMPONENTS)
+        {
+            entry.extend_from_slice(col);
         }
     }
 
@@ -88,8 +92,8 @@ impl PalettePredictor {
         let num_comps = self.num_comps.max(1);
         let mut new_cols: [Vec<u16>; MAX_COMPONENTS] = Default::default();
         for e in cu_palette {
-            for c in 0..num_comps {
-                new_cols[c].push(e[c]);
+            for (c, &e_s) in e[..num_comps].iter().enumerate() {
+                new_cols[c].push(e_s);
             }
         }
         let prev_len = self.entries[0].len();
@@ -98,8 +102,8 @@ impl PalettePredictor {
                 if new_cols[0].len() >= max_pred_size {
                     break;
                 }
-                for (c, dst) in new_cols[..num_comps].iter_mut().enumerate() {
-                    dst.push(self.entries[c][k]);
+                for (dst, entry) in new_cols[..num_comps].iter_mut().zip(self.entries.iter()) {
+                    dst.push(entry[k]);
                 }
             }
         }
