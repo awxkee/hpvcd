@@ -3308,7 +3308,19 @@ impl<'cab> FullDecoder<'cab> {
         let mut cbf_cb = parent_cbf_cb;
         let mut cbf_cr = parent_cbf_cr;
         if chroma_present && (log2_ts > 2 || self.sps.chroma_idc == 3) {
+            // For 4:2:2 (ChromaArrayType==2) the second, lower stacked chroma TB
+            // has its own cbf, but that bin is only present at this node when the
+            // transform does not split further, or at log2TrafoSize==3 (where luma
+            // splits to 4×4 but the chroma stays as two stacked 4×4). At a
+            // splitting node with log2TrafoSize>3 only the top cbf is coded and the
+            // lower slot mirrors it so the child nodes inherit the same presence
+            // gate (§7.3.8.8). Signaling the extra bin there desyncs CABAC.
+            let signal_second = self.sps.chroma_idc == 2 && (!split || log2_ts == 3);
             for t in 0..n_tb {
+                if t == 1 && !signal_second {
+                    cbf_cb[1] = cbf_cb[0];
+                    break;
+                }
                 if depth == 0 || parent_cbf_cb[t] {
                     cbf_cb[t] = self
                         .cab
@@ -3317,6 +3329,10 @@ impl<'cab> FullDecoder<'cab> {
                 }
             }
             for t in 0..n_tb {
+                if t == 1 && !signal_second {
+                    cbf_cr[1] = cbf_cr[0];
+                    break;
+                }
                 if depth == 0 || parent_cbf_cr[t] {
                     cbf_cr[t] = self
                         .cab

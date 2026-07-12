@@ -42,7 +42,7 @@ use crate::yuv::YuvPlanes;
 /// conformance-window crop, the chroma format / bit depth, and the colour
 /// coefficients. Filled in from the active SPS when a frame is emitted.
 #[derive(Clone)]
-struct FrameMeta {
+pub(crate) struct FrameMeta {
     /// Conformance-window crop offsets in luma samples.
     crop_left: usize,
     crop_top: usize,
@@ -617,7 +617,7 @@ impl VideoDecoder {
             self.outputs.push(VideoFrame {
                 planes: f.planes,
                 poc: f.poc,
-                meta: self.cur_meta.clone(),
+                meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
             });
         }
         // Pictures are already emitted in output order: the DPB bumps the
@@ -734,7 +734,7 @@ impl VideoDecoder {
                     .or_insert_with(|| VideoFrame {
                         planes: f.planes.clone(),
                         poc: f.poc,
-                        meta: self.cur_meta.clone(),
+                        meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                     });
             }
             if let Some(f) = self.seek_cache.gop_frames.get(&target_poc) {
@@ -751,7 +751,7 @@ impl VideoDecoder {
                 .or_insert(VideoFrame {
                     planes: f.planes,
                     poc: f.poc,
-                    meta: self.cur_meta.clone(),
+                    meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                 });
         }
         Ok(self.seek_cache.gop_frames.get(&target_poc).cloned())
@@ -1033,7 +1033,7 @@ impl VideoDecoder {
                 self.outputs.push(VideoFrame {
                     planes: f.planes,
                     poc: f.poc,
-                    meta: self.cur_meta.clone(),
+                    meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                 });
             }
         }
@@ -1143,7 +1143,7 @@ impl VideoDecoder {
                     self.outputs.push(VideoFrame {
                         planes: f.planes,
                         poc: f.poc,
-                        meta: self.cur_meta.clone(),
+                        meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                     });
                 }
                 let drop_prior = if is_cra {
@@ -1158,7 +1158,7 @@ impl VideoDecoder {
                         self.outputs.push(VideoFrame {
                             planes: f.planes,
                             poc: f.poc,
-                            meta: self.cur_meta.clone(),
+                            meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                         });
                     }
                 }
@@ -1192,7 +1192,7 @@ impl VideoDecoder {
                 self.outputs.push(VideoFrame {
                     planes: f.planes,
                     poc: f.poc,
-                    meta: self.cur_meta.clone(),
+                    meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                 });
             }
         }
@@ -1358,6 +1358,7 @@ impl VideoDecoder {
             long_term: false,
             needed_for_output: hdr0.pic_output_flag,
             latency: 0,
+            meta: Some(self.cur_meta.clone()),
         };
         self.dpb.push(frame);
         // Update prevTid0Pic (§8.3.1): only pictures with TemporalId 0 that are

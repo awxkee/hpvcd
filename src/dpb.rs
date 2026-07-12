@@ -53,6 +53,11 @@ pub(crate) struct Frame {
     /// PicLatencyCount (§C.5.2.2), advanced once for each subsequently decoded
     /// picture while this picture remains pending for output.
     pub(crate) latency: usize,
+    /// Display metadata (conformance-window crop, dimensions, colour) captured
+    /// from the SPS active when this picture was decoded. Carried per-frame so a
+    /// picture emitted after a later SPS activation (e.g. a stream of IDRs each
+    /// changing resolution) is still cropped with its own SPS, not the newest.
+    pub(crate) meta: Option<crate::video::FrameMeta>,
 }
 
 impl Frame {
@@ -139,7 +144,19 @@ impl Dpb {
     }
 
     /// Insert a freshly decoded frame; returns its index.
+    ///
+    /// §C.5.2.3: when a picture is added to the DPB, PicLatencyCount is set to 0
+    /// for it and incremented by one for every other picture still needed for
+    /// output. Doing this at store time (rather than at the next before-decode
+    /// bump) keeps the latency count in step with decode order, so a picture is
+    /// never made latency-due before a lower-POC picture that follows it in
+    /// decode order has actually been stored.
     pub(crate) fn push(&mut self, frame: Frame) -> usize {
+        for f in &mut self.frames {
+            if f.needed_for_output {
+                f.latency = f.latency.saturating_add(1);
+            }
+        }
         self.frames.push(frame);
         self.frames.len() - 1
     }
@@ -164,11 +181,6 @@ impl Dpb {
         // output at the next IRAP.
         self.frames
             .retain(|f| f.is_reference() || f.needed_for_output);
-        for frame in &mut self.frames {
-            if frame.needed_for_output {
-                frame.latency = frame.latency.saturating_add(1);
-            }
-        }
 
         let mut out = Vec::new();
         loop {
@@ -433,6 +445,7 @@ impl Frame {
             long_term: false,
             needed_for_output: false,
             latency: 0,
+            meta: self.meta.clone(),
         }
     }
 }
@@ -530,6 +543,7 @@ mod tests {
             long_term: false,
             needed_for_output,
             latency: 0,
+            meta: None,
         }
     }
 
@@ -584,11 +598,23 @@ mod tests {
 
     #[test]
     fn max_latency_forces_output_before_capacity_limit() {
+        // SpsMaxLatencyPictures = 2: a pending picture must be output once two
+        // later pictures have been decoded, even though the DPB (capacity 8) is
+        // nowhere near full and the reorder bound (8) is not exceeded.
+        //
+        // §C.5.2.3: PicLatencyCount advances when a *subsequent* picture is
+        // stored, not on each output-process invocation. So POC 4's latency only
+        // reaches the limit after two higher-POC pictures have been pushed — and
+        // by then those pictures are in the DPB, so POC 4 (the lowest POC) is the
+        // one bumped, never a later picture ahead of it.
         let mut dpb = Dpb::new(8);
         dpb.configure(8, 8, Some(2));
         dpb.push(frame(4, true, true));
 
+        dpb.push(frame(5, true, true)); // POC 4 latency -> 1
         assert!(dpb.bump_before_decode().is_empty());
+
+        dpb.push(frame(6, true, true)); // POC 4 latency -> 2 (>= limit)
         let out = dpb.bump_before_decode();
         assert_eq!(out.iter().map(|f| f.poc).collect::<Vec<_>>(), [4]);
     }
