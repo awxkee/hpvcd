@@ -366,6 +366,7 @@ pub(crate) struct SaoBoundary<'a> {
     pub tqb: &'a [bool],
     pub pcm: &'a [bool],
     pub loop_filter_across_slices: bool,
+    pub loop_filter_across_tiles: bool,
     pub pcm_loop_filter_disabled: bool,
     pub tile_grid: Option<&'a crate::tiles::TileGrid>,
 }
@@ -382,14 +383,17 @@ impl SaoBoundary<'_> {
         }
         let gc = (cy / 4) * self.gw + (cx / 4);
         let gn = (y / 4) * self.gw + (x / 4);
-        if self.tqb.get(gc).copied().unwrap_or(false) || self.tqb.get(gn).copied().unwrap_or(false)
-        {
+        // The current sample gets no SAO when it is transquant-bypass or in an
+        // I_PCM CU with pcm_loop_filter_disabled (§8.7.3.1); reporting the
+        // neighbor as unavailable is how the gated edge-offset kernel skips it. A
+        // *neighbor* that is exempt is still available for edge classification —
+        // exemption never removes a sample from §6.4.1 availability — so only the
+        // center `(cx, cy)` is tested here. (The final substitution of exempt
+        // samples back to their pre-SAO values is done in `apply_sao`.)
+        if self.tqb.get(gc).copied().unwrap_or(false) {
             return false;
         }
-        if self.pcm_loop_filter_disabled
-            && (self.pcm.get(gc).copied().unwrap_or(false)
-                || self.pcm.get(gn).copied().unwrap_or(false))
-        {
+        if self.pcm_loop_filter_disabled && self.pcm.get(gc).copied().unwrap_or(false) {
             return false;
         }
         if !self.loop_filter_across_slices
@@ -398,7 +402,9 @@ impl SaoBoundary<'_> {
         {
             return false;
         }
-        if let Some(g) = self.tile_grid {
+        if !self.loop_filter_across_tiles
+            && let Some(g) = self.tile_grid
+        {
             let c = self.log2_ctb;
             if g.tile_id_at(cx >> c, cy >> c) != g.tile_id_at(x >> c, y >> c) {
                 return false;
@@ -797,6 +803,7 @@ fn sao_usage(ctx: &SaoPlanesCtx<'_>) -> SaoUsage {
 /// `dst_*` are consumed and the filtered planes returned (matching the serial
 /// path's in-place semantics from the caller's view). When the pool is
 /// single-threaded or there is only one band, it runs serially with no dispatch.
+#[allow(clippy::type_complexity)]
 pub(crate) fn apply_sao_parallel(
     pool: &crate::threadpool::ThreadPool,
     ctx: &SaoPlanesCtx<'_>,
@@ -919,6 +926,7 @@ mod tests {
             tqb: &[false, false],
             pcm: &[false, false],
             loop_filter_across_slices: false,
+            loop_filter_across_tiles: true,
             pcm_loop_filter_disabled: false,
             tile_grid: None,
         }
@@ -942,6 +950,43 @@ mod tests {
         let mut b = split_slice_bnd(&slices);
         b.loop_filter_across_slices = true;
         assert!(b.luma_neighbor_ok(3, 0, 4, 0));
+    }
+
+    #[test]
+    fn cross_tile_neighbor_respects_loop_filter_flag() {
+        let grid = crate::tiles::TileGrid {
+            cols: 2,
+            rows: 1,
+            col_bd: vec![0, 1],
+            row_bd: vec![0],
+            col_width: vec![1, 1],
+            row_height: vec![1],
+            rs_to_ts: vec![0, 1],
+            ts_to_rs: vec![0, 1],
+            tile_id: vec![0, 1],
+            ctb_cols: 2,
+            ctb_rows: 1,
+            loop_filter_across_tiles: false,
+        };
+        let slices = [0u16; 32];
+        let flags = [false; 32];
+        let mut b = SaoBoundary {
+            gw: 32,
+            log2_ctb: 6,
+            sub_w: 2,
+            sub_h: 2,
+            slice_idx: &slices,
+            tqb: &flags,
+            pcm: &flags,
+            loop_filter_across_slices: true,
+            loop_filter_across_tiles: false,
+            pcm_loop_filter_disabled: false,
+            tile_grid: Some(&grid),
+        };
+
+        assert!(!b.luma_neighbor_ok(63, 0, 64, 0));
+        b.loop_filter_across_tiles = true;
+        assert!(b.luma_neighbor_ok(63, 0, 64, 0));
     }
 
     #[test]

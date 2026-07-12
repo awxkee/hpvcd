@@ -153,6 +153,7 @@ fn plane_window<T: Copy + Default>(
         return Ok(PlaneBuffer::tight(Vec::new(), dst_w, dst_h));
     }
 
+    #[allow(clippy::manual_checked_ops)]
     let rows = if src_w == 0 {
         0
     } else {

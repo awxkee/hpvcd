@@ -31,6 +31,11 @@ use crate::bitreader::BitReader;
 use crate::error::DecodeError;
 use crate::fmt::{BitDepth, ChromaFormat};
 
+#[inline]
+fn component_bit_depth_supported(bit_depth: u8) -> bool {
+    (8..=12).contains(&bit_depth)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Sps {
     /// seq_parameter_set_id (0..15).
@@ -62,6 +67,9 @@ pub(crate) struct Sps {
     /// sps_max_dec_pic_buffering_minus1 + 1 for the highest sub-layer: the DPB
     /// size in pictures. Used to size the output-bumping threshold.
     pub(crate) max_dec_pic_buffering: u32,
+    /// MaxLatencyPictures for the highest sub-layer. `None` means
+    /// sps_max_latency_increase_plus1 was zero and no latency limit applies.
+    pub(crate) max_latency_pictures: Option<u32>,
     /// Asymmetric motion partitions enabled (inter).
     pub(crate) amp_enabled: bool,
     /// SPS-level temporal motion vector prediction enabled.
@@ -585,7 +593,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         .filter(|&v| v <= u8::MAX as u32)
         .map(|v| v as u8)
         .ok_or_else(|| e("bd_luma"))?;
-    if !matches!(bit_depth_luma, 8 | 10 | 12) {
+    if !component_bit_depth_supported(bit_depth_luma) {
         return Err(DecodeError::UnsupportedBitDepth(bit_depth_luma));
     }
     let bit_depth_chroma = r
@@ -595,7 +603,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         .filter(|&v| v <= u8::MAX as u32)
         .map(|v| v as u8)
         .ok_or_else(|| e("bd_chroma"))?;
-    if !matches!(bit_depth_chroma, 8 | 10 | 12) {
+    if !component_bit_depth_supported(bit_depth_chroma) {
         return Err(DecodeError::UnsupportedBitDepth(bit_depth_chroma));
     }
     let log2_max_poc_lsb = r.read_ue().map_err(|_| e("log2_max_poc"))? + 4;
@@ -609,12 +617,15 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     };
     let mut max_dec_pic_buffering = 1u32;
     let mut max_num_reorder_pics = 0u32;
+    let mut max_latency_pictures = None;
     for _ in start..=max_sub_layers_minus1 {
         // Only the highest sub-layer's values are retained; they govern the
         // output DPB size and reorder latency (§C.5.2.2).
         max_dec_pic_buffering = r.read_ue().map_err(|_| e("max_dec_pic_buffering"))? + 1;
         max_num_reorder_pics = r.read_ue().map_err(|_| e("num_reorder_pics"))?;
-        r.read_ue().map_err(|_| e("max_latency"))?;
+        let increase_plus1 = r.read_ue().map_err(|_| e("max_latency"))?;
+        max_latency_pictures =
+            (increase_plus1 != 0).then(|| max_num_reorder_pics.saturating_add(increase_plus1 - 1));
     }
 
     let log2_min_cb = r
@@ -841,6 +852,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         log2_max_poc_lsb,
         max_num_reorder_pics,
         max_dec_pic_buffering,
+        max_latency_pictures,
         amp_enabled,
         temporal_mvp_enabled,
         short_term_rps,
@@ -986,9 +998,7 @@ pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps,
     let cabac_init_present = r.read_flag().map_err(|_| e("cabac_init"))?;
     let num_ref_idx_l0_default = r.read_ue().map_err(|_| e("nref0"))? as usize + 1;
     let num_ref_idx_l1_default = r.read_ue().map_err(|_| e("nref1"))? as usize + 1;
-    let init_qp = 26i32
-        .saturating_add(r.read_se().map_err(|_| e("init_qp"))?)
-        .clamp(0, 51);
+    let init_qp = derive_pps_init_qp(r.read_se().map_err(|_| e("init_qp"))?);
     let constrained_intra_pred = r.read_flag().map_err(|_| e("constrained_intra"))?;
     let transform_skip_enabled = r.read_flag().map_err(|_| e("transform_skip"))?;
     let cu_qp_delta_enabled = r.read_flag().map_err(|_| e("cu_qp_delta"))?;
@@ -1142,6 +1152,14 @@ pub(crate) fn parse_pps(rbsp: &[u8], _scaling_list_enabled: bool) -> Result<Pps,
         luma_bit_depth_entry: pscc.luma_bit_depth_entry,
         chroma_bit_depth_entry: pscc.chroma_bit_depth_entry,
     })
+}
+
+#[inline]
+fn derive_pps_init_qp(pic_init_qp_minus26: i32) -> i32 {
+    // The lower bound is -QpBdOffsetY, which is SPS/bit-depth dependent and is
+    // therefore unavailable while parsing a standalone PPS. Preserve the
+    // signed value here; slice QP derivation clamps it once the SPS is known.
+    26i32.saturating_add(pic_init_qp_minus26)
 }
 
 struct PpsRangeExt {
@@ -1372,4 +1390,25 @@ fn skip_hrd_parameters(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{component_bit_depth_supported, derive_pps_init_qp};
+
+    #[test]
+    fn component_depth_accepts_normative_intermediate_precisions() {
+        for bit_depth in 8..=12 {
+            assert!(component_bit_depth_supported(bit_depth));
+        }
+        assert!(!component_bit_depth_supported(7));
+        assert!(!component_bit_depth_supported(13));
+    }
+
+    #[test]
+    fn pps_init_qp_preserves_main10_negative_minimum() {
+        // INITQP_B_Main10 uses pic_init_qp_minus26=-38. Clamping this to the
+        // 8-bit minimum of zero changes its slice CABAC initialization QP.
+        assert_eq!(derive_pps_init_qp(-38), -12);
+    }
 }

@@ -50,6 +50,9 @@ pub(crate) struct Frame {
     pub(crate) long_term: bool,
     /// Whether this frame still needs to be output.
     pub(crate) needed_for_output: bool,
+    /// PicLatencyCount (§C.5.2.2), advanced once for each subsequently decoded
+    /// picture while this picture remains pending for output.
+    pub(crate) latency: usize,
 }
 
 impl Frame {
@@ -75,6 +78,7 @@ pub(crate) struct Dpb {
     /// sps_max_num_reorder_pics: at most this many output-pending pictures may be
     /// held before the lowest-POC one is bumped for output (§C.5.2.2).
     max_reorder: usize,
+    max_latency: Option<usize>,
     /// NoRaslOutputFlag of the current random-access period: when true, RASL
     /// pictures attached to the period's IRAP are discarded.
     no_rasl_output: bool,
@@ -86,6 +90,7 @@ impl Dpb {
             frames: Vec::new(),
             max_frames: max_frames.max(1),
             max_reorder: max_frames.max(1),
+            max_latency: None,
             no_rasl_output: false,
         }
     }
@@ -93,9 +98,15 @@ impl Dpb {
     /// Configure the output DPB from the active SPS (§C.5.2.2). `buffering` is
     /// sps_max_dec_pic_buffering (DPB size) and `reorder` is
     /// sps_max_num_reorder_pics (reorder-latency bound).
-    pub(crate) fn configure(&mut self, buffering: usize, reorder: usize) {
+    pub(crate) fn configure(
+        &mut self,
+        buffering: usize,
+        reorder: usize,
+        max_latency: Option<usize>,
+    ) {
         self.max_frames = buffering.max(1);
         self.max_reorder = reorder.min(self.max_frames);
+        self.max_latency = max_latency;
     }
 
     /// Whether RASL pictures in the current random-access period are suppressed.
@@ -131,6 +142,53 @@ impl Dpb {
     pub(crate) fn push(&mut self, frame: Frame) -> usize {
         self.frames.push(frame);
         self.frames.len() - 1
+    }
+
+    /// Run the Annex C output process before decoding the next picture. RPS
+    /// marking has already released references not needed by that picture.
+    pub(crate) fn bump_before_decode(&mut self) -> Vec<Frame> {
+        self.bump_before_picture(true)
+    }
+
+    /// At a new CVS, reference-capacity pressure is resolved by the impending
+    /// reference reset. Only reorder/latency constraints can make a prior
+    /// picture due before no_output_of_prior_pics_flag discards the remainder.
+    pub(crate) fn bump_before_irap(&mut self) -> Vec<Frame> {
+        self.bump_before_picture(false)
+    }
+
+    fn bump_before_picture(&mut self, check_fullness: bool) -> Vec<Frame> {
+        // RPS marking runs immediately before this process. Purge pictures that
+        // it made unused and that were already output before evaluating DPB
+        // fullness; counting those dead slots causes premature leading-picture
+        // output at the next IRAP.
+        self.frames
+            .retain(|f| f.is_reference() || f.needed_for_output);
+        for frame in &mut self.frames {
+            if frame.needed_for_output {
+                frame.latency = frame.latency.saturating_add(1);
+            }
+        }
+
+        let mut out = Vec::new();
+        loop {
+            let pending = self.frames.iter().filter(|f| f.needed_for_output).count();
+            let full = check_fullness && self.frames.len() >= self.max_frames && pending != 0;
+            let over_reorder = pending > self.max_reorder;
+            let over_latency = self.max_latency.is_some_and(|limit| {
+                self.frames
+                    .iter()
+                    .any(|f| f.needed_for_output && f.latency >= limit)
+            });
+            if !full && !over_reorder && !over_latency {
+                break;
+            }
+            let Some(frame) = self.bump_one() else { break };
+            out.push(frame);
+        }
+        self.frames
+            .retain(|f| f.is_reference() || f.needed_for_output);
+        out
     }
 
     /// Find a short-term reference frame by POC.
@@ -333,23 +391,8 @@ impl Dpb {
             if !(flush && pending > 0) && !over_reorder && !over_full {
                 break;
             }
-            // Output the lowest-POC frame still needing output.
-            let mut best: Option<usize> = None;
-            for (i, f) in self.frames.iter().enumerate() {
-                if f.needed_for_output && best.is_none_or(|b| f.poc < self.frames[b].poc) {
-                    best = Some(i);
-                }
-            }
-            let Some(bi) = best else { break };
-            self.frames[bi].needed_for_output = false;
-            // Remove if also not a reference.
-            if !self.frames[bi].is_reference() {
-                out.push(self.frames.remove(bi));
-            } else {
-                // Reference but output: clone-free move is impossible while it
-                // stays a reference, so we output a shallow copy of planes.
-                out.push(self.frames[bi].shallow_output());
-            }
+            let Some(frame) = self.bump_one() else { break };
+            out.push(frame);
             if !flush {
                 break;
             }
@@ -358,6 +401,22 @@ impl Dpb {
         self.frames
             .retain(|f| f.is_reference() || f.needed_for_output);
         out
+    }
+
+    fn bump_one(&mut self) -> Option<Frame> {
+        let best = self
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.needed_for_output)
+            .min_by_key(|(_, f)| f.poc)
+            .map(|(i, _)| i)?;
+        self.frames[best].needed_for_output = false;
+        if self.frames[best].is_reference() {
+            Some(self.frames[best].shallow_output())
+        } else {
+            Some(self.frames.remove(best))
+        }
     }
 }
 
@@ -373,6 +432,7 @@ impl Frame {
             short_term: false,
             long_term: false,
             needed_for_output: false,
+            latency: 0,
         }
     }
 }
@@ -449,6 +509,29 @@ impl Clone for YuvPlanes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fmt::{BitDepth, ChromaFormat};
+
+    fn frame(poc: i32, short_term: bool, needed_for_output: bool) -> Frame {
+        Frame {
+            planes: YuvPlanes {
+                y: vec![poc as u16],
+                cb: Vec::new(),
+                cr: Vec::new(),
+                width: 1,
+                height: 1,
+                chroma: ChromaFormat::Monochrome,
+                bit_depth: BitDepth::Eight,
+            },
+            poc,
+            motion: Vec::new(),
+            width4: 0,
+            height4: 0,
+            short_term,
+            long_term: false,
+            needed_for_output,
+            latency: 0,
+        }
+    }
 
     #[test]
     fn current_picture_is_an_active_long_term_reference() {
@@ -472,5 +555,41 @@ mod tests {
         assert_eq!(l0[0].poc, 17);
         assert_eq!(l1[0].poc, 17);
         assert!(l0[0].long_term && l1[0].long_term);
+    }
+
+    #[test]
+    fn dead_output_reference_does_not_create_false_capacity_pressure() {
+        let mut dpb = Dpb::new(2);
+        dpb.configure(2, 2, None);
+        dpb.push(frame(0, false, false));
+        dpb.push(frame(2, true, true));
+
+        assert!(dpb.bump_before_decode().is_empty());
+        assert_eq!(dpb.frames.len(), 1);
+        assert_eq!(dpb.frames[0].poc, 2);
+    }
+
+    #[test]
+    fn irap_bumps_only_reorder_due_picture_before_discard() {
+        let mut dpb = Dpb::new(6);
+        dpb.configure(6, 4, None);
+        for poc in 3..=7 {
+            dpb.push(frame(poc, true, true));
+        }
+
+        let out = dpb.bump_before_irap();
+        assert_eq!(out.iter().map(|f| f.poc).collect::<Vec<_>>(), [3]);
+        assert_eq!(dpb.frames.iter().filter(|f| f.needed_for_output).count(), 4);
+    }
+
+    #[test]
+    fn max_latency_forces_output_before_capacity_limit() {
+        let mut dpb = Dpb::new(8);
+        dpb.configure(8, 8, Some(2));
+        dpb.push(frame(4, true, true));
+
+        assert!(dpb.bump_before_decode().is_empty());
+        let out = dpb.bump_before_decode();
+        assert_eq!(out.iter().map(|f| f.poc).collect::<Vec<_>>(), [4]);
     }
 }

@@ -319,6 +319,14 @@ impl<'a> CabacDecoder<'a> {
         self.offset = self.read_bits(9);
     }
 
+    /// Re-prime CABAC after byte-aligned PCM samples. Fixed-length reads may
+    /// have prefetched whole bytes, which must be returned before the reservoir
+    /// is cleared by arithmetic-engine initialization.
+    pub(crate) fn reinit_after_pcm(&mut self) {
+        self.byte_align();
+        self.reinit_engine();
+    }
+
     /// Read `n` (≤ 32) raw bits from the stream, MSB-first. Used for PCM sample
     /// data (§7.3.8.5 / §9.3.1), which is coded as fixed-length uncompressed bits
     /// between an engine byte-alignment and a subsequent re-initialization.
@@ -333,6 +341,24 @@ impl<'a> CabacDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm_reinit_preserves_prefetched_cabac_bytes() {
+        let data = [0x80, 0x00, 0x12, 0x34, 0xab, 0xcd, 0xef, 0x42];
+        let mut dec = CabacDecoder::new_borrowed(&data).unwrap();
+
+        // A terminated CABAC segment aligns to byte 2; consume two bytes of
+        // raw PCM while refill deliberately prefetches beyond them.
+        dec.byte_align();
+        assert_eq!(dec.read_pcm_bits(16), 0x1234);
+        dec.reinit_after_pcm();
+
+        // Reinitialization must begin at byte 4, not at the end of the refill.
+        assert_eq!(
+            dec.offset,
+            (u32::from(data[4]) << 1) | u32::from(data[5] >> 7)
+        );
+    }
 
     #[test]
     fn packed_decision_table_matches_normative_tables() {
