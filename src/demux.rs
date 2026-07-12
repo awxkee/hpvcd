@@ -217,14 +217,6 @@ pub(crate) mod nal {
     pub(crate) fn is_sub_layer_non_ref(t: u8) -> bool {
         t <= 14 && (t).is_multiple_of(2)
     }
-    /// Reference picture flag: `_R` VCL types and all IRAP are reference.
-    #[inline]
-    pub(crate) fn is_reference(t: u8) -> bool {
-        if t > 31 {
-            return false;
-        }
-        !is_sub_layer_non_ref(t)
-    }
 }
 
 #[cfg(test)]

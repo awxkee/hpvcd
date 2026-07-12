@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::color::{Cicp, MatrixCoefficients};
+use crate::error::DecodeError;
 use crate::fmt::{BitDepth, ChromaFormat, ImageBuffer};
 
 const Q13: u32 = 13;
@@ -70,6 +71,92 @@ pub struct YuvPlanes {
     pub height: usize,
     pub chroma: ChromaFormat,
     pub bit_depth: BitDepth,
+}
+
+/// HEIC output storage after the decoder has completed all in-loop filters.
+/// Eight-bit pictures are narrowed once here so callers do not pay a second
+/// whole-image `u16 -> u8` conversion after cropping.
+pub(crate) struct NativePlanes<T> {
+    pub(crate) y: Vec<T>,
+    pub(crate) cb: Vec<T>,
+    pub(crate) cr: Vec<T>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) chroma: ChromaFormat,
+    pub(crate) bit_depth: BitDepth,
+}
+
+pub(crate) enum NativeYuvPlanes {
+    U8(NativePlanes<u8>),
+    U16(NativePlanes<u16>),
+}
+
+impl NativeYuvPlanes {
+    #[inline]
+    pub(crate) fn bit_depth(&self) -> BitDepth {
+        match self {
+            Self::U8(planes) => planes.bit_depth,
+            Self::U16(planes) => planes.bit_depth,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn chroma(&self) -> ChromaFormat {
+        match self {
+            Self::U8(planes) => planes.chroma,
+            Self::U16(planes) => planes.chroma,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn dims(&self) -> (usize, usize) {
+        match self {
+            Self::U8(planes) => (planes.width, planes.height),
+            Self::U16(planes) => (planes.width, planes.height),
+        }
+    }
+}
+
+impl YuvPlanes {
+    pub(crate) fn into_native(self) -> Result<NativeYuvPlanes, DecodeError> {
+        let Self {
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            chroma,
+            bit_depth,
+        } = self;
+        if bit_depth == BitDepth::Eight {
+            fn narrow(src: Vec<u16>, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+                let mut out = try_vec![0u8; src.len(), what];
+                for (dst, sample) in out.iter_mut().zip(src) {
+                    *dst = sample as u8;
+                }
+                Ok(out)
+            }
+            Ok(NativeYuvPlanes::U8(NativePlanes {
+                y: narrow(y, "8-bit luma plane")?,
+                cb: narrow(cb, "8-bit Cb plane")?,
+                cr: narrow(cr, "8-bit Cr plane")?,
+                width,
+                height,
+                chroma,
+                bit_depth,
+            }))
+        } else {
+            Ok(NativeYuvPlanes::U16(NativePlanes {
+                y,
+                cb,
+                cr,
+                width,
+                height,
+                chroma,
+                bit_depth,
+            }))
+        }
+    }
 }
 
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
@@ -331,6 +418,43 @@ where
     v
 }
 
+/// Fallible counterpart used by HEIC APIs whose error type can represent OOM.
+fn try_banded<T, F>(
+    pool: Option<&ThreadPool>,
+    dw: usize,
+    dh: usize,
+    chn: usize,
+    what: &'static str,
+    f: F,
+) -> Result<Vec<T>, DecodeError>
+where
+    T: Default + Copy + Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let total = dw
+        .checked_mul(dh)
+        .and_then(|v| v.checked_mul(chn))
+        .ok_or_else(|| DecodeError::Bitstream("RGB output dimensions overflow usize".into()))?;
+    if let Some(p) = pool {
+        let threads = p.threads();
+        if threads > 1 && dh > 1 {
+            let band_rows = dh.div_ceil((threads * 4).min(dh));
+            let bands = dh.div_ceil(band_rows);
+            let dm = DisjointMut::new(try_vec![T::default(); total, what]);
+            parallel_for(p, bands, |b| {
+                let y0 = b * band_rows;
+                let nr = band_rows.min(dh - y0);
+                let mut band = dm.slice_mut(y0 * dw * chn..(y0 + nr) * dw * chn);
+                f(y0, &mut band);
+            });
+            return Ok(dm.into_inner());
+        }
+    }
+    let mut out = try_vec![T::default(); total, what];
+    f(0, &mut out);
+    Ok(out)
+}
+
 pub(crate) fn yuv_to_rgb_window_with_color(
     yuv: &YuvPlanes,
     dw: usize,
@@ -338,18 +462,6 @@ pub(crate) fn yuv_to_rgb_window_with_color(
     crop_left: usize,
     crop_top: usize,
     color: &Cicp,
-) -> ImageBuffer {
-    yuv_to_rgb_window_with_color_pool(yuv, dw, dh, crop_left, crop_top, color, None)
-}
-
-pub(crate) fn yuv_to_rgb_window_with_color_pool(
-    yuv: &YuvPlanes,
-    dw: usize,
-    dh: usize,
-    crop_left: usize,
-    crop_top: usize,
-    color: &Cicp,
-    pool: Option<&ThreadPool>,
 ) -> ImageBuffer {
     if dw == 0 || dh == 0 || yuv.width == 0 || yuv.height == 0 {
         return if yuv.chroma.is_monochrome() {
@@ -368,72 +480,217 @@ pub(crate) fn yuv_to_rgb_window_with_color_pool(
     let crop_left = crop_left.min(yuv.width - 1);
     let crop_top = crop_top.min(yuv.height - 1);
     let cvt = Cvt::new(yuv, dw, crop_left, crop_top, color);
+    let mono = yuv.chroma.is_monochrome();
+    let identity = color.matrix == MatrixCoefficients::Identity;
+    let ycgco = color.matrix == MatrixCoefficients::YCgCo;
+    let fast = dw <= yuv.width - crop_left && dh <= yuv.height - crop_top;
 
-    if yuv.chroma.is_monochrome() {
-        return if yuv.bit_depth == BitDepth::Eight {
-            ImageBuffer::Luma8(banded(pool, dw, dh, 1, |y0, out| {
+    if yuv.bit_depth == BitDepth::Eight {
+        if mono {
+            ImageBuffer::Luma8(banded(None, dw, dh, 1, |y0, out| {
                 cvt.mono_rows::<u8>(y0, out, 255)
             }))
-        } else {
-            ImageBuffer::Luma16(banded(pool, dw, dh, 1, |y0, out| {
-                cvt.mono_rows::<u16>(y0, out, cvt.max_val)
-            }))
-        };
-    }
-
-    if color.matrix == MatrixCoefficients::Identity {
-        return if yuv.bit_depth == BitDepth::Eight {
-            ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+        } else if identity {
+            ImageBuffer::Rgb8(banded(None, dw, dh, 3, |y0, out| {
                 cvt.gbr_rows::<u8>(y0, out, 255)
             }))
-        } else {
-            ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
-                cvt.gbr_rows::<u16>(y0, out, cvt.max_val)
-            }))
-        };
-    }
-
-    if color.matrix == MatrixCoefficients::YCgCo {
-        return if yuv.bit_depth == BitDepth::Eight {
-            ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+        } else if ycgco {
+            ImageBuffer::Rgb8(banded(None, dw, dh, 3, |y0, out| {
                 cvt.ycgco_rows::<u8>(y0, out, 255)
             }))
-        } else {
-            ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
-                cvt.ycgco_rows::<u16>(y0, out, cvt.max_val)
-            }))
-        };
-    }
-
-    // Fast path assumes the visible window fits inside the coded planes, making
-    // the per-pixel edge clamps in `pixel` provably no-ops; output is bit-exact.
-    let fast = dw <= yuv.width - crop_left && dh <= yuv.height - crop_top;
-    if fast {
-        return if yuv.bit_depth == BitDepth::Eight {
-            ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
+        } else if fast {
+            ImageBuffer::Rgb8(banded(None, dw, dh, 3, |y0, out| {
                 cvt.fast_rows::<u8>(y0, out, 255)
             }))
         } else {
-            ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
-                cvt.fast_rows::<u16>(y0, out, cvt.max_val)
+            ImageBuffer::Rgb8(banded(None, dw, dh, 3, |y0, out| {
+                cvt.slow_rows::<u8>(y0, out, 255)
             }))
-        };
-    }
-
-    if yuv.bit_depth == BitDepth::Eight {
-        ImageBuffer::Rgb8(banded(pool, dw, dh, 3, |y0, out| {
-            cvt.slow_rows::<u8>(y0, out, 255)
+        }
+    } else if mono {
+        ImageBuffer::Luma16(banded(None, dw, dh, 1, |y0, out| {
+            cvt.mono_rows::<u16>(y0, out, cvt.max_val)
+        }))
+    } else if identity {
+        ImageBuffer::Rgb16(banded(None, dw, dh, 3, |y0, out| {
+            cvt.gbr_rows::<u16>(y0, out, cvt.max_val)
+        }))
+    } else if ycgco {
+        ImageBuffer::Rgb16(banded(None, dw, dh, 3, |y0, out| {
+            cvt.ycgco_rows::<u16>(y0, out, cvt.max_val)
+        }))
+    } else if fast {
+        ImageBuffer::Rgb16(banded(None, dw, dh, 3, |y0, out| {
+            cvt.fast_rows::<u16>(y0, out, cvt.max_val)
         }))
     } else {
-        ImageBuffer::Rgb16(banded(pool, dw, dh, 3, |y0, out| {
+        ImageBuffer::Rgb16(banded(None, dw, dh, 3, |y0, out| {
             cvt.slow_rows::<u16>(y0, out, cvt.max_val)
         }))
     }
 }
 
+pub(crate) fn yuv_to_rgb_window_with_color_pool(
+    yuv: &YuvPlanes,
+    dw: usize,
+    dh: usize,
+    crop_left: usize,
+    crop_top: usize,
+    color: &Cicp,
+    pool: Option<&ThreadPool>,
+) -> Result<ImageBuffer, DecodeError> {
+    if dw == 0 || dh == 0 || yuv.width == 0 || yuv.height == 0 {
+        return Ok(if yuv.chroma.is_monochrome() {
+            if yuv.bit_depth == BitDepth::Eight {
+                ImageBuffer::Luma8(Vec::new())
+            } else {
+                ImageBuffer::Luma16(Vec::new())
+            }
+        } else if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(Vec::new())
+        } else {
+            ImageBuffer::Rgb16(Vec::new())
+        });
+    }
+
+    let crop_left = crop_left.min(yuv.width - 1);
+    let crop_top = crop_top.min(yuv.height - 1);
+    let cvt = Cvt::new(yuv, dw, crop_left, crop_top, color);
+
+    if yuv.chroma.is_monochrome() {
+        return Ok(if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Luma8(try_banded(
+                pool,
+                dw,
+                dh,
+                1,
+                "8-bit luma output",
+                |y0, out| cvt.mono_rows::<u8>(y0, out, 255),
+            )?)
+        } else {
+            ImageBuffer::Luma16(try_banded(
+                pool,
+                dw,
+                dh,
+                1,
+                "high-bit-depth luma output",
+                |y0, out| cvt.mono_rows::<u16>(y0, out, cvt.max_val),
+            )?)
+        });
+    }
+
+    if color.matrix == MatrixCoefficients::Identity {
+        return Ok(if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(try_banded(
+                pool,
+                dw,
+                dh,
+                3,
+                "8-bit RGB output",
+                |y0, out| cvt.gbr_rows::<u8>(y0, out, 255),
+            )?)
+        } else {
+            ImageBuffer::Rgb16(try_banded(
+                pool,
+                dw,
+                dh,
+                3,
+                "high-bit-depth RGB output",
+                |y0, out| cvt.gbr_rows::<u16>(y0, out, cvt.max_val),
+            )?)
+        });
+    }
+
+    if color.matrix == MatrixCoefficients::YCgCo {
+        return Ok(if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(try_banded(
+                pool,
+                dw,
+                dh,
+                3,
+                "8-bit RGB output",
+                |y0, out| cvt.ycgco_rows::<u8>(y0, out, 255),
+            )?)
+        } else {
+            ImageBuffer::Rgb16(try_banded(
+                pool,
+                dw,
+                dh,
+                3,
+                "high-bit-depth RGB output",
+                |y0, out| cvt.ycgco_rows::<u16>(y0, out, cvt.max_val),
+            )?)
+        });
+    }
+
+    let fast = dw <= yuv.width - crop_left && dh <= yuv.height - crop_top;
+    if fast {
+        return Ok(if yuv.bit_depth == BitDepth::Eight {
+            ImageBuffer::Rgb8(try_banded(
+                pool,
+                dw,
+                dh,
+                3,
+                "8-bit RGB output",
+                |y0, out| cvt.fast_rows::<u8>(y0, out, 255),
+            )?)
+        } else {
+            ImageBuffer::Rgb16(try_banded(
+                pool,
+                dw,
+                dh,
+                3,
+                "high-bit-depth RGB output",
+                |y0, out| cvt.fast_rows::<u16>(y0, out, cvt.max_val),
+            )?)
+        });
+    }
+
+    Ok(if yuv.bit_depth == BitDepth::Eight {
+        ImageBuffer::Rgb8(try_banded(
+            pool,
+            dw,
+            dh,
+            3,
+            "8-bit RGB output",
+            |y0, out| cvt.slow_rows::<u8>(y0, out, 255),
+        )?)
+    } else {
+        ImageBuffer::Rgb16(try_banded(
+            pool,
+            dw,
+            dh,
+            3,
+            "high-bit-depth RGB output",
+            |y0, out| cvt.slow_rows::<u16>(y0, out, cvt.max_val),
+        )?)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eight_bit_decoder_output_is_narrowed_once() {
+        let planes = YuvPlanes {
+            y: vec![0, 255],
+            cb: vec![128],
+            cr: vec![127],
+            width: 2,
+            height: 1,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: BitDepth::Eight,
+        };
+        match planes.into_native().unwrap() {
+            NativeYuvPlanes::U8(planes) => {
+                assert_eq!(planes.y, vec![0, 255]);
+                assert_eq!(planes.cb, vec![128]);
+                assert_eq!(planes.cr, vec![127]);
+            }
+            NativeYuvPlanes::U16(_) => panic!("8-bit output must use u8 storage"),
+        }
+    }
 
     fn gbr_cicp(full_range: bool) -> Cicp {
         Cicp {

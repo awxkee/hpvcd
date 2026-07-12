@@ -51,6 +51,12 @@ pub enum DecodeError {
         value: u64,
         limit: u64,
     },
+    /// A potentially large allocation failed. Small scratch allocations use
+    /// ordinary infallible allocation to keep hot code uncluttered.
+    AllocationFailed {
+        what: &'static str,
+        bytes: usize,
+    },
 }
 
 impl std::fmt::Display for DecodeError {
@@ -75,8 +81,30 @@ impl std::fmt::Display for DecodeError {
                 f,
                 "parse limit exceeded: {what} = {value} exceeds configured limit {limit}"
             ),
+            Self::AllocationFailed { what, bytes } => {
+                write!(f, "allocation failed for {what} ({bytes} bytes)")
+            }
         }
     }
 }
 
 impl std::error::Error for DecodeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_vec_reports_capacity_overflow() {
+        let result = (|| -> Result<Vec<u8>, DecodeError> {
+            Ok(try_vec![0u8; usize::MAX, "test image buffer"])
+        })();
+        assert!(matches!(
+            result,
+            Err(DecodeError::AllocationFailed {
+                what: "test image buffer",
+                ..
+            })
+        ));
+    }
+}

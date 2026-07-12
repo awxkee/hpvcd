@@ -225,7 +225,7 @@ impl Decoder {
         crate::decode_heic_with(self, file)
     }
 
-    /// Decode to raw YCbCr planes without color conversion.
+    /// Decode raw YCbCr as typed, owning, strided planes.
     pub fn decode_yuv(&self, file: &[u8]) -> Result<DecodedYuv, DecodeError> {
         crate::decode_heic_yuv_with(self, file)
     }

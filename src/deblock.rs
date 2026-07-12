@@ -64,8 +64,6 @@ pub(crate) struct DeblockCtx<'a> {
     pub bd_c: u8,
     pub beta_offset: i32,
     pub tc_offset: i32,
-    pub qp_bd_offset_y: i32,
-    pub qp_bd_offset_c: i32,
     pub default_qp: i16,
     pub log2_ctb: u32,
     pub qp_y_map: &'a [i16],
@@ -304,11 +302,15 @@ fn luma_vertical_segment_params(
     let qp_p = ctx.qp_at(edge - 1, mid);
     let qp_q = ctx.qp_at(edge, mid);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
-    let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
+    // §8.7.2.5.3: Q indexes the tables at qPL (+offsets) without QpBdOffset; the
+    // looked-up β′/tC′ are then scaled to the sample bit depth. Mirrors the
+    // serial `apply_deblocking`.
+    let beta_prime = (avg_qp + ctx.beta_offset).clamp(0, 51);
     // tc' = Q(qp + 2*(Bs-1) + tc_offset) (§8.7.2.5.3): Bs=2 adds 2, Bs=1 adds 0.
-    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
-    let beta = BETA[beta_prime as usize];
-    let tc = TC[tc_prime as usize];
+    let tc_prime = (avg_qp + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
+    let bd_shift = (ctx.bd - 8) as u32;
+    let beta = BETA[beta_prime as usize] << bd_shift;
+    let tc = TC[tc_prime as usize] << bd_shift;
     if tc == 0 {
         return None;
     }
@@ -338,10 +340,11 @@ fn luma_horizontal_segment_params(
     let qp_p = ctx.qp_at(mid, edge - 1);
     let qp_q = ctx.qp_at(mid, edge);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
-    let beta_prime = (avg_qp + ctx.qp_bd_offset_y + ctx.beta_offset).clamp(0, 51);
-    let tc_prime = (avg_qp + ctx.qp_bd_offset_y + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
-    let beta = BETA[beta_prime as usize];
-    let tc = TC[tc_prime as usize];
+    let beta_prime = (avg_qp + ctx.beta_offset).clamp(0, 51);
+    let tc_prime = (avg_qp + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
+    let bd_shift = (ctx.bd - 8) as u32;
+    let beta = BETA[beta_prime as usize] << bd_shift;
+    let tc = TC[tc_prime as usize] << bd_shift;
     if tc == 0 {
         return None;
     }
@@ -804,8 +807,8 @@ fn chroma_vertical_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, s: usize) -> Op
         return None;
     }
     let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
-    let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
-    let tc_c = TC[tc_prime_c as usize];
+    let tc_prime_c = (avg_qp_l + 2 + ctx.tc_offset).clamp(0, 53);
+    let tc_c = TC[tc_prime_c as usize] << (ctx.bd_c - 8) as u32;
     if tc_c == 0 {
         return None;
     }
@@ -821,8 +824,8 @@ fn chroma_horizontal_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, scan: usize) 
         return None;
     }
     let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
-    let tc_prime_c = (avg_qp_l + ctx.qp_bd_offset_c + 2 + ctx.tc_offset).clamp(0, 53);
-    let tc_c = TC[tc_prime_c as usize];
+    let tc_prime_c = (avg_qp_l + 2 + ctx.tc_offset).clamp(0, 53);
+    let tc_c = TC[tc_prime_c as usize] << (ctx.bd_c - 8) as u32;
     if tc_c == 0 {
         return None;
     }
@@ -1102,8 +1105,6 @@ mod tests {
             bd_c: 8,
             beta_offset: 0,
             tc_offset: 0,
-            qp_bd_offset_y: 0,
-            qp_bd_offset_c: 0,
             default_qp: 26,
             log2_ctb: 6,
             qp_y_map: &[],

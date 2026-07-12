@@ -9,3 +9,5 @@ app/target
 Cargo.lock
 corpus
 findings
+.DS_Store
+tests

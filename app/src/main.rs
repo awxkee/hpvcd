@@ -1,4 +1,6 @@
-use hpvcd::{ImageBuffer, VideoDecoder};
+mod gainmap;
+
+use hpvcd::{HeicSettings, ImageBuffer, VideoDecoder};
 use image::{DynamicImage, RgbImage};
 use std::fs;
 use std::time::Instant;
@@ -22,19 +24,23 @@ fn main() {
     // .unwrap();
     // iamge.save("./out_v.jpg").unwrap();
 
-    let bytes = fs::read("./assets/IMG_0073.HEIC").unwrap();
+    let bytes = fs::read("./assets/lossless_rpcdm.heic").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
-        let decoded = hpvcd::decode_heic(&bytes).unwrap();
+        let decoded = hpvcd::decode_heic_with_settings(
+            &bytes,
+            &HeicSettings::new().with_decode_gain_map(false),
+        )
+        .unwrap();
         let elapsed = instant.elapsed();
-        if let Some(metadata) = decoded
-            .gain_map
-            .and_then(|x| x.metadata)
-            .and_then(|x| String::from_utf8(x).ok())
-        {
-            println!("{:?}", metadata);
-        }
+        // if let Some(metadata) = decoded
+        //     .gain_map
+        //     .and_then(|x| x.metadata)
+        //     .and_then(|x| String::from_utf8(x).ok())
+        // {
+        //     println!("{:?}", metadata);
+        // }
         println!("Iteration {i}: {:?} w:{}", elapsed, decoded.width);
         durations.push(elapsed);
     }
@@ -49,7 +55,8 @@ fn main() {
     println!("Decoded WxH {:?}x{:?}", decoded.width, decoded.height);
     println!(
         "Decoded YUV WxH {:?}x{:?}",
-        decoded_yuv.width, decoded_yuv.height
+        decoded_yuv.width(),
+        decoded_yuv.height()
     );
     println!("Decoded: {:?}", instant.elapsed());
     println!("Decoded: {:?}", decoded_yuv.bit_depth);

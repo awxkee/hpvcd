@@ -96,8 +96,6 @@ pub(crate) struct SliceDeblock {
     disabled: bool,
     beta_offset_div2: i32,
     tc_offset_div2: i32,
-    cb_qp_offset: i32,
-    cr_qp_offset: i32,
 }
 
 pub(crate) struct FullDecoder<'cab> {
@@ -378,7 +376,7 @@ impl FullDecoder<'static> {
         // Reject malformed SPS values before they reach shifts like `1 << (bd - 1)`.
         sps.bit_depth()?;
         match sps.bit_depth_chroma {
-            8 | 10 | 12 => {}
+            8..=12 => {}
             n => return Err(DecodeError::UnsupportedBitDepth(n)),
         }
         if !sao_offset_scale_is_valid(sps.bit_depth_luma, pps.log2_sao_offset_scale_luma) {
@@ -458,9 +456,9 @@ impl FullDecoder<'static> {
             log2_min_tb: sps.log2_min_tb,
             log2_max_tb: sps.log2_max_tb,
             max_trafo_depth_intra: sps.max_transform_hierarchy_intra,
-            y: crate::plane::Plane::owned(vec![0; w * h]),
-            cb: crate::plane::Plane::owned(vec![0; cw * ch]),
-            cr: crate::plane::Plane::owned(vec![0; cw * ch]),
+            y: crate::plane::Plane::owned(try_vec![0; w * h, "decoded luma plane"]),
+            cb: crate::plane::Plane::owned(try_vec![0; cw * ch, "decoded Cb plane"]),
+            cr: crate::plane::Plane::owned(try_vec![0; cw * ch, "decoded Cr plane"]),
             w,
             h,
             cw,
@@ -469,20 +467,44 @@ impl FullDecoder<'static> {
             sub_h,
             sub_w_div: FastDivU32::new(sub_w as u32),
             sub_h_div: FastDivU32::new(sub_h as u32),
-            mode_y: crate::plane::Plane::owned(vec![MODE_DC; grid_w * grid_h]),
-            decoded: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            tqb: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            pcm: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            bs_v: crate::plane::Plane::owned(vec![0u8; grid_w * grid_h]),
-            bs_h: crate::plane::Plane::owned(vec![0u8; grid_w * grid_h]),
-            nz_coeff: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            tu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            tu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            pu_edge_v: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            pu_edge_h: crate::plane::Plane::owned(vec![false; grid_w * grid_h]),
-            slice_idx: crate::plane::Plane::owned(vec![0u16; grid_w * grid_h]),
+            mode_y: crate::plane::Plane::owned(
+                try_vec![MODE_DC; grid_w * grid_h, "intra mode map"],
+            ),
+            decoded: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            tqb: crate::plane::Plane::owned(try_vec![false; grid_w * grid_h, "decoder block map"]),
+            pcm: crate::plane::Plane::owned(try_vec![false; grid_w * grid_h, "decoder block map"]),
+            edge_v: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            edge_h: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            bs_v: crate::plane::Plane::owned(
+                try_vec![0u8; grid_w * grid_h, "deblock strength map"],
+            ),
+            bs_h: crate::plane::Plane::owned(
+                try_vec![0u8; grid_w * grid_h, "deblock strength map"],
+            ),
+            nz_coeff: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            tu_edge_v: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            tu_edge_h: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            pu_edge_v: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            pu_edge_h: crate::plane::Plane::owned(
+                try_vec![false; grid_w * grid_h, "decoder block map"],
+            ),
+            slice_idx: crate::plane::Plane::owned(
+                try_vec![0u16; grid_w * grid_h, "slice ownership map"],
+            ),
             cur_slice_idx: 1,
             // Index 0 unused; index 1 is the first (independent) slice.
             slice_lf_across: vec![
@@ -497,15 +519,11 @@ impl FullDecoder<'static> {
                     disabled: hdr.deblocking_disabled,
                     beta_offset_div2: hdr.beta_offset_div2,
                     tc_offset_div2: hdr.tc_offset_div2,
-                    cb_qp_offset: hdr.cb_qp_offset,
-                    cr_qp_offset: hdr.cr_qp_offset,
                 },
                 SliceDeblock {
                     disabled: hdr.deblocking_disabled,
                     beta_offset_div2: hdr.beta_offset_div2,
                     tc_offset_div2: hdr.tc_offset_div2,
-                    cb_qp_offset: hdr.cb_qp_offset,
-                    cr_qp_offset: hdr.cr_qp_offset,
                 },
             ],
             cu_tqb: false,
@@ -516,12 +534,14 @@ impl FullDecoder<'static> {
             cu_intra_y0: 0,
             cu_intra_pu: 64,
             cur_tu_rdpcm: None,
-            ct_depth: crate::plane::Plane::owned(vec![0; grid_w * grid_h]),
+            ct_depth: crate::plane::Plane::owned(try_vec![0; grid_w * grid_h, "coding depth map"]),
             grid_w,
             grid_h,
             slice_qp,
             qp_y_prev: slice_qp,
-            qp_y_map: crate::plane::Plane::owned(vec![slice_qp as i16; grid_w * grid_h]),
+            qp_y_map: crate::plane::Plane::owned(
+                try_vec![slice_qp as i16; grid_w * grid_h, "QP map"],
+            ),
             cu_qp_delta_val: 0,
             is_cu_qp_delta_coded: false,
             is_cu_chroma_qp_offset_coded: false,
@@ -531,7 +551,9 @@ impl FullDecoder<'static> {
             log2_qg,
             log2_chroma_qp_offset,
             cur_qp: slice_qp,
-            sao: crate::plane::Plane::owned(vec![SaoCtb::default(); ctb_cols * ctb_rows]),
+            sao: crate::plane::Plane::owned(
+                try_vec![SaoCtb::default(); ctb_cols * ctb_rows, "SAO CTB map"],
+            ),
             ctb_cols,
             ctb_rows,
             sao_luma,
@@ -562,7 +584,9 @@ impl FullDecoder<'static> {
             slice_type: hdr.slice_type,
             cabac_init: hdr.cabac_init,
             pred_weights: hdr.pred_weights.clone(),
-            motion: crate::plane::Plane::owned(vec![MotionInfo::intra(); grid_w * grid_h]),
+            motion: crate::plane::Plane::owned(
+                try_vec![MotionInfo::intra(); grid_w * grid_h, "motion map"],
+            ),
             ref_list0: Vec::new(),
             ref_list1: Vec::new(),
             cur_poc: 0,
@@ -573,7 +597,7 @@ impl FullDecoder<'static> {
             cur_cu_inter: false,
             _curr_pic_ref_active: sps.curr_pic_ref_enabled && pps.curr_pic_ref_enabled,
             last_pu_merge: false,
-            cu_skip_map: vec![false; grid_w * grid_h],
+            cu_skip_map: try_vec![false; grid_w * grid_h, "CU skip map"],
             collocated_from_l0: hdr.collocated_from_l0,
             collocated_ref_idx: hdr.collocated_ref_idx,
             ref_frames: Vec::new(),
@@ -725,8 +749,6 @@ impl<'cab> FullDecoder<'cab> {
                 disabled: hdr.deblocking_disabled,
                 beta_offset_div2: hdr.beta_offset_div2,
                 tc_offset_div2: hdr.tc_offset_div2,
-                cb_qp_offset: hdr.cb_qp_offset,
-                cr_qp_offset: hdr.cr_qp_offset,
             };
             if self.slice_deblock.len() <= idx {
                 self.slice_deblock.resize(idx + 1, this_deblock);
@@ -1109,7 +1131,7 @@ impl<'cab> FullDecoder<'cab> {
         if self.tiles.is_some() {
             return self.decode_slice_tiled(start_ctb, cabac_and_starts);
         }
-        self.decode_slice_raster(start_ctb)
+        self.decode_slice_raster(start_ctb, cabac_and_starts)
     }
 
     /// Tile-scan CTB decode. Advances through tile-scan addresses `ts`, mapping
@@ -1155,6 +1177,19 @@ impl<'cab> FullDecoder<'cab> {
                 dec.cab.reinit_engine();
             }
         };
+
+        // A slice segment that begins at a tile boundary re-initializes the CABAC
+        // contexts at that tile start (§9.3.2.2). The arithmetic engine is already
+        // positioned at the segment's sub-stream 0 by the caller. An independent
+        // segment was reset by `decode_segment`, but a *dependent* segment whose
+        // first CTB is a tile start would otherwise inherit the previous segment's
+        // contexts — the tiled analogue of the WPP dependent-segment reset. The
+        // main loop's `new_substream` gate excludes this first CTB (`ts !=
+        // start_ts`), so handle it here.
+        if grid.is_tile_start_rs(start_ctb) {
+            self.reinit_slice_contexts();
+            self.qp_y_prev = self.slice_qp;
+        }
 
         let mut ts = start_ts;
         while ts < total {
@@ -1264,46 +1299,95 @@ impl<'cab> FullDecoder<'cab> {
         self.palette_predictor.reset_from(&init, num_comps);
     }
 
-    fn decode_slice_raster(&mut self, start_ctb: usize) -> Result<(), DecodeError> {
-        let _ctb = 1usize << self.log2_ctb;
+    fn decode_slice_raster(
+        &mut self,
+        start_ctb: usize,
+        cabac_and_starts: Option<(&[u8], &[usize])>,
+    ) -> Result<(), DecodeError> {
+        let ctb = 1usize << self.log2_ctb;
         let wpp = self.pps.entropy_coding_sync_enabled;
-        let total = self.ctb_cols * self.ctb_rows;
+        let cols = self.ctb_cols;
+        let total = cols * self.ctb_rows;
         let start_ctb = start_ctb.min(total);
 
-        let start_ry = start_ctb.checked_div(self.ctb_cols).unwrap_or(0);
-        let start_rx0 = if self.ctb_cols == 0 {
-            0
-        } else {
-            start_ctb % self.ctb_cols
+        let start_ry = start_ctb.checked_div(cols).unwrap_or(0);
+        let start_rx0 = if cols == 0 { 0 } else { start_ctb % cols };
+
+        // `sub_starts[i]` is the RBSP offset (relative to the CABAC payload) of
+        // WPP sub-stream `i` within this slice segment; index 0 is 0. A WPP slice
+        // segment that spans more than one CTB row always carries the matching
+        // entry points, so when they are present we position the arithmetic
+        // engine exactly at each row's sub-stream. This is robust against a
+        // desynced end_of_sub_stream, which the previous byte-alignment approach
+        // could not recover from once a single CTB parsed the wrong bin count.
+        let empty: &[usize] = &[];
+        let sub_starts: &[usize] = cabac_and_starts.map(|(_, s)| s).unwrap_or(empty);
+        let have_entries = wpp && !sub_starts.is_empty();
+
+        // Seek the arithmetic engine to the start of sub-stream `substream`.
+        // Returns whether the reposition succeeded.
+        let seek = |dec: &mut Self, substream: usize| -> bool {
+            cabac_and_starts.is_some_and(|(cabac, _)| {
+                sub_starts.get(substream).is_some_and(|&off| {
+                    off <= cabac.len() && dec.cab.reset_with(&cabac[off..]).is_ok()
+                })
+            })
         };
 
-        for ry in start_ry..self.ctb_rows {
-            // WPP: at start of every non-first row, restore saved contexts and
-            // reinitialize the CABAC engine from the current stream position
-            // (which the previous row's sub-stream end already byte-aligned to).
-            if wpp && ry > start_ry {
-                if let (Some(ctx), Some(ictx)) = (
-                    self.wpp_ctx_snap[ry - 1].take(),
-                    self.wpp_ictx_snap[ry - 1].take(),
-                ) {
-                    self.ctx = ctx;
-                    self.ictx = ictx;
-                    if let Some(pal) = self.wpp_palette_snap[ry - 1].take() {
-                        self.palette_predictor = pal;
-                    }
-                    if let Some(pc) = self.wpp_pctx_snap[ry - 1].take() {
-                        self.pctx = pc;
-                    }
-                }
-                self.cab.reinit_engine();
-            }
+        // Sub-stream 0 is where the slice segment's CABAC payload starts (already
+        // positioned by the caller); each later CTB row is the next sub-stream.
+        let mut substream = 0usize;
 
+        for ry in start_ry..self.ctb_rows {
             // Only the first row of this segment starts at its column offset;
             // subsequent rows start at column 0.
             let rx_start = if ry == start_ry { start_rx0 } else { 0 };
 
+            // The first column of every CTB row after the segment's first begins a
+            // new WPP sub-stream: seek/realign the arithmetic engine to it.
+            if wpp && ry > start_ry {
+                substream += 1;
+                if !(have_entries && seek(self, substream)) {
+                    // No usable entry point: fall back to the byte-aligned engine
+                    // reinit set up by the previous row's end_of_sub_stream.
+                    self.cab.reinit_engine();
+                }
+            }
+
+            // At the first CTB of every CTB row (ry > 0): §9.3.2.2 re-initializes
+            // the context models afresh, then §9.3.2.5 *overrides* them with the
+            // model saved after the 2nd CTB of the row above when that CTB exists
+            // and belongs to the same slice. Doing the fresh init here (rather than
+            // only in the sub-stream block above) also covers a *dependent* slice
+            // segment that begins at a row boundary: with a same-slice sync source
+            // it inherits the row above; without one (e.g. a 1-CTB-wide picture,
+            // where no upper-right CTB exists) it correctly restarts from the
+            // fresh init instead of the previous segment's final state.
+            if wpp && ry > 0 && rx_start == 0 {
+                self.reinit_slice_contexts();
+                self.qp_y_prev = self.slice_qp;
+                let ur_ok = cols > 1
+                    && (self.cur_slice_idx <= 1
+                        || self.slice_idx_at(ctb, (ry - 1) * ctb) == self.cur_slice_idx);
+                if ur_ok
+                    && let (Some(c), Some(ic)) = (
+                        self.wpp_ctx_snap[ry - 1].clone(),
+                        self.wpp_ictx_snap[ry - 1],
+                    )
+                {
+                    self.ctx = c;
+                    self.ictx = ic;
+                    if let Some(pal) = self.wpp_palette_snap[ry - 1].clone() {
+                        self.palette_predictor = pal;
+                    }
+                    if let Some(pc) = self.wpp_pctx_snap[ry - 1] {
+                        self.pctx = pc;
+                    }
+                }
+            }
+
             let mut terminated = false;
-            for rx in rx_start..self.ctb_cols {
+            for rx in rx_start..cols {
                 let end = self.decode_one_ctb(rx, ry, wpp);
                 if end {
                     // end_of_slice_segment_flag: this slice segment is complete.
@@ -1316,10 +1400,10 @@ impl<'cab> FullDecoder<'cab> {
                 break;
             }
 
-            // WPP: after the last CTB of each non-final row, the stream contains
-            // an end_of_sub_stream_one_bit (= 1), then byte-alignment padding,
-            // then the next row's sub-stream starts.
-            if wpp && ry < self.ctb_rows - 1 {
+            // Without entry points the sub-streams are decoded contiguously: after
+            // the last CTB of each non-final row consume end_of_sub_stream_one_bit
+            // (= 1) and the byte-alignment padding before the next row.
+            if wpp && !have_entries && ry < self.ctb_rows - 1 {
                 let eoss = self.cab.decode_terminate();
                 if eoss != 1 {
                     return Err(DecodeError::Bitstream(
@@ -1341,7 +1425,7 @@ impl<'cab> FullDecoder<'cab> {
         &mut self,
         deblock_pool: Option<&crate::threadpool::ThreadPool>,
         sao_pool: Option<&crate::threadpool::ThreadPool>,
-    ) -> YuvPlanes {
+    ) -> Result<YuvPlanes, DecodeError> {
         // In-loop filters run in HEVC order: deblocking first, then SAO. They
         // are independently gated: deblocking runs unless it is disabled (PPS or
         // a slice-level override), while SAO runs only when the SPS enables it.
@@ -1377,12 +1461,12 @@ impl<'cab> FullDecoder<'cab> {
             let restricted = self.sao_boundary_restricted();
             match sao_pool {
                 Some(p) if p.threads() > 1 && self.ctb_rows > 1 && !restricted => {
-                    self.apply_sao_parallel(p)
+                    self.apply_sao_parallel(p)?
                 }
-                _ => self.apply_sao(),
+                _ => self.apply_sao()?,
             }
         }
-        YuvPlanes {
+        Ok(YuvPlanes {
             y: self.y.take_vec(),
             cb: self.cb.take_vec(),
             cr: self.cr.take_vec(),
@@ -1390,7 +1474,18 @@ impl<'cab> FullDecoder<'cab> {
             height: self.h,
             chroma: self.sps.chroma,
             bit_depth: self.sps.bit_depth().unwrap_or(BitDepth::Eight),
-        }
+        })
+    }
+
+    /// Finish a still-picture decode in the sample type exposed by the HEIC
+    /// YUV API. The prediction/filter pipeline remains `u16`; 8-bit output
+    /// is narrowed exactly once while ownership leaves the decoder.
+    pub(crate) fn finish_native_with(
+        &mut self,
+        deblock_pool: Option<&crate::threadpool::ThreadPool>,
+        sao_pool: Option<&crate::threadpool::ThreadPool>,
+    ) -> Result<crate::yuv::NativeYuvPlanes, DecodeError> {
+        self.finish_with(deblock_pool, sao_pool)?.into_native()
     }
 
     fn parse_sao(&mut self, rx: usize, ry: usize) {
@@ -1525,8 +1620,6 @@ impl<'cab> FullDecoder<'cab> {
             bd_c: self.bd_c,
             beta_offset: self.beta_offset_div2 * 2,
             tc_offset: self.tc_offset_div2 * 2,
-            qp_bd_offset_y: 6 * (self.bd as i32 - 8),
-            qp_bd_offset_c: 6 * (self.bd_c as i32 - 8),
             default_qp: self.slice_qp as i16,
             log2_ctb: self.log2_ctb,
             qp_y_map: &self.qp_y_map[..],
@@ -1596,15 +1689,12 @@ impl<'cab> FullDecoder<'cab> {
     /// `(pxq, pyq)` may be filtered given slice/tile/PCM/TQB exemptions.
     #[inline]
     fn filter_across_boundary(&self, pxp: usize, pyp: usize, pxq: usize, pyq: usize) -> bool {
-        // Transquant-bypass (lossless) blocks are never deblocked on the side
-        // that is bypass (§8.7.2 restore_tqb behavior ≈ skip).
-        if self.tqb_at(pxp, pyp) || self.tqb_at(pxq, pyq) {
-            return false;
-        }
-        // I_PCM blocks are exempt when pcm_loop_filter_disabled_flag is set.
-        if self.sps.pcm_loop_filter_disabled && (self.pcm_at(pxp, pyp) || self.pcm_at(pxq, pyq)) {
-            return false;
-        }
+        // Transquant-bypass and I_PCM (with pcm_loop_filter_disabled) samples are
+        // *not* removed from the edge here: §8.7.2.5.7 filters the edge normally
+        // using the reconstructed samples and only substitutes the exempt side's
+        // output back with its input. That per-sample restore is applied after
+        // each deblock pass in `apply_deblocking`, so the *non-exempt* neighbour
+        // still gets filtered (which a whole-edge skip would wrongly suppress).
         // Cross-slice filtering: disabled when the current (q-side) slice's
         // slice_loop_filter_across_slices_enabled_flag is 0 and the two sides
         // are in different slices (§8.7.1). The flag is per-slice, so consult
@@ -1637,17 +1727,6 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     #[inline]
-    fn pcm_at(&self, px: usize, py: usize) -> bool {
-        if px >= self.w || py >= self.h {
-            return false;
-        }
-        self.grid_idx(px, py)
-            .and_then(|g| self.pcm.get(g))
-            .copied()
-            .unwrap_or(false)
-    }
-
-    #[inline]
     fn slice_idx_at(&self, px: usize, py: usize) -> u16 {
         if px >= self.w || py >= self.h {
             return 0;
@@ -1668,8 +1747,6 @@ impl<'cab> FullDecoder<'cab> {
                 disabled: self.deblocking_disabled,
                 beta_offset_div2: self.beta_offset_div2,
                 tc_offset_div2: self.tc_offset_div2,
-                cb_qp_offset: self.slice_cb_qp_offset,
-                cr_qp_offset: self.slice_cr_qp_offset,
             })
     }
 
@@ -1696,10 +1773,13 @@ impl<'cab> FullDecoder<'cab> {
 
         // Deblocking offsets and the disabled flag are per-slice; they are
         // resolved per edge from the q-side sample's owning slice (§8.7.2).
-        // HEVC §8.7.2.3: table indices use QP′ = QP + QpBdOffset where
-        // QpBdOffset = 6*(BitDepth−8).  For 8-bit this is 0; for 10-bit it's 12.
-        let qp_bd_offset_y = 6 * (self.bd as i32 - 8);
-        let qp_bd_offset_c = 6 * (self.bd_c as i32 - 8);
+        // §8.7.2.5.3/§8.7.2.5.5: β′ and tC′ are read from the tables at Q = qPL
+        // (plus the slice offsets) — QpBdOffset is *not* added to the table index
+        // — and the results are then scaled to the sample bit depth:
+        // β = β′ << (BitDepthY−8), tC = tC′ << (BitDepthY−8). For 8-bit both the
+        // (absent) offset and this shift are zero, so the common path is unchanged.
+        let bd_shift = (self.bd - 8) as u32;
+        let bd_shift_c = (self.bd_c - 8) as u32;
 
         // QP for dequantization (per 4×4 grid). For intra-only all Bs=2.
         // We use the CTB average QP — approximation good enough.
@@ -1726,6 +1806,72 @@ impl<'cab> FullDecoder<'cab> {
                 .and_then(|idx| qp_map.get(idx))
                 .copied()
                 .unwrap_or(default_qp) as i32
+        };
+
+        // §8.7.2.5.7 / §8.7.3.1: samples of a transquant-bypass CU, or of an
+        // I_PCM CU when pcm_loop_filter_disabled_flag is set, are exempt from the
+        // in-loop filters — their filtered value is replaced by the input value.
+        // Because a min-size CU (8×8) is wider than the filter reach (≤3) and
+        // edges are 8-aligned, an exempt CU covers a whole side of any edge, so a
+        // per-4×4-cell restore after each pass reproduces the per-sample rule
+        // while letting the non-exempt neighbour filter normally. The snapshot and
+        // the per-cell mask are only built when some CU is actually exempt, so the
+        // common (no-PCM, no-TQB) picture pays nothing.
+        let suppress_active = self.tqb.iter().any(|&b| b)
+            || (self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b));
+        let supp: Vec<bool> = if suppress_active {
+            (0..gw * gh)
+                .map(|g| {
+                    self.tqb.get(g).copied().unwrap_or(false)
+                        || (self.sps.pcm_loop_filter_disabled
+                            && self.pcm.get(g).copied().unwrap_or(false))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let snap_y = suppress_active.then(|| self.y[..].to_vec());
+        let snap_cb = suppress_active.then(|| self.cb[..].to_vec());
+        let snap_cr = suppress_active.then(|| self.cr[..].to_vec());
+
+        // Restore exempt luma samples (whole 4×4 cells) from the pre-deblock
+        // snapshot. Called after each luma pass so the next pass reads the
+        // unfiltered values for exempt samples.
+        let restore_luma = |plane: &mut [u16], snap: &[u16], supp: &[bool]| {
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    if !supp[gy * gw + gx] {
+                        continue;
+                    }
+                    for dy in 0..4 {
+                        let y = gy * 4 + dy;
+                        if y >= h {
+                            break;
+                        }
+                        for dx in 0..4 {
+                            let x = gx * 4 + dx;
+                            if x >= w {
+                                break;
+                            }
+                            plane[y * w + x] = snap[y * w + x];
+                        }
+                    }
+                }
+            }
+        };
+        // As `restore_luma`, but mapping chroma pixels back to the luma 4×4 grid
+        // through the subsampling factors.
+        let restore_chroma = |plane: &mut [u16], snap: &[u16], supp: &[bool]| {
+            for cy in 0..ch {
+                let ly = cy * self.sub_h;
+                for cx in 0..cw {
+                    let lx = cx * self.sub_w;
+                    let g = (ly / 4) * gw + (lx / 4);
+                    if supp.get(g).copied().unwrap_or(false) {
+                        plane[cy * cw + cx] = snap[cy * cw + cx];
+                    }
+                }
+            }
         };
 
         // Vertical edges first (filter across columns), then horizontal.
@@ -1773,12 +1919,10 @@ impl<'cab> FullDecoder<'cab> {
                         let qp_p = qp_at(&self.qp_y_map[..], edge - 1, mid);
                         let qp_q = qp_at(&self.qp_y_map[..], edge, mid);
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
-                        let beta_prime = (avg_qp + qp_bd_offset_y + beta_offset).clamp(0, 51);
-                        let tc_prime =
-                            (avg_qp + qp_bd_offset_y + 2 * (bs_v as i32 - 1) + tc_offset)
-                                .clamp(0, 53);
-                        let beta = BETA[beta_prime as usize];
-                        let tc = TC[tc_prime as usize];
+                        let beta_prime = (avg_qp + beta_offset).clamp(0, 51);
+                        let tc_prime = (avg_qp + 2 * (bs_v as i32 - 1) + tc_offset).clamp(0, 53);
+                        let beta = BETA[beta_prime as usize] << bd_shift;
+                        let tc = TC[tc_prime as usize] << bd_shift;
                         if tc == 0 {
                             scan += 4;
                             continue;
@@ -1820,12 +1964,10 @@ impl<'cab> FullDecoder<'cab> {
                         let qp_p = qp_at(&self.qp_y_map[..], mid, edge - 1);
                         let qp_q = qp_at(&self.qp_y_map[..], mid, edge);
                         let avg_qp = (qp_p + qp_q + 1) >> 1;
-                        let beta_prime = (avg_qp + qp_bd_offset_y + beta_offset).clamp(0, 51);
-                        let tc_prime =
-                            (avg_qp + qp_bd_offset_y + 2 * (bs_h as i32 - 1) + tc_offset)
-                                .clamp(0, 53);
-                        let beta = BETA[beta_prime as usize];
-                        let tc = TC[tc_prime as usize];
+                        let beta_prime = (avg_qp + beta_offset).clamp(0, 51);
+                        let tc_prime = (avg_qp + 2 * (bs_h as i32 - 1) + tc_offset).clamp(0, 53);
+                        let beta = BETA[beta_prime as usize] << bd_shift;
+                        let tc = TC[tc_prime as usize] << bd_shift;
                         if tc == 0 {
                             scan += 4;
                             continue;
@@ -1852,6 +1994,11 @@ impl<'cab> FullDecoder<'cab> {
                     }
                 }
                 edge += edge_step;
+            }
+            // Substitute exempt luma samples back before the next pass reads them
+            // (and after the final pass, before SAO).
+            if let Some(snap) = &snap_y {
+                restore_luma(&mut self.y[..], snap, &supp);
             }
         }
 
@@ -1909,16 +2056,19 @@ impl<'cab> FullDecoder<'cab> {
                     let avg_qp_l = (qp_p_l + qp_q_l + 1) >> 1;
 
                     for plane in 0..2usize {
-                        // PPS offset plus this slice's Cb/Cr offset (§8.6.1),
-                        // matching the reconstruction path.
+                        // cQpPicOffset (§8.7.2.5.5): the *picture*-level chroma QP
+                        // offset only — pps_cb/cr_qp_offset. The spec deliberately
+                        // excludes slice_cb/cr_qp_offset (and the CU offset) here so
+                        // the deblock chroma QP stays constant within the picture,
+                        // unlike the reconstruction path which adds them.
                         let cqp_offset = if plane == 0 {
-                            self.pps.cb_qp_offset + sd.cb_qp_offset
+                            self.pps.cb_qp_offset
                         } else {
-                            self.pps.cr_qp_offset + sd.cr_qp_offset
+                            self.pps.cr_qp_offset
                         };
                         let qp_c = qpc(avg_qp_l + cqp_offset, self.sps.chroma_idc, self.bd_c);
-                        let tc_prime_c = (qp_c + qp_bd_offset_c + 2 + tc_offset).clamp(0, 53);
-                        let tc_c = TC[tc_prime_c as usize];
+                        let tc_prime_c = (qp_c + 2 + tc_offset).clamp(0, 53);
+                        let tc_c = TC[tc_prime_c as usize] << bd_shift_c;
                         if tc_c == 0 {
                             continue;
                         }
@@ -1963,23 +2113,34 @@ impl<'cab> FullDecoder<'cab> {
                 }
                 edge += edge_step;
             }
+            // Substitute exempt chroma samples back after each chroma pass.
+            if let (Some(scb), Some(scr)) = (&snap_cb, &snap_cr) {
+                restore_chroma(&mut self.cb[..], scb, &supp);
+                restore_chroma(&mut self.cr[..], scr, &supp);
+            }
         }
     }
 
     /// Parallel SAO: flatten per-CTB params and dispatch CTB-row bands across
     /// the pool. Bit-identical to [`Self::apply_sao`]; see
     /// [`crate::sao::apply_sao_parallel`].
-    fn apply_sao_parallel(&mut self, pool: &crate::threadpool::ThreadPool) {
-        let params: Vec<crate::sao::SaoCtbParams> = self
-            .sao
-            .iter()
-            .map(|s| crate::sao::SaoCtbParams {
-                type_idx: s.type_idx,
-                offsets: s.offsets,
-                band_pos: s.band_pos,
-                eo_class: s.eo_class,
-            })
-            .collect();
+    fn apply_sao_parallel(
+        &mut self,
+        pool: &crate::threadpool::ThreadPool,
+    ) -> Result<(), DecodeError> {
+        let mut params = try_vec![
+            crate::sao::SaoCtbParams::default();
+            self.sao.len(),
+            "parallel SAO parameter map"
+        ];
+        for (dst, src) in params.iter_mut().zip(self.sao.iter()) {
+            *dst = crate::sao::SaoCtbParams {
+                type_idx: src.type_idx,
+                offsets: src.offsets,
+                band_pos: src.band_pos,
+                eo_class: src.eo_class,
+            };
+        }
         let ctx = crate::sao::SaoPlanesCtx {
             exec: self.exec.clone(),
             params: &params,
@@ -2000,10 +2161,11 @@ impl<'cab> FullDecoder<'cab> {
         let y = self.y.take_vec();
         let cb = self.cb.take_vec();
         let cr = self.cr.take_vec();
-        let (y, cb, cr) = crate::sao::apply_sao_parallel(pool, &ctx, y, cb, cr);
+        let (y, cb, cr) = crate::sao::apply_sao_parallel(pool, &ctx, y, cb, cr)?;
         self.y = crate::plane::Plane::owned(y);
         self.cb = crate::plane::Plane::owned(cb);
         self.cr = crate::plane::Plane::owned(cr);
+        Ok(())
     }
 
     fn sao_usage(&self) -> ([bool; 3], [bool; 3]) {
@@ -2063,23 +2225,45 @@ impl<'cab> FullDecoder<'cab> {
             pcm: &self.pcm[..],
             loop_filter_across_slices: self.pps.loop_filter_across_slices
                 && self.slice_lf_across.iter().all(|&f| f),
+            loop_filter_across_tiles: self
+                .tiles
+                .as_ref()
+                .is_none_or(|g| g.loop_filter_across_tiles),
             pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
             tile_grid: self.tiles.as_ref(),
         }
     }
 
-    fn apply_sao(&mut self) {
+    fn apply_sao(&mut self) -> Result<(), DecodeError> {
         let ctb = 1usize << self.log2_ctb;
         let (active, needs_src) = self.sao_usage();
         if !active.iter().any(|&x| x) {
-            return;
+            return Ok(());
         }
 
         // Only EO needs an untouched source snapshot. BO is pointwise and can
         // run in place, avoiding full-plane clones for common BO-only pictures.
-        let orig_y = needs_src[0].then(|| self.y.to_vec_clone());
-        let orig_cb = needs_src[1].then(|| self.cb.to_vec_clone());
-        let orig_cr = needs_src[2].then(|| self.cr.to_vec_clone());
+        let orig_y = if needs_src[0] {
+            let mut snapshot = try_vec![0u16; self.y.len(), "SAO luma snapshot"];
+            snapshot.copy_from_slice(&self.y);
+            Some(snapshot)
+        } else {
+            None
+        };
+        let orig_cb = if needs_src[1] {
+            let mut snapshot = try_vec![0u16; self.cb.len(), "SAO Cb snapshot"];
+            snapshot.copy_from_slice(&self.cb);
+            Some(snapshot)
+        } else {
+            None
+        };
+        let orig_cr = if needs_src[2] {
+            let mut snapshot = try_vec![0u16; self.cr.len(), "SAO Cr snapshot"];
+            snapshot.copy_from_slice(&self.cr);
+            Some(snapshot)
+        } else {
+            None
+        };
 
         let restricted = self.sao_boundary_restricted();
         // Take the planes out so the boundary map borrows (slice_idx/tqb/pcm/
@@ -2091,7 +2275,29 @@ impl<'cab> FullDecoder<'cab> {
         let (w, h, cw, ch) = (self.w, self.h, self.cw, self.ch);
         let (bd, bd_c) = (self.bd, self.bd_c);
         let (sub_w, sub_h) = (self.sub_w, self.sub_h);
+        let (gw, gh) = (self.grid_w, self.grid_h);
         let exec = self.exec.clone();
+
+        // §8.7.3.1: transquant-bypass CUs, and I_PCM CUs when
+        // pcm_loop_filter_disabled, are exempt from SAO. Snapshot the exempt
+        // sample values before filtering and substitute them back afterwards;
+        // the gated edge-offset kernel already leaves an exempt centre untouched,
+        // but the pointwise band-offset kernel does not, so the revert makes both
+        // uniform. Only built when a CU is actually exempt.
+        let sao_suppress = self.tqb.iter().any(|&b| b)
+            || (self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b));
+        let (sao_supp, sao_snap_y, sao_snap_cb, sao_snap_cr) = if sao_suppress {
+            let supp: Vec<bool> = (0..gw * gh)
+                .map(|g| {
+                    self.tqb.get(g).copied().unwrap_or(false)
+                        || (self.sps.pcm_loop_filter_disabled
+                            && self.pcm.get(g).copied().unwrap_or(false))
+                })
+                .collect();
+            (supp, y.clone(), cb.clone(), cr.clone())
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
 
         for ry in 0..self.ctb_rows {
             for rx in 0..self.ctb_cols {
@@ -2222,9 +2428,47 @@ impl<'cab> FullDecoder<'cab> {
                 }
             }
         }
+        if sao_suppress {
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    if !sao_supp[gy * gw + gx] {
+                        continue;
+                    }
+                    for dy in 0..4 {
+                        let ly = gy * 4 + dy;
+                        if ly >= h {
+                            break;
+                        }
+                        for dx in 0..4 {
+                            let lx = gx * 4 + dx;
+                            if lx >= w {
+                                break;
+                            }
+                            y[ly * w + lx] = sao_snap_y[ly * w + lx];
+                        }
+                    }
+                }
+            }
+            // Chroma: an exempt luma CU covers the co-located chroma samples.
+            for cy in 0..ch {
+                let ly = cy * sub_h;
+                for cx in 0..cw {
+                    let lx = cx * sub_w;
+                    if sao_supp
+                        .get((ly / 4) * gw + (lx / 4))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        cb[cy * cw + cx] = sao_snap_cb[cy * cw + cx];
+                        cr[cy * cw + cx] = sao_snap_cr[cy * cw + cx];
+                    }
+                }
+            }
+        }
         self.y = crate::plane::Plane::owned(y);
         self.cb = crate::plane::Plane::owned(cb);
         self.cr = crate::plane::Plane::owned(cr);
+        Ok(())
     }
 
     fn coding_quadtree(&mut self, x0: usize, y0: usize, log2_cb: u32, depth: u8) {
@@ -2555,8 +2799,11 @@ impl<'cab> FullDecoder<'cab> {
             }
         }
 
-        // Re-prime the arithmetic engine from the now byte-aligned position.
-        self.cab.reinit_engine();
+        // Raw fixed-length reads refill the reservoir in whole-byte batches.
+        // Return any prefetched, unconsumed bytes before clearing it; otherwise
+        // reinitialisation skips CABAC bytes following the PCM block. The PCM
+        // sample count is byte-aligned by construction.
+        self.cab.reinit_after_pcm();
 
         // Bookkeeping: I_PCM CUs are intra (mode irrelevant for prediction but
         // needed for neighbor availability), lossless-like for the deblocking
@@ -2913,17 +3160,6 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    /// cu_transquant_bypass_flag at a luma pixel (4×4 grid). Out-of-range → false.
-    fn tqb_at(&self, px: usize, py: usize) -> bool {
-        if px >= self.w || py >= self.h {
-            return false;
-        }
-        self.grid_idx(px, py)
-            .and_then(|g| self.tqb.get(g))
-            .copied()
-            .unwrap_or(false)
-    }
-
     fn derive_luma_mode(&self, x0: usize, y0: usize, prev: bool, val: u8) -> u8 {
         let cand_a = self.neighbor_mode(x0 as i32 - 1, y0 as i32, true);
         let cand_b = self.neighbor_mode(x0 as i32, y0 as i32 - 1, false);
@@ -3072,7 +3308,19 @@ impl<'cab> FullDecoder<'cab> {
         let mut cbf_cb = parent_cbf_cb;
         let mut cbf_cr = parent_cbf_cr;
         if chroma_present && (log2_ts > 2 || self.sps.chroma_idc == 3) {
+            // For 4:2:2 (ChromaArrayType==2) the second, lower stacked chroma TB
+            // has its own cbf, but that bin is only present at this node when the
+            // transform does not split further, or at log2TrafoSize==3 (where luma
+            // splits to 4×4 but the chroma stays as two stacked 4×4). At a
+            // splitting node with log2TrafoSize>3 only the top cbf is coded and the
+            // lower slot mirrors it so the child nodes inherit the same presence
+            // gate (§7.3.8.8). Signaling the extra bin there desyncs CABAC.
+            let signal_second = self.sps.chroma_idc == 2 && (!split || log2_ts == 3);
             for t in 0..n_tb {
+                if t == 1 && !signal_second {
+                    cbf_cb[1] = cbf_cb[0];
+                    break;
+                }
                 if depth == 0 || parent_cbf_cb[t] {
                     cbf_cb[t] = self
                         .cab
@@ -3081,6 +3329,10 @@ impl<'cab> FullDecoder<'cab> {
                 }
             }
             for t in 0..n_tb {
+                if t == 1 && !signal_second {
+                    cbf_cr[1] = cbf_cr[0];
+                    break;
+                }
                 if depth == 0 || parent_cbf_cr[t] {
                     cbf_cr[t] = self
                         .cab
@@ -5351,8 +5603,12 @@ impl RowFactory {
             tu_edge_v: mkb(self.tu_edge_v),
             tu_edge_h: mkb(self.tu_edge_h),
             // WPP rows are intra I-slices with no inter PU edges.
-            pu_edge_v: crate::plane::Plane::owned(vec![false; self.grid_w * self.grid_h]),
-            pu_edge_h: crate::plane::Plane::owned(vec![false; self.grid_w * self.grid_h]),
+            pu_edge_v: crate::plane::Plane::owned(
+                try_vec![false; self.grid_w * self.grid_h, "WPP PU edge map"],
+            ),
+            pu_edge_h: crate::plane::Plane::owned(
+                try_vec![false; self.grid_w * self.grid_h, "WPP PU edge map"],
+            ),
             slice_idx: mku16(self.slice_idx),
             cur_slice_idx: 1,
             // WPP rows belong to a single slice; cross-slice filtering is not
@@ -5364,8 +5620,6 @@ impl RowFactory {
                     disabled: self.deblocking_disabled,
                     beta_offset_div2: self.beta_offset_div2,
                     tc_offset_div2: self.tc_offset_div2,
-                    cb_qp_offset: self.slice_cb_qp_offset,
-                    cr_qp_offset: self.slice_cr_qp_offset,
                 },
             ],
             cu_tqb: false,

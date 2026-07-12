@@ -42,7 +42,7 @@ use crate::yuv::YuvPlanes;
 /// conformance-window crop, the chroma format / bit depth, and the colour
 /// coefficients. Filled in from the active SPS when a frame is emitted.
 #[derive(Clone)]
-struct FrameMeta {
+pub(crate) struct FrameMeta {
     /// Conformance-window crop offsets in luma samples.
     crop_left: usize,
     crop_top: usize,
@@ -217,8 +217,11 @@ impl VideoFrame {
         let (sub_w, sub_h) = (self.meta.chroma.sub_w(), self.meta.chroma.sub_h());
         let (coded_w, coded_h) = self.planes.dims();
         let (coded_cw, coded_ch) = self.planes.chroma_dims();
-        let cw = dw.div_ceil(sub_w);
-        let ch = dh.div_ceil(sub_h);
+        let (cw, ch) = if self.meta.chroma.is_monochrome() {
+            (0, 0)
+        } else {
+            (dw.div_ceil(sub_w), dh.div_ceil(sub_h))
+        };
         let eight = self.meta.bit_depth == BitDepth::Eight;
 
         let y = crop_plane(&self.planes.y, coded_w, coded_h, cl, ct, dw, dh, eight);
@@ -614,7 +617,7 @@ impl VideoDecoder {
             self.outputs.push(VideoFrame {
                 planes: f.planes,
                 poc: f.poc,
-                meta: self.cur_meta.clone(),
+                meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
             });
         }
         // Pictures are already emitted in output order: the DPB bumps the
@@ -731,7 +734,7 @@ impl VideoDecoder {
                     .or_insert_with(|| VideoFrame {
                         planes: f.planes.clone(),
                         poc: f.poc,
-                        meta: self.cur_meta.clone(),
+                        meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                     });
             }
             if let Some(f) = self.seek_cache.gop_frames.get(&target_poc) {
@@ -748,7 +751,7 @@ impl VideoDecoder {
                 .or_insert(VideoFrame {
                     planes: f.planes,
                     poc: f.poc,
-                    meta: self.cur_meta.clone(),
+                    meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                 });
         }
         Ok(self.seek_cache.gop_frames.get(&target_poc).cloned())
@@ -1030,7 +1033,7 @@ impl VideoDecoder {
                 self.outputs.push(VideoFrame {
                     planes: f.planes,
                     poc: f.poc,
-                    meta: self.cur_meta.clone(),
+                    meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                 });
             }
         }
@@ -1074,6 +1077,7 @@ impl VideoDecoder {
         self.dpb.configure(
             sps.max_dec_pic_buffering as usize,
             sps.max_num_reorder_pics as usize,
+            sps.max_latency_pictures.map(|v| v as usize),
         );
 
         // Parse the first segment's header to set up picture-level state.
@@ -1096,7 +1100,6 @@ impl VideoDecoder {
             .get(1)
             .map(|b| (b & 0x07).wrapping_sub(1))
             .unwrap_or(0);
-
         // NoRaslOutputFlag: the leading (RASL) pictures of this IRAP cannot be
         // correctly decoded, so they are discarded. It is 1 for IDR/BLA, and for
         // a CRA only when it is the first picture of the stream or follows an
@@ -1136,6 +1139,13 @@ impl VideoDecoder {
             // begins a random-access decode) or emitted first. For IDR/BLA the
             // parsed flag applies directly.
             if no_rasl_output {
+                for f in self.dpb.bump_before_irap() {
+                    self.outputs.push(VideoFrame {
+                        planes: f.planes,
+                        poc: f.poc,
+                        meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
+                    });
+                }
                 let drop_prior = if is_cra {
                     true
                 } else {
@@ -1148,7 +1158,7 @@ impl VideoDecoder {
                         self.outputs.push(VideoFrame {
                             planes: f.planes,
                             poc: f.poc,
-                            meta: self.cur_meta.clone(),
+                            meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                         });
                     }
                 }
@@ -1173,6 +1183,19 @@ impl VideoDecoder {
         } else {
             None
         };
+
+        // §C.5.2.2 performs bumping before decoding the current picture. Doing
+        // it after insertion can output an IRAP before lower-POC RASL/RADL
+        // pictures that follow it in decoding order.
+        if !is_irap || !no_rasl_output {
+            for f in self.dpb.bump_before_decode() {
+                self.outputs.push(VideoFrame {
+                    planes: f.planes,
+                    poc: f.poc,
+                    meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
+                });
+            }
+        }
 
         // Reference lists (built once per picture from the first slice's RPS).
         // With curr_pic_ref (IBC) the current picture is appended to L0 as a
@@ -1318,19 +1341,24 @@ impl VideoDecoder {
         // Deblock/SAO once the whole picture is reconstructed, then store it.
         // Deblock runs serially (its parallel chroma kernel is not yet bit-exact
         // vs the serial reference); SAO runs on the pool.
-        let planes = d.finish_with(None, Some(&self.pool));
+        let planes = d.finish_with(None, Some(&self.pool))?;
         let (motion, width4, height4) = d.take_motion();
 
-        let is_ref = nal::is_reference(first_nal);
+        // §8.3.2: every decoded picture is marked "used for short-term reference"
+        // when decoded, regardless of NAL type — a sub-layer non-reference (`_N`)
+        // picture may still be referenced by a higher temporal sub-layer. The
+        // next picture's RPS performs the subsequent short/long-term marking.
         let frame = Frame {
             planes,
             poc,
             motion,
             width4,
             height4,
-            short_term: is_ref,
+            short_term: true,
             long_term: false,
             needed_for_output: hdr0.pic_output_flag,
+            latency: 0,
+            meta: Some(self.cur_meta.clone()),
         };
         self.dpb.push(frame);
         // Update prevTid0Pic (§8.3.1): only pictures with TemporalId 0 that are
@@ -1345,13 +1373,6 @@ impl VideoDecoder {
         self.first_picture = false;
         self.seen_first = true;
 
-        for f in self.dpb.bump(false) {
-            self.outputs.push(VideoFrame {
-                planes: f.planes,
-                poc: f.poc,
-                meta: self.cur_meta.clone(),
-            });
-        }
         Ok(())
     }
 
@@ -1509,5 +1530,39 @@ mod tests {
         assert_eq!(frame.signalled_color(), None);
         assert_eq!(frame.to_rgb8_gbr(), vec![10, 20, 30]);
         assert_eq!(frame.to_rgba8_gbr(), vec![10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn monochrome_yuv_has_no_chroma_planes() {
+        let frame = VideoFrame {
+            planes: YuvPlanes {
+                y: vec![1, 2, 3, 4],
+                cb: Vec::new(),
+                cr: Vec::new(),
+                width: 2,
+                height: 2,
+                chroma: ChromaFormat::Monochrome,
+                bit_depth: BitDepth::Eight,
+            },
+            poc: 0,
+            meta: FrameMeta {
+                crop_left: 0,
+                crop_top: 0,
+                disp_w: 2,
+                disp_h: 2,
+                chroma: ChromaFormat::Monochrome,
+                bit_depth: BitDepth::Eight,
+                color: Cicp::unspecified(),
+                color_description_present: false,
+                time_scale: 0,
+                num_units_in_tick: 0,
+            },
+        };
+
+        let yuv = frame.to_yuv();
+        assert_eq!(yuv.y.as_u8(), Some([1, 2, 3, 4].as_slice()));
+        assert!(yuv.cb.is_empty());
+        assert!(yuv.cr.is_empty());
+        assert_eq!((yuv.chroma_width, yuv.chroma_height), (0, 0));
     }
 }
