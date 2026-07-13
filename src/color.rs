@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn default_cicp_is_not_falsely_signalled_as_bt709() {
+    fn default_cicp_is_not_falsely_signaled_as_bt709() {
         assert_eq!(Cicp::default(), Cicp::unspecified());
     }
 

@@ -245,7 +245,7 @@ impl Dpb {
         }
 
         // Long-term references: resolve each to a DPB picture's POC. When the
-        // MSB cycle was signalled we can reconstruct the full POC (§8.3.2):
+        // MSB cycle was signaled we can reconstruct the full POC (§8.3.2):
         //   pocLt = cur_poc - deltaMsbCycle*MaxPocLsb - (cur_poc_lsb - pocLsbLt)
         // and match by full POC; otherwise only the LSB is known and we match by
         // LSB. `val` holds poc_lsb_lt and `delta_cycle` the MSB cycle.
