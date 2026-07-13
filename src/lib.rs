@@ -287,7 +287,7 @@ pub struct GainMap {
     pub cb: Option<SampleBuf>,
     /// Gain-map red-difference chroma samples. `None` for monochrome maps.
     pub cr: Option<SampleBuf>,
-    /// Chroma subsampling signalled by the gain-map HEVC SPS. The explicit
+    /// Chroma subsampling signaled by the gain-map HEVC SPS. The explicit
     /// chroma dimensions remain authoritative after display orientation; this
     /// matters for a 90°/270° rotation of a coded 4:2:2 map.
     pub chroma: ChromaFormat,
@@ -1299,7 +1299,7 @@ impl StillPictureOutput for U16StillPicture {
         decoder: &mut decode::FullDecoder<'_>,
         pool: Option<&threadpool::ThreadPool>,
     ) -> Result<Self::Planes, DecodeError> {
-        decoder.finish_with(None, pool)
+        decoder.finish_with(pool, pool)
     }
 }
 
@@ -1311,7 +1311,7 @@ impl StillPictureOutput for NativeStillPicture {
         decoder: &mut decode::FullDecoder<'_>,
         pool: Option<&threadpool::ThreadPool>,
     ) -> Result<Self::Planes, DecodeError> {
-        decoder.finish_native_with(None, pool)
+        decoder.finish_native_with(pool, pool)
     }
 }
 

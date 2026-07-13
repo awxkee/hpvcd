@@ -217,7 +217,21 @@ fn luma_filter8_avx2(
     let do_p1_mask = half(do_p1_lo, do_p1_hi);
     let do_q1_mask = half(do_q1_lo, do_q1_hi);
 
-    let p0s = clamp_i32x8(
+    // §8.7.2.5.4: each strongly-filtered sample is clipped to ±2·tc around its
+    // original value, then to the sample range. `strong_clip(v, orig)` folds both
+    // clamps by tightening [0, maxv] to [orig−2tc, orig+2tc]. Omitting the ±2·tc
+    // clip (scalar `deblock_luma_segment` applies it) over-filters high-contrast
+    // edges and diverges from the serial decoder.
+    let two_tc = _mm256_slli_epi32::<1>(tc);
+    let strong_clip = |v: __m256i, orig: __m256i| {
+        clamp_i32x8(
+            v,
+            _mm256_max_epi32(zero, _mm256_sub_epi32(orig, two_tc)),
+            _mm256_min_epi32(maxv, _mm256_add_epi32(orig, two_tc)),
+        )
+    };
+
+    let p0s = strong_clip(
         _mm256_srai_epi32::<3>(_mm256_add_epi32(
             _mm256_add_epi32(
                 _mm256_add_epi32(
@@ -228,18 +242,16 @@ fn luma_filter8_avx2(
             ),
             four,
         )),
-        zero,
-        maxv,
+        p0,
     );
-    let p1s = clamp_i32x8(
+    let p1s = strong_clip(
         _mm256_srai_epi32::<2>(_mm256_add_epi32(
             _mm256_add_epi32(_mm256_add_epi32(p2, p1), _mm256_add_epi32(p0, q0)),
             two,
         )),
-        zero,
-        maxv,
+        p1,
     );
-    let p2s = clamp_i32x8(
+    let p2s = strong_clip(
         _mm256_srai_epi32::<3>(_mm256_add_epi32(
             _mm256_add_epi32(
                 _mm256_add_epi32(_mm256_slli_epi32::<1>(p3), _mm256_mullo_epi32(three, p2)),
@@ -247,10 +259,9 @@ fn luma_filter8_avx2(
             ),
             _mm256_add_epi32(q0, four),
         )),
-        zero,
-        maxv,
+        p2,
     );
-    let q0s = clamp_i32x8(
+    let q0s = strong_clip(
         _mm256_srai_epi32::<3>(_mm256_add_epi32(
             _mm256_add_epi32(
                 _mm256_add_epi32(p1, _mm256_slli_epi32::<1>(p0)),
@@ -258,18 +269,16 @@ fn luma_filter8_avx2(
             ),
             _mm256_add_epi32(q2, four),
         )),
-        zero,
-        maxv,
+        q0,
     );
-    let q1s = clamp_i32x8(
+    let q1s = strong_clip(
         _mm256_srai_epi32::<2>(_mm256_add_epi32(
             _mm256_add_epi32(_mm256_add_epi32(p0, q0), _mm256_add_epi32(q1, q2)),
             two,
         )),
-        zero,
-        maxv,
+        q1,
     );
-    let q2s = clamp_i32x8(
+    let q2s = strong_clip(
         _mm256_srai_epi32::<3>(_mm256_add_epi32(
             _mm256_add_epi32(
                 _mm256_add_epi32(p0, q0),
@@ -277,8 +286,7 @@ fn luma_filter8_avx2(
             ),
             _mm256_add_epi32(_mm256_slli_epi32::<1>(q3), four),
         )),
-        zero,
-        maxv,
+        q2,
     );
 
     let delta = _mm256_srai_epi32::<4>(_mm256_add_epi32(

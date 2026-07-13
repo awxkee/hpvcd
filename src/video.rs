@@ -53,7 +53,7 @@ pub(crate) struct FrameMeta {
     bit_depth: BitDepth,
     color: Cicp,
     color_description_present: bool,
-    /// VUI frame-rate as time_scale / num_units_in_tick (0 = not signalled).
+    /// VUI frame-rate as time_scale / num_units_in_tick (0 = not signaled).
     time_scale: u32,
     num_units_in_tick: u32,
 }
@@ -119,7 +119,7 @@ impl VideoFrame {
         self.frame_rate().map(|fps| self.poc as f64 / fps)
     }
 
-    /// Colour metadata from the active SPS VUI. Unsignalled code points are
+    /// Colour metadata from the active SPS VUI. Unsignaled code points are
     /// returned as `Unspecified`, never fabricated as BT.709.
     pub fn color(&self) -> Cicp {
         self.meta.color
@@ -127,7 +127,7 @@ impl VideoFrame {
 
     /// Complete CICP colour description, only when `colour_description_present_flag`
     /// was set in the active SPS VUI.
-    pub fn signalled_color(&self) -> Option<Cicp> {
+    pub fn signaled_color(&self) -> Option<Cicp> {
         self.meta
             .color_description_present
             .then_some(self.meta.color)
@@ -1339,9 +1339,9 @@ impl VideoDecoder {
         }
 
         // Deblock/SAO once the whole picture is reconstructed, then store it.
-        // Deblock runs serially (its parallel chroma kernel is not yet bit-exact
-        // vs the serial reference); SAO runs on the pool.
-        let planes = d.finish_with(None, Some(&self.pool))?;
+        // Both ordered filters use the decoder-owned pool when the picture has
+        // enough CTB rows to form independent bands.
+        let planes = d.finish_with(Some(&self.pool), Some(&self.pool))?;
         let (motion, width4, height4) = d.take_motion();
 
         // §8.3.2: every decoded picture is marked "used for short-term reference"
@@ -1527,7 +1527,7 @@ mod tests {
             },
         };
         assert_eq!(frame.color(), Cicp::unspecified());
-        assert_eq!(frame.signalled_color(), None);
+        assert_eq!(frame.signaled_color(), None);
         assert_eq!(frame.to_rgb8_gbr(), vec![10, 20, 30]);
         assert_eq!(frame.to_rgba8_gbr(), vec![10, 20, 30, 255]);
     }

@@ -149,7 +149,7 @@ pub(crate) struct PredWeightTable {
     /// [list][ref][cb=0/cr=1], with offsets in reconstructed-sample units.
     pub(crate) chroma_weight: [Vec<[i32; 2]>; 2],
     pub(crate) chroma_offset: [Vec<[i32; 2]>; 2],
-    /// Whether an explicit weight was signalled for each entry.
+    /// Whether an explicit weight was signaled for each entry.
     pub(crate) luma_flag: [Vec<bool>; 2],
     pub(crate) chroma_flag: [Vec<bool>; 2],
 }

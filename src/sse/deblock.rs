@@ -413,7 +413,21 @@ fn luma_filter4_sse41(
     // Uniform per-segment strong decision (splat all lanes).
     let strong = if strong_all { _mm_set1_epi32(-1) } else { zero };
 
-    let p0s = clamp_i32x4(
+    // §8.7.2.5.4: each strongly-filtered sample is clipped to ±2·tc around its
+    // original value, then to the sample range. `strong_clip(v, orig)` folds both
+    // clamps by tightening [0, maxv] to [orig−2tc, orig+2tc]. Omitting the ±2·tc
+    // clip (scalar `deblock_luma_segment` applies it) over-filters high-contrast
+    // edges and diverges from the serial decoder.
+    let two_tc = _mm_set1_epi32(2 * tc);
+    let strong_clip = |v: __m128i, orig: __m128i| {
+        clamp_i32x4(
+            v,
+            _mm_max_epi32(zero, _mm_sub_epi32(orig, two_tc)),
+            _mm_min_epi32(maxv_v, _mm_add_epi32(orig, two_tc)),
+        )
+    };
+
+    let p0s = strong_clip(
         _mm_srai_epi32::<3>(_mm_add_epi32(
             _mm_add_epi32(
                 _mm_add_epi32(
@@ -424,18 +438,16 @@ fn luma_filter4_sse41(
             ),
             four,
         )),
-        zero,
-        maxv_v,
+        p0,
     );
-    let p1s = clamp_i32x4(
+    let p1s = strong_clip(
         _mm_srai_epi32::<2>(_mm_add_epi32(
             _mm_add_epi32(_mm_add_epi32(p2, p1), _mm_add_epi32(p0, q0)),
             two,
         )),
-        zero,
-        maxv_v,
+        p1,
     );
-    let p2s = clamp_i32x4(
+    let p2s = strong_clip(
         _mm_srai_epi32::<3>(_mm_add_epi32(
             _mm_add_epi32(
                 _mm_add_epi32(_mm_slli_epi32::<1>(p3), _mm_mullo_epi32(three, p2)),
@@ -443,10 +455,9 @@ fn luma_filter4_sse41(
             ),
             _mm_add_epi32(q0, four),
         )),
-        zero,
-        maxv_v,
+        p2,
     );
-    let q0s = clamp_i32x4(
+    let q0s = strong_clip(
         _mm_srai_epi32::<3>(_mm_add_epi32(
             _mm_add_epi32(
                 _mm_add_epi32(p1, _mm_slli_epi32::<1>(p0)),
@@ -454,18 +465,16 @@ fn luma_filter4_sse41(
             ),
             _mm_add_epi32(q2, four),
         )),
-        zero,
-        maxv_v,
+        q0,
     );
-    let q1s = clamp_i32x4(
+    let q1s = strong_clip(
         _mm_srai_epi32::<2>(_mm_add_epi32(
             _mm_add_epi32(_mm_add_epi32(p0, q0), _mm_add_epi32(q1, q2)),
             two,
         )),
-        zero,
-        maxv_v,
+        q1,
     );
-    let q2s = clamp_i32x4(
+    let q2s = strong_clip(
         _mm_srai_epi32::<3>(_mm_add_epi32(
             _mm_add_epi32(
                 _mm_add_epi32(p0, q0),
@@ -473,8 +482,7 @@ fn luma_filter4_sse41(
             ),
             _mm_add_epi32(_mm_slli_epi32::<1>(q3), four),
         )),
-        zero,
-        maxv_v,
+        q2,
     );
 
     // Weak filter (§8.7.2.5.7). delta0 unclamped; a line is filtered only when

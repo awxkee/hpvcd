@@ -76,10 +76,10 @@ pub(crate) struct Sps {
     pub(crate) temporal_mvp_enabled: bool,
     /// Short-term reference picture sets parsed from the SPS.
     pub(crate) short_term_rps: Vec<crate::rps::ShortTermRps>,
-    /// Long-term reference POC LSBs signalled at SPS level.
+    /// Long-term reference POC LSBs signaled at SPS level.
     pub(crate) lt_ref_poc_lsb: Vec<u32>,
     pub(crate) lt_used_by_curr: Vec<bool>,
-    /// long_term_ref_pics_present_flag (§7.4.3.2). LT refs may still be signalled
+    /// long_term_ref_pics_present_flag (§7.4.3.2). LT refs may still be signaled
     /// per-slice even when the SPS candidate list is empty.
     pub(crate) long_term_ref_pics_present: bool,
     pub(crate) scaling_list_enabled: bool,
@@ -94,7 +94,7 @@ pub(crate) struct Sps {
     pub(crate) strong_intra_smoothing: bool,
     /// Whether the SPS carried a VUI and its nested colour signalling fields.
     /// These are retained separately from the code-point defaults so callers can
-    /// distinguish “unspecified/absent” from an explicitly signalled value.
+    /// distinguish “unspecified/absent” from an explicitly signaled value.
     #[allow(dead_code)]
     pub(crate) vui_parameters_present: bool,
     #[allow(dead_code)]

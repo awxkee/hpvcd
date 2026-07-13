@@ -93,9 +93,9 @@ fn scale_sao_offsets(offsets: &mut [i32; 4], log2_scale: u32) {
 /// until a second independent slice makes explicit ownership necessary.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SliceDeblock {
-    disabled: bool,
-    beta_offset_div2: i32,
-    tc_offset_div2: i32,
+    pub(crate) disabled: bool,
+    pub(crate) beta_offset_div2: i32,
+    pub(crate) tc_offset_div2: i32,
 }
 
 pub(crate) struct FullDecoder<'cab> {
@@ -653,6 +653,38 @@ fn inter_motion_differs(p: &MotionInfo, q: &MotionInfo) -> bool {
     }
 }
 
+/// Fill a pixel-aligned rectangle on one of the decoder's 4×4 metadata maps.
+/// Callers use disjoint CU/PU/TU rectangles, allowing each row to become one
+/// bounds check plus `slice::fill` instead of one checked lookup per cell.
+#[allow(clippy::too_many_arguments)]
+fn fill_grid_rect<T: Copy>(
+    map: &mut [T],
+    grid_w: usize,
+    grid_h: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    value: T,
+) {
+    if grid_w == 0 || grid_h == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let gx0 = (x0 / 4).min(grid_w);
+    let gy0 = (y0 / 4).min(grid_h);
+    let gx1 = x0.saturating_add(width).div_ceil(4).min(grid_w);
+    let gy1 = y0.saturating_add(height).div_ceil(4).min(grid_h);
+    if gx0 >= gx1 || gy0 >= gy1 {
+        return;
+    }
+    for gy in gy0..gy1 {
+        let row0 = gy * grid_w;
+        if let Some(row) = map.get_mut(row0..row0 + grid_w) {
+            row[gx0..gx1].fill(value);
+        }
+    }
+}
+
 /// Fill slice ownership for a pixel-aligned rectangle on the decoder's 4x4
 /// metadata grid. Slice boundaries are CTB-aligned, but the helper also serves
 /// CU/PU bookkeeping and therefore accepts any 4-sample-aligned rectangle.
@@ -667,22 +699,7 @@ fn fill_slice_owner_rect(
     height: usize,
     owner: u16,
 ) {
-    if grid_w == 0 || grid_h == 0 || width == 0 || height == 0 {
-        return;
-    }
-    let gx0 = (x0 / 4).min(grid_w);
-    let gy0 = (y0 / 4).min(grid_h);
-    let gx1 = x0.saturating_add(width).div_ceil(4).min(grid_w);
-    let gy1 = y0.saturating_add(height).div_ceil(4).min(grid_h);
-    if gx0 >= gx1 || gy0 >= gy1 {
-        return;
-    }
-    for gy in gy0..gy1 {
-        let row0 = gy * grid_w;
-        if let Some(row) = owners.get_mut(row0..row0 + grid_w) {
-            row[gx0..gx1].fill(owner);
-        }
-    }
+    fill_grid_rect(owners, grid_w, grid_h, x0, y0, width, height, owner);
 }
 
 /// Convert the implicit owner-0 representation used by the single-slice fast
@@ -1418,9 +1435,8 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// As [`Self::finish`], but with independent pools for deblocking and SAO so
-    /// a caller can keep one filter serial. The video path passes `None` for
-    /// `deblock_pool` because the parallel deblock's chroma kernel is not yet
-    /// bit-identical to the serial reference; SAO stays parallel.
+    /// a caller can keep either filter serial. Parallel deblocking preserves the
+    /// serial path's per-slice parameters and PCM/TQB substitution rules.
     pub(crate) fn finish_with(
         &mut self,
         deblock_pool: Option<&crate::threadpool::ThreadPool>,
@@ -1618,8 +1634,12 @@ impl<'cab> FullDecoder<'cab> {
             sub_h: self.sub_h,
             bd: self.bd,
             bd_c: self.bd_c,
+            chroma_idc: self.sps.chroma_idc,
+            cb_qp_offset: self.pps.cb_qp_offset,
+            cr_qp_offset: self.pps.cr_qp_offset,
             beta_offset: self.beta_offset_div2 * 2,
             tc_offset: self.tc_offset_div2 * 2,
+            deblocking_disabled: self.deblocking_disabled,
             default_qp: self.slice_qp as i16,
             log2_ctb: self.log2_ctb,
             qp_y_map: &self.qp_y_map[..],
@@ -1630,9 +1650,10 @@ impl<'cab> FullDecoder<'cab> {
             bs_h: &self.bs_h[..],
             pcm: &self.pcm[..],
             slice_idx: &self.slice_idx[..],
+            slice_deblock: &self.slice_deblock,
+            slice_lf_across: &self.slice_lf_across,
             pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
-            loop_filter_across_slices: self.pps.loop_filter_across_slices
-                && self.slice_lf_across.iter().all(|&f| f),
+            loop_filter_across_slices: self.pps.loop_filter_across_slices,
             tile_grid: match &self.tiles {
                 Some(g) if !g.loop_filter_across_tiles => Some(g.clone()),
                 _ => None,
@@ -2475,7 +2496,7 @@ impl<'cab> FullDecoder<'cab> {
         let cb_size = 1usize << log2_cb;
         let in_pic = x0 + cb_size <= self.w && y0 + cb_size <= self.h;
         let can_split = log2_cb > self.log2_min_cb;
-        let split = if x0 + cb_size <= self.w && y0 + cb_size <= self.h && can_split {
+        let split = if in_pic && can_split {
             // read split_cu_flag with neighbor-depth context
             let ctx_inc = self.split_cu_ctx(x0, y0, depth);
             self.cab.decode_bin(&mut self.ctx.split_cu_flag[ctx_inc]) != 0
@@ -2540,16 +2561,25 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     fn set_ct_depth(&mut self, x0: usize, y0: usize, size: usize, depth: u8) {
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.ct_depth[g] = depth;
-                }
-            }
+        // Coding-tree leaves do not overlap. When the top-left cell already has
+        // the requested value, the complete fresh leaf still contains the
+        // initialization value, so avoid touching the metadata rows at all.
+        if self
+            .grid_idx(x0, y0)
+            .is_some_and(|g| self.ct_depth[g] == depth)
+        {
+            return;
         }
+        fill_grid_rect(
+            &mut self.ct_depth,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            depth,
+        );
     }
 
     fn coding_unit(&mut self, x0: usize, y0: usize, log2_cb: u32) {
@@ -2717,8 +2747,6 @@ impl<'cab> FullDecoder<'cab> {
             [false; 2],
         );
 
-        // mark decoded
-        self.mark_decoded(x0, y0, cb_size);
         // The CU's outer boundary is already marked by its constituent TUs'
         // left/top edges, so only the NxN internal PU split lines need adding.
         if nxn {
@@ -2726,7 +2754,6 @@ impl<'cab> FullDecoder<'cab> {
             self.mark_block_edges(x0 + half, y0, half, 2); // internal vertical PU edge
             self.mark_block_edges(x0, y0 + half, half, 2); // internal horizontal PU edge
         }
-        self.set_slice_idx(x0, y0, cb_size);
         let cur_qp = clamp_qpy(self.cur_qp, self.bd);
         self.qp_y_prev = cur_qp;
         self.cur_qp = cur_qp;
@@ -2812,7 +2839,6 @@ impl<'cab> FullDecoder<'cab> {
         self.set_pcm(x0, y0, n);
         self.mark_decoded(x0, y0, n);
         self.mark_block_edges(x0, y0, n, 2);
-        self.set_slice_idx(x0, y0, n);
         // PCM CUs carry no delta QP; QpY stays at the predicted value.
         let cur_qp = clamp_qpy(self.cur_qp, self.bd);
         self.qp_y_prev = cur_qp;
@@ -2821,16 +2847,16 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     fn set_pcm(&mut self, x0: usize, y0: usize, size: usize) {
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.pcm[g] = true;
-                }
-            }
-        }
+        fill_grid_rect(
+            &mut self.pcm,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            true,
+        );
     }
 
     /// Mark the left (vertical) and top (horizontal) boundaries of the block
@@ -2908,19 +2934,16 @@ impl<'cab> FullDecoder<'cab> {
     /// Record that the transform block at (x0,y0) carries nonzero luma
     /// coefficients, over its whole 4×4-grid footprint.
     fn set_nz_coeff(&mut self, x0: usize, y0: usize, size: usize) {
-        let gw = self.grid_w;
-        let y_end = (y0 + size).min(self.h);
-        let x_end = (x0 + size).min(self.w);
-        let mut yy = y0;
-        while yy < y_end {
-            let base = (yy / 4) * gw;
-            let mut xx = x0;
-            while xx < x_end {
-                self.nz_coeff[base + xx / 4] = true;
-                xx += 4;
-            }
-            yy += 4;
-        }
+        fill_grid_rect(
+            &mut self.nz_coeff,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            true,
+        );
     }
 
     /// Final deblock BS derivation (§8.7.2.4), run once per picture before the
@@ -2930,6 +2953,12 @@ impl<'cab> FullDecoder<'cab> {
     /// - else, a transform edge with nonzero luma coefficients on either side →
     ///   BS 1.
     fn finalize_coeff_bs(&mut self) {
+        // In an all-intra picture every TU/PU boundary was assigned BS=2 as it
+        // was decoded. The post-picture inter/coefficient derivation would only
+        // rescan the complete metadata grid without changing anything.
+        if self.motion.iter().all(|mi| mi.is_intra) {
+            return;
+        }
         let gw = self.grid_w;
         let gh = self.grid_h;
         let have_motion = self.motion.len() >= gw * gh;
@@ -3096,50 +3125,62 @@ impl<'cab> FullDecoder<'cab> {
 
     fn set_qp(&mut self, x0: usize, y0: usize, size: usize, qp: i32) {
         let qp = clamp_qpy(qp, self.bd) as i16;
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.qp_y_map[g] = qp;
-                }
-            }
+        // Each CU owns a fresh, non-overlapping grid rectangle. Most still-image
+        // streams keep SliceQpY unchanged, matching the map initialization, so
+        // this removes a complete per-CU write pass from the common path.
+        if self
+            .grid_idx(x0, y0)
+            .is_some_and(|g| self.qp_y_map[g] == qp)
+        {
+            return;
         }
+        fill_grid_rect(
+            &mut self.qp_y_map,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            qp,
+        );
     }
 
     fn set_mode(&mut self, x0: usize, y0: usize, size: usize, mode: u8) {
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.mode_y[g] = mode;
-                }
-            }
+        // PU rectangles are disjoint. DC is also the map's initialization value,
+        // so a very common mode needs no metadata write at all.
+        if self
+            .grid_idx(x0, y0)
+            .is_some_and(|g| self.mode_y[g] == mode)
+        {
+            return;
         }
+        fill_grid_rect(
+            &mut self.mode_y,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            mode,
+        );
     }
 
     fn mark_decoded_rect(&mut self, x0: usize, y0: usize, width: usize, height: usize) {
-        let mark_slice = self.cur_slice_idx > 1;
-        let s = self.cur_slice_idx;
-        for yy in (y0..y0 + height).step_by(4) {
-            for xx in (x0..x0 + width).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.decoded[g] = true;
-                    // Keep ownership in lock-step for alternate/PU-granular
-                    // decode paths too. The normal CTB path has already pre-tagged
-                    // the whole CTB before parsing any CU syntax.
-                    if mark_slice {
-                        self.slice_idx[g] = s;
-                    }
-                }
-            }
-        }
+        // Slice ownership is pre-tagged once for the complete CTB before any CU
+        // syntax is parsed. Rewriting it for every reconstructed TU/PU duplicated
+        // a large part of the hot metadata traffic.
+        fill_grid_rect(
+            &mut self.decoded,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            width,
+            height,
+            true,
+        );
     }
 
     #[inline]
@@ -3148,16 +3189,16 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     fn set_tqb(&mut self, x0: usize, y0: usize, size: usize) {
-        for yy in (y0..y0 + size).step_by(4) {
-            for xx in (x0..x0 + size).step_by(4) {
-                if xx < self.w
-                    && yy < self.h
-                    && let Some(g) = self.grid_idx(xx, yy)
-                {
-                    self.tqb[g] = true;
-                }
-            }
-        }
+        fill_grid_rect(
+            &mut self.tqb,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            size,
+            size,
+            true,
+        );
     }
 
     fn derive_luma_mode(&self, x0: usize, y0: usize, prev: bool, val: u8) -> u8 {
@@ -3485,11 +3526,15 @@ impl<'cab> FullDecoder<'cab> {
         // coefficient flag — either side of a transform edge having coefficients
         // raises BS to 1.
         let tu_size = 1usize << log2_ts;
-        self.mark_tu_edges(x0, y0, tu_size);
-        if cbf_luma {
-            self.set_nz_coeff(x0, y0, tu_size);
-        }
-        if !self.cur_cu_inter {
+        if self.cur_cu_inter {
+            self.mark_tu_edges(x0, y0, tu_size);
+            if cbf_luma {
+                self.set_nz_coeff(x0, y0, tu_size);
+            }
+        } else {
+            // Intra boundaries are known to have BS=2 immediately. Recording
+            // the same footprint again in tu_edge/nz_coeff only feeds the later
+            // inter-only BS derivation and was pure metadata traffic.
             self.mark_block_edges(x0, y0, tu_size, 2);
         }
 
@@ -3587,11 +3632,12 @@ impl<'cab> FullDecoder<'cab> {
         let n = 1usize << log2_ts;
         let n2 = n * n;
         let tu_size = n;
-        self.mark_tu_edges(x0, y0, tu_size);
-        if cbf_luma {
-            self.set_nz_coeff(x0, y0, tu_size);
-        }
-        if !self.cur_cu_inter {
+        if self.cur_cu_inter {
+            self.mark_tu_edges(x0, y0, tu_size);
+            if cbf_luma {
+                self.set_nz_coeff(x0, y0, tu_size);
+            }
+        } else {
             self.mark_block_edges(x0, y0, tu_size, 2);
         }
 
@@ -3829,6 +3875,7 @@ impl<'cab> FullDecoder<'cab> {
                 &self.exec, dst, stride, pred, res, n, valid_w, valid_h, self.bd,
             );
         }
+        self.mark_decoded(x0, y0, n);
     }
 
     /// Predict chroma intra/inter and add the ACT residual into the Cb/Cr plane.
@@ -3920,7 +3967,7 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// Decode a palette-mode coding unit (§7.3.8.13, §8.4.4.2): build the CU
-    /// palette from predictor reuse + signalled entries, decode the index map
+    /// palette from predictor reuse + signaled entries, decode the index map
     /// (COPY_INDEX / COPY_ABOVE runs, escape samples), reconstruct the samples,
     /// and update the persistent predictor.
     fn decode_palette_cu(&mut self, x0: usize, y0: usize, log2_cb: u32) {
@@ -3939,8 +3986,8 @@ impl<'cab> FullDecoder<'cab> {
             crate::palette::decode_reuse_flags(&mut b, pred_size, max_size)
         };
 
-        // --- (2) num_signalled_palette_entries ---
-        let num_signalled = if num_reused < max_size {
+        // --- (2) num_signaled_palette_entries ---
+        let num_signaled = if num_reused < max_size {
             let mut b = PaletteBridge {
                 cab: &mut self.cab,
                 pctx: &mut self.pctx,
@@ -3949,7 +3996,7 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             0
         };
-        let palette_size = (num_reused + num_signalled).min(max_size);
+        let palette_size = (num_reused + num_signaled).min(max_size);
 
         // Reused predictor entries (in predictor order) form the palette head.
         let mut palette: Vec<[u16; crate::palette::MAX_COMPONENTS]> =
@@ -3965,9 +4012,9 @@ impl<'cab> FullDecoder<'cab> {
         }
 
         // --- (3) new_palette_entries, COMPONENT-MAJOR (§7.3.8.13):
-        // for each component, all `num_signalled` fixed-length values. ---
+        // for each component, all `num_signaled` fixed-length values. ---
         let new_start = palette.len();
-        for _ in 0..num_signalled {
+        for _ in 0..num_signaled {
             palette.push([0u16; crate::palette::MAX_COMPONENTS]);
         }
         for c in 0..num_comps {
@@ -3976,7 +4023,7 @@ impl<'cab> FullDecoder<'cab> {
             } else {
                 self.bd_c as u32
             };
-            for dst in palette[new_start..new_start + num_signalled].iter_mut() {
+            for dst in palette[new_start..new_start + num_signaled].iter_mut() {
                 dst[c] = self.cab.decode_bypass_bits(nbits) as u16;
             }
         }
@@ -4107,7 +4154,6 @@ impl<'cab> FullDecoder<'cab> {
         self.set_mode(x0, y0, size, MODE_DC);
         self.mark_decoded(x0, y0, size);
         self.mark_block_edges(x0, y0, size, 2);
-        self.set_slice_idx(x0, y0, size);
         let cur_qp = clamp_qpy(self.cur_qp, self.bd);
         self.qp_y_prev = cur_qp;
         self.cur_qp = cur_qp;
@@ -5835,7 +5881,7 @@ fn scaling_matrix_from_lists<'a>(
 ) -> Option<transform::ScalingMatrix<'a>> {
     // HM getUseScalingList(): scaling lists apply to transform skip only for
     // 4x4 TUs. RExt permits larger transform-skip blocks, but those use the
-    // neutral inverse-quantisation scale rather than the signalled 8x8/16x16/
+    // neutral inverse-quantisation scale rather than the signaled 8x8/16x16/
     // 32x32 matrices.
     if transform_skip && n != 4 {
         return None;
@@ -6269,40 +6315,18 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     /// Store a PU's motion across its covered 4x4 blocks.
-    fn store_motion(
-        &mut self,
-        x0: usize,
-        y0: usize,
-        w: usize,
-        h: usize,
-        mi: crate::inter::MotionInfo,
-    ) {
+    fn store_motion(&mut self, x0: usize, y0: usize, w: usize, h: usize, mi: MotionInfo) {
         // Motion-based deblock boundary strength (§8.7.2.4): before overwriting
         // the motion field, mark BS=1 on this PU's left/top edges where the
         // already-decoded neighbor differs enough (different ref picture,
         // different number of MVs, or |ΔMV| ≥ 4 quarter-pel in x or y).
         self.mark_motion_bs(x0, y0, w, h, &mi);
-        for yy in (y0..y0 + h).step_by(4) {
-            for xx in (x0..x0 + w).step_by(4) {
-                if let Some(g) = self.grid_idx(xx, yy)
-                    && g < self.motion.len()
-                {
-                    self.motion[g] = mi;
-                }
-            }
-        }
+        fill_grid_rect(&mut self.motion, self.grid_w, self.grid_h, x0, y0, w, h, mi);
     }
 
     /// Mark BS=1 on a PU's left (vertical) and top (horizontal) 8-grid edges
     /// where the neighboring block's motion differs enough to require filtering.
-    fn mark_motion_bs(
-        &mut self,
-        x0: usize,
-        y0: usize,
-        w: usize,
-        h: usize,
-        mi: &crate::inter::MotionInfo,
-    ) {
+    fn mark_motion_bs(&mut self, x0: usize, y0: usize, w: usize, h: usize, mi: &MotionInfo) {
         let gw = self.grid_w;
         // Left edge at x0 (vertical boundary), on the 8×8 deblock grid.
         if x0 > 0 && (x0).is_multiple_of(8) {
@@ -6360,15 +6384,16 @@ impl<'cab> FullDecoder<'cab> {
         // from de265's root markTransformBlockBoundary call): this covers skip
         // CUs and rqt_root_cbf=0 CUs, for which no transform_unit runs.
         self.mark_tu_edges(x0, y0, cb);
-        for yy in (y0..y0 + cb).step_by(4) {
-            for xx in (x0..x0 + cb).step_by(4) {
-                if let Some(g) = self.grid_idx(xx, yy)
-                    && g < self.cu_skip_map.len()
-                {
-                    self.cu_skip_map[g] = skip;
-                }
-            }
-        }
+        fill_grid_rect(
+            &mut self.cu_skip_map,
+            self.grid_w,
+            self.grid_h,
+            x0,
+            y0,
+            cb,
+            cb,
+            skip,
+        );
 
         if skip {
             // Skip: single 2Nx2N merge PU, no residual.
@@ -6433,7 +6458,7 @@ impl<'cab> FullDecoder<'cab> {
 
         // rqt_root_cbf (§7.3.8.5): decoded unless the CU is a 2Nx2N merge, in
         // which case it is inferred = true (a 2Nx2N merge with no residual would
-        // have been signalled as SKIP instead, so residual must be present).
+        // have been signaled as SKIP instead, so residual must be present).
         let is_2nx2n_merge = part == InterPartMode::P2Nx2N && self.last_pu_merge;
         let rqt_root_cbf = if is_2nx2n_merge {
             true
@@ -6521,7 +6546,6 @@ impl<'cab> FullDecoder<'cab> {
     fn finish_inter_cu(&mut self, x0: usize, y0: usize, cb: usize) {
         self.cur_cu_inter = false;
         self.mark_decoded(x0, y0, cb);
-        self.set_slice_idx(x0, y0, cb);
         let cur_qp = clamp_qpy(self.cur_qp, self.bd);
         self.qp_y_prev = cur_qp;
         self.cur_qp = cur_qp;
@@ -7572,7 +7596,7 @@ fn add_residual_into_i16(
 /// Chroma QP mapping (Table 8-10). The input qPi is a nominal signed QP, so
 /// high-bit-depth streams may legitimately pass negative values. The returned
 /// QpC is still nominal/signed; callers add QpBdOffsetC with `qp_prime`.
-fn qpc(qpi: i32, chroma_idc: u8, bit_depth: u8) -> i32 {
+pub(crate) fn qpc(qpi: i32, chroma_idc: u8, bit_depth: u8) -> i32 {
     let qpi = qpi.clamp(-qp_bd_offset(bit_depth), 57);
     if chroma_idc != 1 {
         // 4:2:2 / 4:4:4: QpC = min(qPi, 51), preserving negative QP.
@@ -7830,7 +7854,7 @@ pub(crate) fn parse_slice_header_full(
             }
         }
         // long_term reference pictures (§7.3.6.1). Collect each LT ref's POC
-        // (or POC LSB when the MSB delta is not signalled) and used_by_curr flag.
+        // (or POC LSB when the MSB delta is not signaled) and used_by_curr flag.
         if long_term_ref_pics_present(sps) {
             let num_lt_sps = if !sps.lt_ref_poc_lsb.is_empty() {
                 r.read_ue().map_err(|_| e("num_lt_sps"))? as usize
@@ -8049,7 +8073,7 @@ pub(crate) fn parse_slice_header_full(
     } else {
         false
     };
-    // Deblocking: default to the PPS state, overridden per-slice if signalled.
+    // Deblocking: default to the PPS state, overridden per-slice if signaled.
     let mut deblocking_disabled = pps.deblocking_filter_disabled;
     let mut beta_offset_div2 = pps.beta_offset_div2;
     let mut tc_offset_div2 = pps.tc_offset_div2;

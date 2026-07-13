@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::decode::{SliceDeblock, qpc};
 use crate::exec::ExecContext;
 use crate::threadpool::{DisjointMut, ThreadPool, parallel_for};
 
@@ -62,8 +63,12 @@ pub(crate) struct DeblockCtx<'a> {
     pub sub_h: usize,
     pub bd: u8,
     pub bd_c: u8,
+    pub chroma_idc: u8,
+    pub cb_qp_offset: i32,
+    pub cr_qp_offset: i32,
     pub beta_offset: i32,
     pub tc_offset: i32,
+    pub deblocking_disabled: bool,
     pub default_qp: i16,
     pub log2_ctb: u32,
     pub qp_y_map: &'a [i16],
@@ -75,6 +80,8 @@ pub(crate) struct DeblockCtx<'a> {
     pub bs_h: &'a [u8],
     pub pcm: &'a [bool],
     pub slice_idx: &'a [u16],
+    pub slice_deblock: &'a [SliceDeblock],
+    pub slice_lf_across: &'a [bool],
     pub pcm_loop_filter_disabled: bool,
     pub loop_filter_across_slices: bool,
     /// Resolved tile geometry when tiles are enabled and cross-tile filtering is
@@ -95,15 +102,6 @@ impl DeblockCtx<'_> {
             .and_then(|idx| self.qp_y_map.get(idx))
             .copied()
             .unwrap_or(self.default_qp) as i32
-    }
-
-    #[inline]
-    fn tqb_at(&self, px: usize, py: usize) -> bool {
-        if px >= self.w || py >= self.h {
-            return false;
-        }
-        let idx = (py / 4) * self.gw + (px / 4);
-        self.tqb.get(idx).copied().unwrap_or(false)
     }
 
     #[inline]
@@ -154,13 +152,17 @@ impl DeblockCtx<'_> {
 
     #[inline]
     fn filter_across(&self, pxp: usize, pyp: usize, pxq: usize, pyq: usize) -> bool {
-        if self.tqb_at(pxp, pyp) || self.tqb_at(pxq, pyq) {
-            return false;
-        }
-        if self.pcm_loop_filter_disabled && (self.pcm_at(pxp, pyp) || self.pcm_at(pxq, pyq)) {
-            return false;
-        }
-        if !self.loop_filter_across_slices && self.slice_at(pxp, pyp) != self.slice_at(pxq, pyq) {
+        // TQB/PCM samples do not suppress the complete edge. HEVC filters using
+        // the reconstructed samples and then restores only the exempt side. The
+        // parallel driver performs that substitution after every pass, exactly
+        // like the serial path.
+        let sq = self.slice_at(pxq, pyq);
+        let q_across = self
+            .slice_lf_across
+            .get(sq as usize)
+            .copied()
+            .unwrap_or(self.loop_filter_across_slices);
+        if !q_across && self.slice_at(pxp, pyp) != sq {
             return false;
         }
         if let Some(g) = &self.tile_grid {
@@ -173,25 +175,35 @@ impl DeblockCtx<'_> {
     }
 
     #[inline]
-    fn pcm_at(&self, px: usize, py: usize) -> bool {
-        self.grid(px, py)
-            .and_then(|g| self.pcm.get(g))
-            .copied()
-            .unwrap_or(false)
-    }
-
-    #[inline]
     fn slice_at(&self, px: usize, py: usize) -> u16 {
         self.grid(px, py)
             .and_then(|g| self.slice_idx.get(g))
             .copied()
             .unwrap_or(0)
     }
+
+    #[inline]
+    fn slice_deblock_at(&self, px: usize, py: usize) -> SliceDeblock {
+        self.slice_deblock
+            .get(self.slice_at(px, py) as usize)
+            .copied()
+            .unwrap_or(SliceDeblock {
+                disabled: self.deblocking_disabled,
+                beta_offset_div2: self.beta_offset / 2,
+                tc_offset_div2: self.tc_offset / 2,
+            })
+    }
+
+    #[inline]
+    fn sample_suppressed(&self, grid: usize) -> bool {
+        self.tqb.get(grid).copied().unwrap_or(false)
+            || (self.pcm_loop_filter_disabled && self.pcm.get(grid).copied().unwrap_or(false))
+    }
 }
 
 /// Per-4-line luma deblock decision (§8.7.2.5.3), computed once from lines 0 and
 /// 3 and applied uniformly to all 4 lines. `Weak` carries the dEp/dEq gates.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LumaDecision {
     Skip,
     Strong,
@@ -295,19 +307,24 @@ fn luma_vertical_segment_params(
     let mid = s + 1;
     // Real TU/PU/CU edge with Bs>0 and not a disabled slice/tile/PCM/TQB
     // boundary (§8.7.2). Mirrors the serial `deblock_bs_v` gate.
-    if ctx.bs_v_at(edge, mid) == 0 {
+    let bs = ctx.bs_v_at(edge, mid);
+    if bs == 0 {
         return None;
     }
-    let bs = ctx.bs_v_at(edge, mid) as i32;
+    let bs = bs as i32;
+    let sd = ctx.slice_deblock_at(edge, mid);
+    if sd.disabled {
+        return None;
+    }
     let qp_p = ctx.qp_at(edge - 1, mid);
     let qp_q = ctx.qp_at(edge, mid);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
     // §8.7.2.5.3: Q indexes the tables at qPL (+offsets) without QpBdOffset; the
     // looked-up β′/tC′ are then scaled to the sample bit depth. Mirrors the
     // serial `apply_deblocking`.
-    let beta_prime = (avg_qp + ctx.beta_offset).clamp(0, 51);
+    let beta_prime = (avg_qp + sd.beta_offset_div2 * 2).clamp(0, 51);
     // tc' = Q(qp + 2*(Bs-1) + tc_offset) (§8.7.2.5.3): Bs=2 adds 2, Bs=1 adds 0.
-    let tc_prime = (avg_qp + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
+    let tc_prime = (avg_qp + 2 * (bs - 1) + sd.tc_offset_div2 * 2).clamp(0, 53);
     let bd_shift = (ctx.bd - 8) as u32;
     let beta = BETA[beta_prime as usize] << bd_shift;
     let tc = TC[tc_prime as usize] << bd_shift;
@@ -333,15 +350,20 @@ fn luma_horizontal_segment_params(
     scan: usize,
 ) -> Option<(LumaDecision, i32)> {
     let mid = scan + 1;
-    if ctx.bs_h_at(mid, edge) == 0 {
+    let bs = ctx.bs_h_at(mid, edge);
+    if bs == 0 {
         return None;
     }
-    let bs = ctx.bs_h_at(mid, edge) as i32;
+    let bs = bs as i32;
+    let sd = ctx.slice_deblock_at(mid, edge);
+    if sd.disabled {
+        return None;
+    }
     let qp_p = ctx.qp_at(mid, edge - 1);
     let qp_q = ctx.qp_at(mid, edge);
     let avg_qp = (qp_p + qp_q + 1) >> 1;
-    let beta_prime = (avg_qp + ctx.beta_offset).clamp(0, 51);
-    let tc_prime = (avg_qp + 2 * (bs - 1) + ctx.tc_offset).clamp(0, 53);
+    let beta_prime = (avg_qp + sd.beta_offset_div2 * 2).clamp(0, 51);
+    let tc_prime = (avg_qp + 2 * (bs - 1) + sd.tc_offset_div2 * 2).clamp(0, 53);
     let bd_shift = (ctx.bd - 8) as u32;
     let beta = BETA[beta_prime as usize] << bd_shift;
     let tc = TC[tc_prime as usize] << bd_shift;
@@ -798,7 +820,18 @@ pub(crate) fn chroma_horizontal_plane_scalar(
 }
 
 #[inline]
-fn chroma_vertical_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, s: usize) -> Option<i32> {
+fn chroma_tcs(ctx: &DeblockCtx<'_>, avg_qp_l: i32, tc_offset: i32) -> (i32, i32) {
+    let shift = (ctx.bd_c - 8) as u32;
+    let tc_for = |offset: i32| {
+        let qp_c = qpc(avg_qp_l + offset, ctx.chroma_idc, ctx.bd_c);
+        let tc_prime = (qp_c + 2 + tc_offset).clamp(0, 53);
+        TC[tc_prime as usize] << shift
+    };
+    (tc_for(ctx.cb_qp_offset), tc_for(ctx.cr_qp_offset))
+}
+
+#[inline]
+fn chroma_vertical_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, s: usize) -> Option<(i32, i32)> {
     let mid = s + 1;
     let qlx = edge * ctx.sub_w;
     let qly = mid * ctx.sub_h;
@@ -806,30 +839,42 @@ fn chroma_vertical_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, s: usize) -> Op
     if ctx.bs_v_at(qlx, qly) < 2 {
         return None;
     }
-    let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
-    let tc_prime_c = (avg_qp_l + 2 + ctx.tc_offset).clamp(0, 53);
-    let tc_c = TC[tc_prime_c as usize] << (ctx.bd_c - 8) as u32;
-    if tc_c == 0 {
+    let lqx = qlx.min(ctx.w.saturating_sub(1));
+    let lqy = qly.min(ctx.h.saturating_sub(1));
+    let sd = ctx.slice_deblock_at(lqx, lqy);
+    if sd.disabled {
         return None;
     }
-    Some(tc_c)
+    let lpx = qlx.saturating_sub(1).min(ctx.w.saturating_sub(1));
+    let qp_p = ctx.qp_at(lpx, lqy);
+    let qp_q = ctx.qp_at(lqx, lqy);
+    let avg_qp_l = (qp_p + qp_q + 1) >> 1;
+    Some(chroma_tcs(ctx, avg_qp_l, sd.tc_offset_div2 * 2))
 }
 
 #[inline]
-fn chroma_horizontal_segment_tc(ctx: &DeblockCtx<'_>, edge: usize, scan: usize) -> Option<i32> {
+fn chroma_horizontal_segment_tc(
+    ctx: &DeblockCtx<'_>,
+    edge: usize,
+    scan: usize,
+) -> Option<(i32, i32)> {
     let mid = scan + 1;
     let qlx = mid * ctx.sub_w;
     let qly = edge * ctx.sub_h;
     if ctx.bs_h_at(qlx, qly) < 2 {
         return None;
     }
-    let avg_qp_l = ctx.qp_at(qlx.min(ctx.w - 1), qly.min(ctx.h - 1));
-    let tc_prime_c = (avg_qp_l + 2 + ctx.tc_offset).clamp(0, 53);
-    let tc_c = TC[tc_prime_c as usize] << (ctx.bd_c - 8) as u32;
-    if tc_c == 0 {
+    let lqx = qlx.min(ctx.w.saturating_sub(1));
+    let lqy = qly.min(ctx.h.saturating_sub(1));
+    let sd = ctx.slice_deblock_at(lqx, lqy);
+    if sd.disabled {
         return None;
     }
-    Some(tc_c)
+    let lpy = qly.saturating_sub(1).min(ctx.h.saturating_sub(1));
+    let qp_p = ctx.qp_at(lqx, lpy);
+    let qp_q = ctx.qp_at(lqx, lqy);
+    let avg_qp_l = (qp_p + qp_q + 1) >> 1;
+    Some(chroma_tcs(ctx, avg_qp_l, sd.tc_offset_div2 * 2))
 }
 
 /// Chroma vertical edges for chroma rows `[crow0, crow1)`. Like luma vertical,
@@ -857,9 +902,13 @@ fn chroma_vertical(
                 let first = chroma_vertical_segment_tc(ctx, edge, s);
                 let second = chroma_vertical_segment_tc(ctx, edge, s + 4);
                 match (first, second) {
-                    (Some(tc0), Some(tc1)) => {
-                        pair_filter(cb, cw, edge, s, crow0, tc0, tc1, maxv_c);
-                        pair_filter(cr, cw, edge, s, crow0, tc0, tc1, maxv_c);
+                    (Some((cb0, cr0)), Some((cb1, cr1))) => {
+                        if cb0 != 0 || cb1 != 0 {
+                            pair_filter(cb, cw, edge, s, crow0, cb0, cb1, maxv_c);
+                        }
+                        if cr0 != 0 || cr1 != 0 {
+                            pair_filter(cr, cw, edge, s, crow0, cr0, cr1, maxv_c);
+                        }
                         s += 8;
                         continue;
                     }
@@ -867,18 +916,26 @@ fn chroma_vertical(
                         s += 4;
                         continue;
                     }
-                    (Some(tc_c), None) => {
-                        filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
-                        filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
+                    (Some((tc_cb, tc_cr)), None) => {
+                        if tc_cb != 0 {
+                            filter(cb, cw, edge, s, crow0, tc_cb, maxv_c);
+                        }
+                        if tc_cr != 0 {
+                            filter(cr, cw, edge, s, crow0, tc_cr, maxv_c);
+                        }
                         s += 4;
                         continue;
                     }
                 }
             }
 
-            if let Some(tc_c) = chroma_vertical_segment_tc(ctx, edge, s) {
-                filter(cb, cw, edge, s, crow0, tc_c, maxv_c);
-                filter(cr, cw, edge, s, crow0, tc_c, maxv_c);
+            if let Some((tc_cb, tc_cr)) = chroma_vertical_segment_tc(ctx, edge, s) {
+                if tc_cb != 0 {
+                    filter(cb, cw, edge, s, crow0, tc_cb, maxv_c);
+                }
+                if tc_cr != 0 {
+                    filter(cr, cw, edge, s, crow0, tc_cr, maxv_c);
+                }
             }
             s += 4;
         }
@@ -915,9 +972,13 @@ fn chroma_horizontal(
                 let first = chroma_horizontal_segment_tc(ctx, edge, scan);
                 let second = chroma_horizontal_segment_tc(ctx, edge, scan + 4);
                 match (first, second) {
-                    (Some(tc0), Some(tc1)) => {
-                        pair_filter(cb, cw, edge, scan, crow0, tc0, tc1, maxv_c);
-                        pair_filter(cr, cw, edge, scan, crow0, tc0, tc1, maxv_c);
+                    (Some((cb0, cr0)), Some((cb1, cr1))) => {
+                        if cb0 != 0 || cb1 != 0 {
+                            pair_filter(cb, cw, edge, scan, crow0, cb0, cb1, maxv_c);
+                        }
+                        if cr0 != 0 || cr1 != 0 {
+                            pair_filter(cr, cw, edge, scan, crow0, cr0, cr1, maxv_c);
+                        }
                         scan += 8;
                         continue;
                     }
@@ -925,18 +986,26 @@ fn chroma_horizontal(
                         scan += 4;
                         continue;
                     }
-                    (Some(tc_c), None) => {
-                        filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
-                        filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
+                    (Some((tc_cb, tc_cr)), None) => {
+                        if tc_cb != 0 {
+                            filter(cb, cw, edge, scan, crow0, tc_cb, maxv_c);
+                        }
+                        if tc_cr != 0 {
+                            filter(cr, cw, edge, scan, crow0, tc_cr, maxv_c);
+                        }
                         scan += 4;
                         continue;
                     }
                 }
             }
 
-            if let Some(tc_c) = chroma_horizontal_segment_tc(ctx, edge, scan) {
-                filter(cb, cw, edge, scan, crow0, tc_c, maxv_c);
-                filter(cr, cw, edge, scan, crow0, tc_c, maxv_c);
+            if let Some((tc_cb, tc_cr)) = chroma_horizontal_segment_tc(ctx, edge, scan) {
+                if tc_cb != 0 {
+                    filter(cb, cw, edge, scan, crow0, tc_cb, maxv_c);
+                }
+                if tc_cr != 0 {
+                    filter(cr, cw, edge, scan, crow0, tc_cr, maxv_c);
+                }
             }
             scan += 4;
         }
@@ -996,6 +1065,51 @@ pub(crate) struct DeblockPlanes {
     pub cr: Vec<u16>,
 }
 
+#[inline]
+fn suppression_active(ctx: &DeblockCtx<'_>) -> bool {
+    ctx.tqb.iter().any(|&v| v) || (ctx.pcm_loop_filter_disabled && ctx.pcm.iter().any(|&v| v))
+}
+
+/// Restore exempt luma samples from the pre-deblock picture after one ordered
+/// pass. The filter must still run across an exempt/non-exempt boundary so the
+/// non-exempt side is updated; only the exempt output samples are substituted.
+fn restore_luma(ctx: &DeblockCtx<'_>, plane: &mut [u16], snapshot: &[u16]) {
+    for gy in 0..ctx.gh {
+        let grid_row = gy * ctx.gw;
+        for gx in 0..ctx.gw {
+            if !ctx.sample_suppressed(grid_row + gx) {
+                continue;
+            }
+            let x0 = gx * 4;
+            let y0 = gy * 4;
+            let width = ctx.w.saturating_sub(x0).min(4);
+            let height = ctx.h.saturating_sub(y0).min(4);
+            if width == 0 || height == 0 {
+                continue;
+            }
+            for row in 0..height {
+                let off = (y0 + row) * ctx.w + x0;
+                plane[off..off + width].copy_from_slice(&snapshot[off..off + width]);
+            }
+        }
+    }
+}
+
+fn restore_chroma(ctx: &DeblockCtx<'_>, plane: &mut [u16], snapshot: &[u16]) {
+    for cy in 0..ctx.ch {
+        let ly = cy * ctx.sub_h;
+        let grid_row = (ly / 4) * ctx.gw;
+        for cx in 0..ctx.cw {
+            let lx = cx * ctx.sub_w;
+            let grid = grid_row + lx / 4;
+            if ctx.sample_suppressed(grid) {
+                let off = cy * ctx.cw + cx;
+                plane[off] = snapshot[off];
+            }
+        }
+    }
+}
+
 /// Parallel deblocking driver. Runs the four ordered passes; within each pass,
 /// CTB-aligned row bands are filtered concurrently on `pool`. Bit-identical to
 /// the serial `apply_deblocking`. `log2_ctb` sets band height; larger CTBs give
@@ -1012,6 +1126,10 @@ pub(crate) fn apply_deblocking_parallel(
     let ctb = 1usize << log2_ctb;
     let w = ctx.w;
     let cw = ctx.cw;
+    let suppress = suppression_active(ctx);
+    let snap_y = suppress.then(|| y.clone());
+    let snap_cb = suppress.then(|| cb.clone());
+    let snap_cr = suppress.then(|| cr.clone());
 
     // ---- Luma vertical: row bands, no halo, in place ----
     {
@@ -1023,6 +1141,9 @@ pub(crate) fn apply_deblocking_parallel(
             luma_vertical(ctx, &mut band, r0, r1);
         });
         y = y_dm.into_inner();
+        if let Some(snapshot) = &snap_y {
+            restore_luma(ctx, &mut y, snapshot);
+        }
     }
 
     // ---- Luma horizontal: row bands, in place ----
@@ -1035,6 +1156,9 @@ pub(crate) fn apply_deblocking_parallel(
             luma_horizontal(ctx, &mut band, r0, r1);
         });
         y = y_dm.into_inner();
+        if let Some(snapshot) = &snap_y {
+            restore_luma(ctx, &mut y, snapshot);
+        }
     }
 
     // ---- Chroma vertical: chroma-row bands, no halo, in place ----
@@ -1052,6 +1176,10 @@ pub(crate) fn apply_deblocking_parallel(
         });
         cb = cb_dm.into_inner();
         cr = cr_dm.into_inner();
+        if let (Some(scb), Some(scr)) = (&snap_cb, &snap_cr) {
+            restore_chroma(ctx, &mut cb, scb);
+            restore_chroma(ctx, &mut cr, scr);
+        }
     }
 
     // ---- Chroma horizontal: chroma-row bands, in place ----
@@ -1068,6 +1196,10 @@ pub(crate) fn apply_deblocking_parallel(
         });
         cb = cb_dm.into_inner();
         cr = cr_dm.into_inner();
+        if let (Some(scb), Some(scr)) = (&snap_cb, &snap_cr) {
+            restore_chroma(ctx, &mut cb, scb);
+            restore_chroma(ctx, &mut cr, scr);
+        }
     }
 
     DeblockPlanes { y, cb, cr }
@@ -1077,6 +1209,80 @@ pub(crate) fn apply_deblocking_parallel(
 mod tests {
     use super::*;
     use crate::exec::ExecContext;
+
+    /// The SIMD luma deblock kernels must be bit-identical to the scalar
+    /// reference. A high-contrast edge drives the strong filter far past
+    /// ±2·tc, so the §8.7.2.5.4 clip is load-bearing: a kernel that omits it
+    /// (as the NEON/SSE/AVX strong path once did) diverges here by tens of code
+    /// levels. Weak decisions are covered too so the whole kernel stays pinned.
+    /// On non-SIMD builds `resolve_*` returns the scalar fn and this is a no-op.
+    #[test]
+    fn simd_luma_kernels_match_scalar_reference() {
+        let simd_v = resolve_luma_vertical_plane();
+        let simd_h = resolve_luma_horizontal_plane();
+        // The driver filters out Skip before dispatch (`luma_*_segment_params`
+        // returns None), so the kernels are only ever called with Strong/Weak.
+        let decisions = [
+            LumaDecision::Strong,
+            LumaDecision::Weak {
+                do_p1: true,
+                do_q1: true,
+            },
+            LumaDecision::Weak {
+                do_p1: true,
+                do_q1: false,
+            },
+            LumaDecision::Weak {
+                do_p1: false,
+                do_q1: true,
+            },
+            LumaDecision::Weak {
+                do_p1: false,
+                do_q1: false,
+            },
+        ];
+        let w = 16usize;
+        for &tc in &[1i32, 2, 3, 5, 8, 14] {
+            for &maxv in &[255i32, 1023] {
+                for &(pv, qv) in &[(0u16, 255u16), (10, 240), (60, 190), (128, 132), (300, 700)] {
+                    let (pv, qv) = (pv.min(maxv as u16), qv.min(maxv as u16));
+                    // Vertical edge at column 8, one 4-row segment (rows 0..4).
+                    let mut vbase = vec![0u16; w * 4];
+                    for row in 0..4 {
+                        for col in 0..w {
+                            vbase[row * w + col] = if col < 8 { pv } else { qv };
+                        }
+                    }
+                    // Horizontal edge at row 8, one 4-column segment (cols 0..4).
+                    let mut hbase = vec![0u16; w * 16];
+                    for row in 0..16 {
+                        for col in 0..w {
+                            hbase[row * w + col] = if row < 8 { pv } else { qv };
+                        }
+                    }
+                    for &dec in &decisions {
+                        let mut a = vbase.clone();
+                        let mut b = vbase.clone();
+                        luma_vertical_plane_scalar(&mut a, w, 8, 0, 0, dec, tc, maxv);
+                        simd_v(&mut b, w, 8, 0, 0, dec, tc, maxv);
+                        assert_eq!(
+                            a, b,
+                            "vertical SIMD vs scalar diverged: tc={tc} maxv={maxv} pv={pv} qv={qv} dec={dec:?}"
+                        );
+
+                        let mut a = hbase.clone();
+                        let mut b = hbase.clone();
+                        luma_horizontal_plane_scalar(&mut a, w, 8, 0, 0, dec, tc, maxv);
+                        simd_h(&mut b, w, 8, 0, 0, dec, tc, maxv);
+                        assert_eq!(
+                            a, b,
+                            "horizontal SIMD vs scalar diverged: tc={tc} maxv={maxv} pv={pv} qv={qv} dec={dec:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Build a 2×2-CTB-worth 8×8-pixel grid (gw=gh=2) DeblockCtx with the given
     /// per-4×4 edge/Bs/slice arrays and no tiles.
@@ -1103,8 +1309,12 @@ mod tests {
             sub_h: 2,
             bd: 8,
             bd_c: 8,
+            chroma_idc: 1,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
             beta_offset: 0,
             tc_offset: 0,
+            deblocking_disabled: false,
             default_qp: 26,
             log2_ctb: 6,
             qp_y_map: &[],
@@ -1115,6 +1325,8 @@ mod tests {
             bs_h,
             pcm,
             slice_idx,
+            slice_deblock: &[],
+            slice_lf_across: &[],
             pcm_loop_filter_disabled: pcm_lf_disabled,
             loop_filter_across_slices: across_slices,
             tile_grid: None,
@@ -1148,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn tqb_and_pcm_suppress_filtering() {
+    fn tqb_and_pcm_suppress_only_the_exempt_samples() {
         let mut edge_v = [false; 4];
         let mut bs_v = [0u8; 4];
         edge_v[1] = true;
@@ -1156,19 +1368,24 @@ mod tests {
         let z = [false; 4];
         let zb = [0u8; 4];
         let s = [0u16; 4];
-        // P side (pixel col 3 → grid 0) is transquant-bypass → suppressed.
+        // P side (pixel col 3 → grid 0) is transquant-bypass. The edge must
+        // still be evaluated so the non-exempt Q side can be filtered; the
+        // driver restores the exempt samples after the pass.
         let mut tqb = [false; 4];
         tqb[0] = true;
         let c = ctx(&edge_v, &z, &bs_v, &zb, &tqb, &z, &s, true, false);
-        assert_eq!(c.bs_v_at(4, 0), 0);
-        // PCM with loop filter disabled likewise suppresses.
+        assert_eq!(c.bs_v_at(4, 0), 2);
+        assert!(c.sample_suppressed(0));
+        // PCM with loop filtering disabled follows the same substitution rule.
         let mut pcm = [false; 4];
         pcm[1] = true;
         let c2 = ctx(&edge_v, &z, &bs_v, &zb, &z, &pcm, &s, true, true);
-        assert_eq!(c2.bs_v_at(4, 0), 0);
-        // PCM present but pcm_loop_filter_disabled=false → still filtered.
+        assert_eq!(c2.bs_v_at(4, 0), 2);
+        assert!(c2.sample_suppressed(1));
+        // PCM present but pcm_loop_filter_disabled=false is not exempt.
         let c3 = ctx(&edge_v, &z, &bs_v, &zb, &z, &pcm, &s, true, false);
         assert_eq!(c3.bs_v_at(4, 0), 2);
+        assert!(!c3.sample_suppressed(1));
     }
 
     #[test]
@@ -1187,5 +1404,39 @@ mod tests {
         // across_slices = true → filtered.
         let c2 = ctx(&edge_v, &z, &bs_v, &zb, &z, &z, &s, true, false);
         assert_eq!(c2.bs_v_at(4, 0), 2);
+    }
+
+    #[test]
+    fn q_side_slice_controls_cross_slice_and_offsets() {
+        let mut edge_v = [false; 4];
+        let mut bs_v = [0u8; 4];
+        edge_v[1] = true;
+        bs_v[1] = 2;
+        let z = [false; 4];
+        let zb = [0u8; 4];
+        let owners = [0u16, 1, 0, 1];
+        let slices = [
+            SliceDeblock {
+                disabled: false,
+                beta_offset_div2: 0,
+                tc_offset_div2: 0,
+            },
+            SliceDeblock {
+                disabled: false,
+                beta_offset_div2: 2,
+                tc_offset_div2: -1,
+            },
+        ];
+        let across = [true, false];
+        let mut c = ctx(&edge_v, &z, &bs_v, &zb, &z, &z, &owners, true, false);
+        c.slice_deblock = &slices;
+        c.slice_lf_across = &across;
+
+        // Q is in slice 1, whose per-slice flag forbids crossing even though
+        // the PPS/default value supplied by the helper is true.
+        assert_eq!(c.bs_v_at(4, 0), 0);
+        let sd = c.slice_deblock_at(4, 0);
+        assert_eq!(sd.beta_offset_div2, 2);
+        assert_eq!(sd.tc_offset_div2, -1);
     }
 }
