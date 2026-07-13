@@ -4990,11 +4990,11 @@ impl<'cab> FullDecoder<'cab> {
             &sc.fa[..2 * n + 1],
             &sc.fl[..2 * n + 1],
             n,
-            // is_luma gates only the DC / pure-horizontal / pure-vertical intra
-            // edge filters inside predict; the SCC flag (and implicit-RDPCM
-            // lossless blocks, §8.4.4.2.6) turns exactly those off.
-            !self.sps.intra_boundary_filtering_disabled
-                && !(self.sps.implicit_rdpcm_enabled && self.cu_tqb),
+            // is_luma gates the DC / pure-horizontal / pure-vertical intra edge
+            // filters inside predict. Transquant bypass and implicit RDPCM affect
+            // residual processing, not these prediction filters; only the SCC
+            // intra_boundary_filtering_disabled_flag suppresses them.
+            !self.sps.intra_boundary_filtering_disabled,
             self.bd,
             &mut sc.pred[..n * n],
             &mut sc.refs_ang,
