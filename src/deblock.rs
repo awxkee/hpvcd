@@ -203,7 +203,7 @@ impl DeblockCtx<'_> {
 
 /// Per-4-line luma deblock decision (§8.7.2.5.3), computed once from lines 0 and
 /// 3 and applied uniformly to all 4 lines. `Weak` carries the dEp/dEq gates.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LumaDecision {
     Skip,
     Strong,
@@ -1209,6 +1209,80 @@ pub(crate) fn apply_deblocking_parallel(
 mod tests {
     use super::*;
     use crate::exec::ExecContext;
+
+    /// The SIMD luma deblock kernels must be bit-identical to the scalar
+    /// reference. A high-contrast edge drives the strong filter far past
+    /// ±2·tc, so the §8.7.2.5.4 clip is load-bearing: a kernel that omits it
+    /// (as the NEON/SSE/AVX strong path once did) diverges here by tens of code
+    /// levels. Weak decisions are covered too so the whole kernel stays pinned.
+    /// On non-SIMD builds `resolve_*` returns the scalar fn and this is a no-op.
+    #[test]
+    fn simd_luma_kernels_match_scalar_reference() {
+        let simd_v = resolve_luma_vertical_plane();
+        let simd_h = resolve_luma_horizontal_plane();
+        // The driver filters out Skip before dispatch (`luma_*_segment_params`
+        // returns None), so the kernels are only ever called with Strong/Weak.
+        let decisions = [
+            LumaDecision::Strong,
+            LumaDecision::Weak {
+                do_p1: true,
+                do_q1: true,
+            },
+            LumaDecision::Weak {
+                do_p1: true,
+                do_q1: false,
+            },
+            LumaDecision::Weak {
+                do_p1: false,
+                do_q1: true,
+            },
+            LumaDecision::Weak {
+                do_p1: false,
+                do_q1: false,
+            },
+        ];
+        let w = 16usize;
+        for &tc in &[1i32, 2, 3, 5, 8, 14] {
+            for &maxv in &[255i32, 1023] {
+                for &(pv, qv) in &[(0u16, 255u16), (10, 240), (60, 190), (128, 132), (300, 700)] {
+                    let (pv, qv) = (pv.min(maxv as u16), qv.min(maxv as u16));
+                    // Vertical edge at column 8, one 4-row segment (rows 0..4).
+                    let mut vbase = vec![0u16; w * 4];
+                    for row in 0..4 {
+                        for col in 0..w {
+                            vbase[row * w + col] = if col < 8 { pv } else { qv };
+                        }
+                    }
+                    // Horizontal edge at row 8, one 4-column segment (cols 0..4).
+                    let mut hbase = vec![0u16; w * 16];
+                    for row in 0..16 {
+                        for col in 0..w {
+                            hbase[row * w + col] = if row < 8 { pv } else { qv };
+                        }
+                    }
+                    for &dec in &decisions {
+                        let mut a = vbase.clone();
+                        let mut b = vbase.clone();
+                        luma_vertical_plane_scalar(&mut a, w, 8, 0, 0, dec, tc, maxv);
+                        simd_v(&mut b, w, 8, 0, 0, dec, tc, maxv);
+                        assert_eq!(
+                            a, b,
+                            "vertical SIMD vs scalar diverged: tc={tc} maxv={maxv} pv={pv} qv={qv} dec={dec:?}"
+                        );
+
+                        let mut a = hbase.clone();
+                        let mut b = hbase.clone();
+                        luma_horizontal_plane_scalar(&mut a, w, 8, 0, 0, dec, tc, maxv);
+                        simd_h(&mut b, w, 8, 0, 0, dec, tc, maxv);
+                        assert_eq!(
+                            a, b,
+                            "horizontal SIMD vs scalar diverged: tc={tc} maxv={maxv} pv={pv} qv={qv} dec={dec:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Build a 2×2-CTB-worth 8×8-pixel grid (gw=gh=2) DeblockCtx with the given
     /// per-4×4 edge/Bs/slice arrays and no tiles.

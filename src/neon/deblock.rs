@@ -411,7 +411,21 @@ fn luma_filter4_neon(
     // Uniform per-segment strong decision (all lanes equal).
     let strong = vdupq_n_u32(if strong_all { u32::MAX } else { 0 });
 
-    let p0s = clamp_i32x4(
+    // §8.7.2.5.4: each strongly-filtered sample is clipped to ±2·tc around its
+    // original value, then to the sample range. `strong_clip(v, orig)` folds both
+    // clamps by tightening the [0, maxv] range to [orig−2tc, orig+2tc]. Omitting
+    // the ±2·tc clip (scalar `deblock_luma_segment` applies it) over-filters
+    // high-contrast edges and diverges from the serial decoder.
+    let two_tc = vdupq_n_s32(2 * tc);
+    let strong_clip = |v: int32x4_t, orig: int32x4_t| {
+        clamp_i32x4(
+            v,
+            vmaxq_s32(zero, vsubq_s32(orig, two_tc)),
+            vminq_s32(maxv_v, vaddq_s32(orig, two_tc)),
+        )
+    };
+
+    let p0s = strong_clip(
         vshrq_n_s32::<3>(vaddq_s32(
             vaddq_s32(
                 vaddq_s32(p2, vaddq_s32(vshlq_n_s32::<1>(p1), vshlq_n_s32::<1>(p0))),
@@ -419,18 +433,16 @@ fn luma_filter4_neon(
             ),
             vdupq_n_s32(4),
         )),
-        zero,
-        maxv_v,
+        p0,
     );
-    let p1s = clamp_i32x4(
+    let p1s = strong_clip(
         vshrq_n_s32::<2>(vaddq_s32(
             vaddq_s32(vaddq_s32(p2, p1), vaddq_s32(p0, q0)),
             vdupq_n_s32(2),
         )),
-        zero,
-        maxv_v,
+        p1,
     );
-    let p2s = clamp_i32x4(
+    let p2s = strong_clip(
         vshrq_n_s32::<3>(vaddq_s32(
             vaddq_s32(
                 vaddq_s32(vshlq_n_s32::<1>(p3), vmulq_s32(three, p2)),
@@ -438,10 +450,9 @@ fn luma_filter4_neon(
             ),
             vaddq_s32(q0, vdupq_n_s32(4)),
         )),
-        zero,
-        maxv_v,
+        p2,
     );
-    let q0s = clamp_i32x4(
+    let q0s = strong_clip(
         vshrq_n_s32::<3>(vaddq_s32(
             vaddq_s32(
                 vaddq_s32(p1, vshlq_n_s32::<1>(p0)),
@@ -449,24 +460,21 @@ fn luma_filter4_neon(
             ),
             vaddq_s32(q2, vdupq_n_s32(4)),
         )),
-        zero,
-        maxv_v,
+        q0,
     );
-    let q1s = clamp_i32x4(
+    let q1s = strong_clip(
         vshrq_n_s32::<2>(vaddq_s32(
             vaddq_s32(vaddq_s32(p0, q0), vaddq_s32(q1, q2)),
             vdupq_n_s32(2),
         )),
-        zero,
-        maxv_v,
+        q1,
     );
-    let q2s = clamp_i32x4(
+    let q2s = strong_clip(
         vshrq_n_s32::<3>(vaddq_s32(
             vaddq_s32(vaddq_s32(p0, q0), vaddq_s32(q1, vmulq_s32(three, q2))),
             vaddq_s32(vshlq_n_s32::<1>(q3), vdupq_n_s32(4)),
         )),
-        zero,
-        maxv_v,
+        q2,
     );
 
     let delta0 = vshrq_n_s32::<4>(vaddq_s32(
