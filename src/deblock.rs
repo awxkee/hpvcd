@@ -86,7 +86,49 @@ pub(crate) struct DeblockCtx<'a> {
     pub loop_filter_across_slices: bool,
     /// Resolved tile geometry when tiles are enabled and cross-tile filtering is
     /// disabled; `None` otherwise (no tile gating needed).
-    pub tile_grid: Option<crate::tiles::TileGrid>,
+    pub tile_grid: Option<&'a crate::tiles::TileGrid>,
+}
+
+#[derive(Default)]
+pub(crate) struct DeblockScratch {
+    pub(crate) snap_y: Vec<u16>,
+    pub(crate) snap_cb: Vec<u16>,
+    pub(crate) snap_cr: Vec<u16>,
+    pub(crate) suppressed: Vec<bool>,
+    bands: Vec<(usize, usize)>,
+}
+
+impl DeblockScratch {
+    pub(crate) fn new(
+        y_len: usize,
+        chroma_len: usize,
+        grid_len: usize,
+        plane_heights: (usize, usize),
+        log2_ctb: u32,
+        sub_h: usize,
+    ) -> Self {
+        let (h, ch) = plane_heights;
+        let ctb = 1usize << log2_ctb;
+        let cband = (ctb / sub_h.max(1)).max(1);
+        let band_capacity = h.div_ceil(ctb).max(ch.div_ceil(cband)) + 1;
+        Self {
+            snap_y: Vec::with_capacity(y_len),
+            snap_cb: Vec::with_capacity(chroma_len),
+            snap_cr: Vec::with_capacity(chroma_len),
+            suppressed: Vec::with_capacity(grid_len),
+            bands: Vec::with_capacity(band_capacity),
+        }
+    }
+
+    #[inline]
+    fn snapshot(&mut self, y: &[u16], cb: &[u16], cr: &[u16]) {
+        self.snap_y.clear();
+        self.snap_y.extend_from_slice(y);
+        self.snap_cb.clear();
+        self.snap_cb.extend_from_slice(cb);
+        self.snap_cr.clear();
+        self.snap_cr.extend_from_slice(cr);
+    }
 }
 
 impl DeblockCtx<'_> {
@@ -1016,15 +1058,14 @@ fn chroma_horizontal(
 /// CTB-aligned row bands covering `[0, total)`. Each band is a whole number of
 /// CTBs tall (except possibly the last), so no filter segment or edge straddles
 /// a boundary. Returns `(start, end)` pairs with `end` of the last == `total`.
-fn ctb_bands(total: usize, ctb: usize) -> Vec<(usize, usize)> {
-    let mut bands = Vec::new();
+fn ctb_bands(bands: &mut Vec<(usize, usize)>, total: usize, ctb: usize) {
+    bands.clear();
     let mut r = 0;
     while r < total {
         let end = (r + ctb).min(total);
         bands.push((r, end));
         r = end;
     }
-    bands
 }
 
 /// Row bands for the *horizontal* passes, whose internal boundaries are placed
@@ -1033,8 +1074,8 @@ fn ctb_bands(total: usize, ctb: usize) -> Vec<(usize, usize)> {
 /// edges' write spans is exactly the rows `≡ 3,4 (mod 8)`, so a boundary at
 /// `+4` never splits any edge's writes across two bands. The first band starts
 /// at 0 and the last ends at `total`.
-fn horiz_bands(total: usize, ctb: usize) -> Vec<(usize, usize)> {
-    let mut bands = Vec::new();
+fn horiz_bands(bands: &mut Vec<(usize, usize)>, total: usize, ctb: usize) {
+    bands.clear();
     let mut r = 0;
     while r < total {
         // Next boundary: first row > r that is ≡ 4 (mod 8) and ≥ r + ctb-ish
@@ -1055,7 +1096,6 @@ fn horiz_bands(total: usize, ctb: usize) -> Vec<(usize, usize)> {
         bands.push((r, end));
         r = end;
     }
-    bands
 }
 
 /// Result planes after deblocking.
@@ -1119,6 +1159,7 @@ pub(crate) fn apply_deblocking_parallel(
     pool: &ThreadPool,
     ctx: &DeblockCtx<'_>,
     log2_ctb: u32,
+    scratch: &mut DeblockScratch,
     mut y: Vec<u16>,
     mut cb: Vec<u16>,
     mut cr: Vec<u16>,
@@ -1127,13 +1168,14 @@ pub(crate) fn apply_deblocking_parallel(
     let w = ctx.w;
     let cw = ctx.cw;
     let suppress = suppression_active(ctx);
-    let snap_y = suppress.then(|| y.clone());
-    let snap_cb = suppress.then(|| cb.clone());
-    let snap_cr = suppress.then(|| cr.clone());
+    if suppress {
+        scratch.snapshot(&y, &cb, &cr);
+    }
 
     // ---- Luma vertical: row bands, no halo, in place ----
     {
-        let bands = ctb_bands(ctx.h, ctb);
+        ctb_bands(&mut scratch.bands, ctx.h, ctb);
+        let bands = &scratch.bands;
         let y_dm = DisjointMut::new(std::mem::take(&mut y));
         parallel_for(pool, bands.len(), |bi| {
             let (r0, r1) = bands[bi];
@@ -1141,14 +1183,15 @@ pub(crate) fn apply_deblocking_parallel(
             luma_vertical(ctx, &mut band, r0, r1);
         });
         y = y_dm.into_inner();
-        if let Some(snapshot) = &snap_y {
-            restore_luma(ctx, &mut y, snapshot);
+        if suppress {
+            restore_luma(ctx, &mut y, &scratch.snap_y);
         }
     }
 
     // ---- Luma horizontal: row bands, in place ----
     {
-        let bands = horiz_bands(ctx.h, ctb);
+        horiz_bands(&mut scratch.bands, ctx.h, ctb);
+        let bands = &scratch.bands;
         let y_dm = DisjointMut::new(std::mem::take(&mut y));
         parallel_for(pool, bands.len(), |bi| {
             let (r0, r1) = bands[bi];
@@ -1156,8 +1199,8 @@ pub(crate) fn apply_deblocking_parallel(
             luma_horizontal(ctx, &mut band, r0, r1);
         });
         y = y_dm.into_inner();
-        if let Some(snapshot) = &snap_y {
-            restore_luma(ctx, &mut y, snapshot);
+        if suppress {
+            restore_luma(ctx, &mut y, &scratch.snap_y);
         }
     }
 
@@ -1165,7 +1208,8 @@ pub(crate) fn apply_deblocking_parallel(
     if ctx.cw > 0 && ctx.ch > 0 {
         // Keep chroma bands luma-CTB-aligned by dividing by sub_h.
         let cband = (ctb / ctx.sub_h).max(1);
-        let bands = ctb_bands(ctx.ch, cband);
+        ctb_bands(&mut scratch.bands, ctx.ch, cband);
+        let bands = &scratch.bands;
         let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
         let cr_dm = DisjointMut::new(std::mem::take(&mut cr));
         parallel_for(pool, bands.len(), |bi| {
@@ -1176,16 +1220,17 @@ pub(crate) fn apply_deblocking_parallel(
         });
         cb = cb_dm.into_inner();
         cr = cr_dm.into_inner();
-        if let (Some(scb), Some(scr)) = (&snap_cb, &snap_cr) {
-            restore_chroma(ctx, &mut cb, scb);
-            restore_chroma(ctx, &mut cr, scr);
+        if suppress {
+            restore_chroma(ctx, &mut cb, &scratch.snap_cb);
+            restore_chroma(ctx, &mut cr, &scratch.snap_cr);
         }
     }
 
     // ---- Chroma horizontal: chroma-row bands, in place ----
     if ctx.cw > 0 && ctx.ch > 0 {
         let cband = (ctb / ctx.sub_h).max(1);
-        let bands = horiz_bands(ctx.ch, cband);
+        horiz_bands(&mut scratch.bands, ctx.ch, cband);
+        let bands = &scratch.bands;
         let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
         let cr_dm = DisjointMut::new(std::mem::take(&mut cr));
         parallel_for(pool, bands.len(), |bi| {
@@ -1196,9 +1241,9 @@ pub(crate) fn apply_deblocking_parallel(
         });
         cb = cb_dm.into_inner();
         cr = cr_dm.into_inner();
-        if let (Some(scb), Some(scr)) = (&snap_cb, &snap_cr) {
-            restore_chroma(ctx, &mut cb, scb);
-            restore_chroma(ctx, &mut cr, scr);
+        if suppress {
+            restore_chroma(ctx, &mut cb, &scratch.snap_cb);
+            restore_chroma(ctx, &mut cr, &scratch.snap_cr);
         }
     }
 
