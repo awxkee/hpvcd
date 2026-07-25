@@ -273,19 +273,19 @@ pub(crate) struct FullDecoder<'cab> {
     /// Inverse-transform output scratch (max 32×32 = 1024 i32 values)
     res_scratch: Box<[i32; 1024]>,
     /// Luma residual retained across Cb/Cr decoding when RExt
-    /// cross-component residual prediction is active.  Chroma residual coding
-    /// follows luma in the bitstream and reuses the co-located luma residual,
-    /// while `res_scratch` itself is reused for each chroma component.
+    /// cross-component residual prediction is active.
     cross_comp_luma: Box<[i32; 1024]>,
     /// i16 dequant/residual scratch, used on the 8-bit-depth path (half the width).
     deq_scratch16: Box<[i16; 1024]>,
     res_scratch16: Box<[i16; 1024]>,
     /// Parsed residual levels scratch (max 32×32), reused across TUs.
-    coeff_scratch: Vec<i32>,
+    coeff_scratch: Box<[i32; 1024]>,
+    /// Persistent deblocking schedules and PCM/TQB snapshots. Capacity is
+    /// reserved with the decoder worker so filtering never enters the allocator.
+    deblock_scratch: crate::deblock::DeblockScratch,
     /// Cached strong_intra_smoothing (avoids env-var lookup per TU)
     strong_smoothing: bool,
 
-    // ---- Inter-prediction state (video decoding) ----
     /// Current slice type (0=B, 1=P, 2=I).
     slice_type: u8,
     /// cabac_init_flag for the current slice (swaps P/B context init tables).
@@ -578,7 +578,15 @@ impl FullDecoder<'static> {
             cross_comp_luma: Box::new([0i32; 1024]),
             deq_scratch16: Box::new([0i16; 1024]),
             res_scratch16: Box::new([0i16; 1024]),
-            coeff_scratch: vec![0i32; 1024],
+            coeff_scratch: Box::new([0i32; 1024]),
+            deblock_scratch: crate::deblock::DeblockScratch::new(
+                w * h,
+                cw * ch,
+                grid_w * grid_h,
+                (h, ch),
+                log2_ctb,
+                sub_h,
+            ),
             cur_tile_id: 0,
             strong_smoothing: true,
             slice_type: hdr.slice_type,
@@ -1655,11 +1663,19 @@ impl<'cab> FullDecoder<'cab> {
             pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
             loop_filter_across_slices: self.pps.loop_filter_across_slices,
             tile_grid: match &self.tiles {
-                Some(g) if !g.loop_filter_across_tiles => Some(g.clone()),
+                Some(g) if !g.loop_filter_across_tiles => Some(g),
                 _ => None,
             },
         };
-        let out = crate::deblock::apply_deblocking_parallel(pool, &ctx, self.log2_ctb, y, cb, cr);
+        let out = crate::deblock::apply_deblocking_parallel(
+            pool,
+            &ctx,
+            self.log2_ctb,
+            &mut self.deblock_scratch,
+            y,
+            cb,
+            cr,
+        );
         self.y = crate::plane::Plane::owned(out.y);
         self.cb = crate::plane::Plane::owned(out.cb);
         self.cr = crate::plane::Plane::owned(out.cr);
@@ -1840,20 +1856,24 @@ impl<'cab> FullDecoder<'cab> {
         // common (no-PCM, no-TQB) picture pays nothing.
         let suppress_active = self.tqb.iter().any(|&b| b)
             || (self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b));
-        let supp: Vec<bool> = if suppress_active {
-            (0..gw * gh)
-                .map(|g| {
-                    self.tqb.get(g).copied().unwrap_or(false)
-                        || (self.sps.pcm_loop_filter_disabled
-                            && self.pcm.get(g).copied().unwrap_or(false))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let snap_y = suppress_active.then(|| self.y[..].to_vec());
-        let snap_cb = suppress_active.then(|| self.cb[..].to_vec());
-        let snap_cr = suppress_active.then(|| self.cr[..].to_vec());
+        // Move the worker-owned scratch out temporarily so the filtering code
+        // can continue borrowing the other decoder fields independently.
+        let mut deblock_scratch = std::mem::take(&mut self.deblock_scratch);
+        deblock_scratch.suppressed.clear();
+        if suppress_active {
+            deblock_scratch.suppressed.extend((0..gw * gh).map(|g| {
+                self.tqb.get(g).copied().unwrap_or(false)
+                    || (self.sps.pcm_loop_filter_disabled
+                        && self.pcm.get(g).copied().unwrap_or(false))
+            }));
+            deblock_scratch.snap_y.clear();
+            deblock_scratch.snap_y.extend_from_slice(&self.y);
+            deblock_scratch.snap_cb.clear();
+            deblock_scratch.snap_cb.extend_from_slice(&self.cb);
+            deblock_scratch.snap_cr.clear();
+            deblock_scratch.snap_cr.extend_from_slice(&self.cr);
+        }
+        let supp = &deblock_scratch.suppressed;
 
         // Restore exempt luma samples (whole 4×4 cells) from the pre-deblock
         // snapshot. Called after each luma pass so the next pass reads the
@@ -2018,8 +2038,8 @@ impl<'cab> FullDecoder<'cab> {
             }
             // Substitute exempt luma samples back before the next pass reads them
             // (and after the final pass, before SAO).
-            if let Some(snap) = &snap_y {
-                restore_luma(&mut self.y[..], snap, &supp);
+            if suppress_active {
+                restore_luma(&mut self.y[..], &deblock_scratch.snap_y, supp);
             }
         }
 
@@ -2135,11 +2155,12 @@ impl<'cab> FullDecoder<'cab> {
                 edge += edge_step;
             }
             // Substitute exempt chroma samples back after each chroma pass.
-            if let (Some(scb), Some(scr)) = (&snap_cb, &snap_cr) {
-                restore_chroma(&mut self.cb[..], scb, &supp);
-                restore_chroma(&mut self.cr[..], scr, &supp);
+            if suppress_active {
+                restore_chroma(&mut self.cb[..], &deblock_scratch.snap_cb, supp);
+                restore_chroma(&mut self.cr[..], &deblock_scratch.snap_cr, supp);
             }
         }
+        self.deblock_scratch = deblock_scratch;
     }
 
     /// Parallel SAO: flatten per-CTB params and dispatch CTB-row bands across
@@ -3566,7 +3587,6 @@ impl<'cab> FullDecoder<'cab> {
             } else {
                 None
             };
-            let mut coeffs = std::mem::take(&mut self.coeff_scratch);
             let rext = self.rext_residual(luma_mode, true);
             let (transform_skip, max_x, _last_y, max_abs_level, rdpcm) = residual_coding(
                 &mut self.cab,
@@ -3579,7 +3599,7 @@ impl<'cab> FullDecoder<'cab> {
                 ts_ctx,
                 self.cu_tqb,
                 &rext,
-                &mut coeffs,
+                &mut self.coeff_scratch[..],
             );
             self.cur_tu_rdpcm = rdpcm;
             self.reconstruct_luma(
@@ -3587,13 +3607,11 @@ impl<'cab> FullDecoder<'cab> {
                 y0,
                 log2_ts,
                 luma_mode,
-                &coeffs,
                 max_x + 1,
                 max_abs_level,
                 transform_skip,
                 cross_comp,
             );
-            self.coeff_scratch = coeffs;
         } else if !self.cur_cu_inter {
             // prediction only (no residual) still needs to fill rec for neighbors
             self.predict_only_luma(x0, y0, log2_ts, luma_mode);
@@ -3753,7 +3771,6 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             None
         };
-        let mut coeffs = std::mem::take(&mut self.coeff_scratch);
         let rext = self.rext_residual(mode, is_luma);
         let (transform_skip, _max_x, _last_y, max_abs_level, rdpcm) = residual_coding(
             &mut self.cab,
@@ -3766,18 +3783,17 @@ impl<'cab> FullDecoder<'cab> {
             ts_ctx,
             self.cu_tqb,
             &rext,
-            &mut coeffs,
+            &mut self.coeff_scratch[..],
         );
 
         self.cur_tu_rdpcm = rdpcm;
         let (rext_rot, rext_rdpcm) = self.rext_post_ops(transform_skip, n, mode);
         if self.cu_tqb {
             // Lossless: dequant/transform are bypassed; residual = parsed levels.
-            for (o, &c) in out[..n * n].iter_mut().zip(coeffs.iter()) {
+            for (o, &c) in out[..n * n].iter_mut().zip(self.coeff_scratch.iter()) {
                 *o = c;
             }
             apply_rext_residual_ops(&mut out[..n * n], n, rext_rot, rext_rdpcm);
-            self.coeff_scratch = coeffs;
             return;
         }
 
@@ -3810,7 +3826,7 @@ impl<'cab> FullDecoder<'cab> {
         if transform_skip {
             dequantize_transform_skip_scaled_into_i32(
                 exec,
-                &coeffs,
+                &self.coeff_scratch[..n * n],
                 n,
                 qp_prime_c,
                 bd,
@@ -3824,7 +3840,7 @@ impl<'cab> FullDecoder<'cab> {
             let deq = &mut self.deq_scratch;
             dequantize_scaled_into_i32(
                 exec,
-                &coeffs,
+                &self.coeff_scratch[..n * n],
                 n,
                 qp_prime_c,
                 bd,
@@ -3853,7 +3869,6 @@ impl<'cab> FullDecoder<'cab> {
                 );
             }
         }
-        self.coeff_scratch = coeffs;
     }
 
     /// Predict luma intra/inter and add the ACT residual into the plane.
@@ -4727,7 +4742,6 @@ impl<'cab> FullDecoder<'cab> {
         y0: usize,
         log2_ts: u32,
         mode: u8,
-        levels: &[i32],
         nx: usize,
         max_abs_level: i32,
         transform_skip: bool,
@@ -4746,6 +4760,7 @@ impl<'cab> FullDecoder<'cab> {
         let stride = self.w;
         let valid_w = self.w.saturating_sub(x0).min(n);
         let valid_h = self.h.saturating_sub(y0).min(n);
+        let levels = &self.coeff_scratch[..n * n];
 
         // 8-bit depth: residuals fit i16, halving memory traffic and widening SIMD.
         if self.bd <= 8 && !self.sps.extended_precision_processing {
@@ -5056,7 +5071,6 @@ impl<'cab> FullDecoder<'cab> {
         for (t, &cb) in cbf_cb[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cb {
-                let mut coeffs = std::mem::take(&mut self.coeff_scratch);
                 let ts_ctx = if self.pps.transform_skip_enabled
                     && !self.cu_tqb
                     && clog2 <= self.pps.log2_max_transform_skip_block_size
@@ -5077,7 +5091,7 @@ impl<'cab> FullDecoder<'cab> {
                     ts_ctx,
                     self.cu_tqb,
                     &rext,
-                    &mut coeffs,
+                    &mut self.coeff_scratch[..],
                 );
                 self.cur_tu_rdpcm = rdpcm;
                 self.reconstruct_chroma(
@@ -5086,14 +5100,12 @@ impl<'cab> FullDecoder<'cab> {
                     ty,
                     cn,
                     mode,
-                    &coeffs,
                     qp_prime_cb,
                     max_x + 1,
                     max_abs_level,
                     transform_skip,
                     cb_scale,
                 );
-                self.coeff_scratch = coeffs;
             } else if cb_scale != 0 {
                 self.reconstruct_cross_comp_only(true, cx0, ty, cn, mode, cb_scale);
             } else if !self.cur_cu_inter {
@@ -5121,7 +5133,6 @@ impl<'cab> FullDecoder<'cab> {
         for (t, &cr) in cbf_cr[..n_tb].iter().enumerate() {
             let ty = cy0 + t * cn;
             if cr {
-                let mut coeffs = std::mem::take(&mut self.coeff_scratch);
                 let ts_ctx = if self.pps.transform_skip_enabled
                     && !self.cu_tqb
                     && clog2 <= self.pps.log2_max_transform_skip_block_size
@@ -5142,7 +5153,7 @@ impl<'cab> FullDecoder<'cab> {
                     ts_ctx,
                     self.cu_tqb,
                     &rext,
-                    &mut coeffs,
+                    &mut self.coeff_scratch[..],
                 );
                 self.cur_tu_rdpcm = rdpcm;
                 self.reconstruct_chroma(
@@ -5151,14 +5162,12 @@ impl<'cab> FullDecoder<'cab> {
                     ty,
                     cn,
                     mode,
-                    &coeffs,
                     qp_prime_cr,
                     max_x + 1,
                     max_abs_level,
                     transform_skip,
                     cr_scale,
                 );
-                self.coeff_scratch = coeffs;
             } else if cr_scale != 0 {
                 self.reconstruct_cross_comp_only(false, cx0, ty, cn, mode, cr_scale);
             } else if !self.cur_cu_inter {
@@ -5284,7 +5293,6 @@ impl<'cab> FullDecoder<'cab> {
         cy0: usize,
         n: usize,
         mode: u8,
-        levels: &[i32],
         qp_prime: i32,
         nx: usize,
         max_abs_level: i32,
@@ -5310,6 +5318,7 @@ impl<'cab> FullDecoder<'cab> {
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
+        let levels = &self.coeff_scratch[..n2];
         // Cross-component prediction can grow an otherwise 8-bit residual
         // beyond i16, so retain the i16 fast path only when no scaling is used.
         if self.bd_c <= 8 && res_scale == 0 && !self.sps.extended_precision_processing {
@@ -5721,7 +5730,8 @@ impl RowFactory {
             cross_comp_luma: Box::new([0i32; 1024]),
             deq_scratch16: Box::new([0i16; 1024]),
             res_scratch16: Box::new([0i16; 1024]),
-            coeff_scratch: vec![0i32; 1024],
+            coeff_scratch: Box::new([0i32; 1024]),
+            deblock_scratch: crate::deblock::DeblockScratch::default(),
             strong_smoothing: self.strong_smoothing,
             slice_type: self.slice_type,
             cabac_init: self.cabac_init,

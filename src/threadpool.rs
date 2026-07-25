@@ -27,9 +27,11 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use std::any::Any;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut, Range};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -361,12 +363,25 @@ impl ThreadPool {
     {
         let scope = Scope {
             pool: self,
-            outstanding: Mutex::new(0),
+            state: Mutex::new(ScopeState {
+                outstanding: 0,
+                panic: None,
+            }),
             done: Condvar::new(),
         };
-        let result = f(&scope);
-        scope.wait();
-        result
+        // A panic while building the scope must not let already-submitted jobs
+        // outlive their borrowed data. Join them first, then resume that panic.
+        let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
+        let worker_panic = scope.wait();
+        match result {
+            Ok(value) => {
+                if let Some(payload) = worker_panic {
+                    resume_unwind(payload);
+                }
+                value
+            }
+            Err(payload) => resume_unwind(payload),
+        }
     }
 }
 
@@ -416,8 +431,15 @@ fn worker_loop(shared: Arc<Shared>, id: usize) {
 /// guarantees they all complete before the borrow ends.
 pub(crate) struct Scope<'scope> {
     pool: &'scope ThreadPool,
-    outstanding: Mutex<usize>,
+    state: Mutex<ScopeState>,
     done: Condvar,
+}
+
+struct ScopeState {
+    outstanding: usize,
+    /// First worker panic wins. The scope still joins all remaining jobs before
+    /// resuming it on the thread that called [`ThreadPool::scope`].
+    panic: Option<Box<dyn Any + Send + 'static>>,
 }
 
 impl<'scope> Scope<'scope> {
@@ -426,7 +448,10 @@ impl<'scope> Scope<'scope> {
     where
         F: FnOnce() + Send + 'scope,
     {
-        *self.outstanding.lock().unwrap() += 1;
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outstanding += 1;
 
         // The scope out-lives every job (we join in `wait` before returning),
         // so widening the job lifetime to 'static for storage on the shared
@@ -435,7 +460,10 @@ impl<'scope> Scope<'scope> {
         let scope_addr = scope_ptr as usize;
 
         let job: Box<dyn FnOnce() + Send + 'scope> = Box::new(move || {
-            f();
+            // A worker must survive user-code panics long enough to publish
+            // completion. The payload is propagated by `scope` after all jobs
+            // using borrowed data have been joined.
+            let result = catch_unwind(AssertUnwindSafe(f));
             // SAFETY: `wait` has not returned yet — it only returns after
             // observing `outstanding == 0` *while holding the lock*, and this
             // job still holds that lock across the decrement + notify below, so
@@ -444,14 +472,19 @@ impl<'scope> Scope<'scope> {
             // return and the `Scope` may be destroyed — so we must not touch
             // `scope` after the `MutexGuard` is dropped.
             let scope = unsafe { &*(scope_addr as *const Scope<'scope>) };
-            let mut n = scope.outstanding.lock().unwrap();
-            *n -= 1;
-            if *n == 0 {
+            let mut state = scope.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(payload) = result
+                && state.panic.is_none()
+            {
+                state.panic = Some(payload);
+            }
+            state.outstanding -= 1;
+            if state.outstanding == 0 {
                 // Notify while still holding the lock; `wait` re-checks the
                 // count under the same lock, so it cannot have returned yet.
                 scope.done.notify_all();
             }
-            // `n` (the guard) drops here, ending all access to `scope`.
+            // `state` (the guard) drops here, ending all access to `scope`.
         });
 
         // SAFETY: transmute the job's lifetime to 'static for queue storage.
@@ -469,7 +502,7 @@ impl<'scope> Scope<'scope> {
     /// Block until all spawned jobs finish. The calling thread helps by draining
     /// jobs itself (using the external-submitter index) so it is never idle
     /// while work remains.
-    fn wait(&self) {
+    fn wait(&self) -> Option<Box<dyn Any + Send + 'static>> {
         let external = self.pool.shared.deques.len();
         loop {
             // Help drain outstanding work without holding the lock, so workers
@@ -486,13 +519,13 @@ impl<'scope> Scope<'scope> {
             // observe zero here, every job has already released the lock and
             // will not touch `self` again. This is what prevents the
             // stack-use-after-scope when `wait` returns and `self` is dropped.
-            let guard = self.outstanding.lock().unwrap();
-            if *guard == 0 {
-                return;
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.outstanding == 0 {
+                return state.panic.take();
             }
             // Some jobs are still running on other workers. Block until one
             // signals completion, then retry stealing.
-            let _unused = self.done.wait(guard).unwrap();
+            let _unused = self.done.wait(state).unwrap_or_else(|p| p.into_inner());
         }
     }
 }
@@ -573,5 +606,45 @@ mod tests {
             });
         }
         assert_eq!(sum.load(Ordering::Relaxed), 45 * 5);
+    }
+
+    #[test]
+    fn worker_panic_is_propagated_after_all_jobs_finish() {
+        let pool = ThreadPool::new(3);
+        let completed = AtomicUsize::new(0);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            parallel_for(&pool, 16, |i| {
+                if i == 7 {
+                    panic!("worker boom");
+                }
+                completed.fetch_add(1, Ordering::Relaxed);
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(completed.load(Ordering::Relaxed), 15);
+
+        // Caught worker panics must not kill pool threads or poison later work.
+        parallel_for(&pool, 8, |_| {
+            completed.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(completed.load(Ordering::Relaxed), 23);
+    }
+
+    #[test]
+    fn scope_body_panic_still_joins_borrowing_jobs() {
+        let pool = ThreadPool::new(3);
+        let completed = AtomicUsize::new(0);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            pool.scope(|scope| {
+                for _ in 0..16 {
+                    scope.spawn(|| {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    });
+                }
+                panic!("scope body boom");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(completed.load(Ordering::Relaxed), 16);
     }
 }
