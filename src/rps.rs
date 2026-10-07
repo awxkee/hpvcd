@@ -170,8 +170,8 @@ fn derive_inter_rps(
         out.delta_poc_s0.push(delta_rps);
         out.used_s0.push(used.get(total).copied().unwrap_or(false));
     }
-    for j in 0..n_neg {
-        let dpoc = src.delta_poc_s0[j] + delta_rps;
+    for (j, &d) in src.delta_poc_s0.iter().enumerate() {
+        let dpoc = d + delta_rps;
         if dpoc < 0 && use_delta.get(j).copied().unwrap_or(false) {
             out.delta_poc_s0.push(dpoc);
             out.used_s0.push(used.get(j).copied().unwrap_or(false));
@@ -191,8 +191,8 @@ fn derive_inter_rps(
         out.delta_poc_s1.push(delta_rps);
         out.used_s1.push(used.get(total).copied().unwrap_or(false));
     }
-    for j in 0..n_pos {
-        let dpoc = src.delta_poc_s1[j] + delta_rps;
+    for (j, &d) in src.delta_poc_s1.iter().enumerate() {
+        let dpoc = d + delta_rps;
         let idx = n_neg + j;
         if dpoc > 0 && use_delta.get(idx).copied().unwrap_or(false) {
             out.delta_poc_s1.push(dpoc);
