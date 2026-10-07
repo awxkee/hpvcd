@@ -406,6 +406,8 @@ pub struct DecodedYuv {
     pub gain_map: Option<GainMapFrame>,
     pub bit_depth: BitDepth,
     pub chroma: ChromaFormat,
+    /// How to interpret the planes: the SPS VUI color description when it
+    /// specifies a matrix, otherwise the item's `colr` CICP; plus any ICC.
     pub color: ColorMetadata,
     pub orientation: Orientation,
     pub clean_aperture: Option<CleanAperture>,
@@ -643,7 +645,7 @@ fn decode_gain_map_frame_item(
         planes: native_to_visible_buffer(planes, width as usize, height as usize, crop)?,
         bit_depth,
         chroma,
-        color: gain_map_color_metadata(&item.color, vui_color),
+        color: coded_color_metadata(&item.color, vui_color),
         orientation: item.orientation,
         metadata: None,
     })
@@ -668,7 +670,7 @@ fn decode_gain_map_frame_grid(
         planes: decoded.planes,
         bit_depth: decoded.bit_depth,
         chroma: decoded.chroma,
-        color: gain_map_color_metadata(item_color, decoded.vui_color),
+        color: coded_color_metadata(item_color, decoded.vui_color),
         orientation: grid.orientation,
         metadata: None,
     })
@@ -736,7 +738,12 @@ fn decode_gain_map(
     }))
 }
 
-fn gain_map_color_metadata(item_color: &ColorMetadata, vui_color: Cicp) -> ColorMetadata {
+/// Color signalling for raw-YCbCr output. The SPS VUI describes how the
+/// samples were actually coded (matrix, range), so a VUI with a specified
+/// matrix wins over the item's `colr` CICP; the item's ICC profile is kept.
+/// iPhone HEICs depend on this: their primary has only an ICC `colr` and
+/// signals full-range BT.601 in the VUI alone.
+fn coded_color_metadata(item_color: &ColorMetadata, vui_color: Cicp) -> ColorMetadata {
     let mut color = item_color.clone();
     if vui_color.matrix != MatrixCoefficients::Unspecified {
         color.cicp = Some(vui_color);
@@ -786,7 +793,7 @@ pub(crate) fn decode_heic_yuv_with(
     let sample = file
         .get(start..end)
         .ok_or_else(|| DecodeError::Bitstream("image data extends past file end".into()))?;
-    let (planes, _) = decode_hevc_item_native(
+    let (planes, vui_color) = decode_hevc_item_native(
         sample,
         &heif.primary.hvcc,
         decoder.exec(),
@@ -816,7 +823,7 @@ pub(crate) fn decode_heic_yuv_with(
         gain_map,
         bit_depth,
         chroma,
-        color: heif.primary.color,
+        color: coded_color_metadata(&heif.primary.color, vui_color),
         orientation: heif.primary.orientation,
         clean_aperture: heif.primary.clap,
         pixel_aspect_ratio: heif.primary.pasp,
@@ -1198,7 +1205,7 @@ fn decode_grid_yuv(
         gain_map,
         bit_depth: decoded.bit_depth,
         chroma: decoded.chroma,
-        color: heif_file.primary.color.clone(),
+        color: coded_color_metadata(&heif_file.primary.color, decoded.vui_color),
         orientation: grid.orientation,
         clean_aperture: heif_file.primary.clap,
         pixel_aspect_ratio: heif_file.primary.pasp,
@@ -2205,5 +2212,31 @@ fn rotate_buf<T: Copy + Default>(
             Ok(out)
         }
         _ => Ok(pixels),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vui_describes_the_planes_when_colr_is_icc_only() {
+        // iPhone primary: ICC `colr` only; VUI says full-range BT.601, P3.
+        let item = ColorMetadata {
+            cicp: None,
+            icc: Some(vec![1, 2, 3]),
+        };
+        let vui = Cicp {
+            primaries: Primaries::Smpte432,
+            transfer: TransferFunction::Srgb,
+            matrix: MatrixCoefficients::Smpte170m,
+            full_range: true,
+        };
+        let color = coded_color_metadata(&item, vui);
+        assert_eq!(color.cicp, Some(vui));
+        assert_eq!(color.icc, item.icc);
+        // A VUI without a color description leaves the item's signalling.
+        let color = coded_color_metadata(&item, Cicp::unspecified());
+        assert_eq!(color.cicp, None);
     }
 }
