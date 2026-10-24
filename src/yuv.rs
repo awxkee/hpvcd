@@ -196,10 +196,11 @@ impl Cvt<'_> {
         } else {
             Q13_KUV_LIMITED
         };
+        // An unspecified matrix is BT.601, as in libheif, FFmpeg and ImageIO.
         let (cr_r0, cb_g0, cr_g0, cb_b0) = match color.matrix {
-            MatrixCoefficients::Bt470Bg | MatrixCoefficients::Smpte170m => {
-                (11485i64, -2819i64, -5851i64, 14516i64)
-            }
+            MatrixCoefficients::Bt470Bg
+            | MatrixCoefficients::Smpte170m
+            | MatrixCoefficients::Unspecified => (11485i64, -2819i64, -5851i64, 14516i64),
             MatrixCoefficients::Bt2020Ncl => (12080i64, -1348i64, -4681i64, 17546i64),
             MatrixCoefficients::Identity => (0, 0, 0, 0),
             _ => (12901i64, -1534i64, -3835i64, 15201i64), // BT.709
@@ -752,5 +753,58 @@ mod tests {
             ImageBuffer::Rgb8(rgb) => assert_eq!(rgb, vec![0, 0, 0, 255, 255, 255]),
             _ => panic!("expected 8-bit RGB"),
         }
+    }
+
+    fn rgb8_444(y: u8, cb: u8, cr: u8, matrix: MatrixCoefficients) -> Vec<u8> {
+        let yuv = YuvPlanes {
+            y: vec![y.into()],
+            cb: vec![cb.into()],
+            cr: vec![cr.into()],
+            width: 1,
+            height: 1,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: BitDepth::Eight,
+        };
+        let color = Cicp {
+            matrix,
+            full_range: true,
+            ..Cicp::unspecified()
+        };
+        match yuv_to_rgb_window_with_color(&yuv, 1, 1, 0, 0, &color) {
+            ImageBuffer::Rgb8(rgb) => rgb,
+            _ => panic!("expected 8-bit RGB"),
+        }
+    }
+
+    /// hpvca writes `nclx` 2/2/2 (all unspecified) and codes BT.601; libheif,
+    /// FFmpeg and ImageIO all read an unspecified matrix as BT.601. Converting
+    /// it as BT.709 shifted saturated colours by up to ~30 levels.
+    #[test]
+    fn unspecified_matrix_converts_as_bt601() {
+        for &(y, cb, cr) in &[(128u8, 60u8, 200u8), (90, 200, 70), (200, 128, 128)] {
+            let unspecified = rgb8_444(y, cb, cr, MatrixCoefficients::Unspecified);
+            assert_eq!(
+                unspecified,
+                rgb8_444(y, cb, cr, MatrixCoefficients::Smpte170m),
+                "Y={y} Cb={cb} Cr={cr}"
+            );
+            let (yf, cbf, crf) = (y as f64, cb as f64 - 128.0, cr as f64 - 128.0);
+            let reference = [
+                yf + 1.402 * crf,
+                yf - 0.344136 * cbf - 0.714136 * crf,
+                yf + 1.772 * cbf,
+            ];
+            for (got, want) in unspecified.iter().zip(reference) {
+                let want = want.round().clamp(0.0, 255.0);
+                assert!(
+                    (*got as f64 - want).abs() <= 1.0,
+                    "{unspecified:?} vs {reference:?}"
+                );
+            }
+        }
+        assert_ne!(
+            rgb8_444(128, 60, 200, MatrixCoefficients::Unspecified),
+            rgb8_444(128, 60, 200, MatrixCoefficients::Bt709)
+        );
     }
 }

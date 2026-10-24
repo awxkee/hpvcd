@@ -751,6 +751,19 @@ fn coded_color_metadata(item_color: &ColorMetadata, vui_color: Cicp) -> ColorMet
     color
 }
 
+/// Color encoding for the YCbCr→RGB step. The VUI describes how the samples
+/// were coded, so a VUI with a specified matrix wins; otherwise the item's
+/// `colr` CICP; otherwise (ICC-only or no `colr`) the MIAF default, full-range
+/// BT.601. A `colr` that itself leaves the matrix unspecified is converted as
+/// BT.601 too, matching libheif, FFmpeg and ImageIO.
+fn rgb_color_encoding(vui_color: Cicp, item_color: &ColorMetadata) -> Cicp {
+    if vui_color.matrix != MatrixCoefficients::Unspecified {
+        vui_color
+    } else {
+        item_color.color_encoding()
+    }
+}
+
 /// Decode a HEIF/HEIC file and return typed, owning, strided raw YCbCr
 /// planes using a default [`Decoder`]. Eight-bit items use `u8`; 10/12-bit
 /// items use `u16`. Single-item images retain coded stride and padding.
@@ -1540,17 +1553,7 @@ fn decode_heic_impl(
     let dh = heif.primary.display_h as usize;
     decoder.check_dims(dw, dh)?;
 
-    // Color encoding for the YCbCr→RGB step.
-    // The VUI matrix/range values describe how the YCbCr was encoded; prefer
-    // those.  If VUI says "unspecified" (matrix==2), fall back to the HEIF
-    // `colr` box, and if that is an ICC profile (no explicit CICP), default
-    // to sRGB (full-range BT.709).
-    // Priority: VUI (from HEVC SPS) > CICP from colr box > sRGB fallback
-    let color_enc = if vui_color.matrix != MatrixCoefficients::Unspecified {
-        vui_color
-    } else {
-        heif.primary.color.cicp.unwrap_or_else(Cicp::srgb)
-    };
+    let color_enc = rgb_color_encoding(vui_color, &heif.primary.color);
     let crop = visible_crop_from_hvcc(&heif.primary.hvcc);
     let rgb = yuv::yuv_to_rgb_window_with_color_pool(
         &yuv_planes,
@@ -1811,16 +1814,16 @@ fn decode_grid(
         } else {
             &fallback_hvcc
         };
-        if let Ok((sps, _)) = config::parse_hvcc_full(hvcc_ref) {
-            Cicp {
+        let vui_color = match config::parse_hvcc_full(hvcc_ref) {
+            Ok((sps, _)) => Cicp {
                 primaries: Primaries::from_u8(sps.color_primaries),
                 transfer: TransferFunction::from_u8(sps.transfer_characteristics),
                 matrix: MatrixCoefficients::from_u8(sps.matrix_coefficients),
                 full_range: sps.video_full_range,
-            }
-        } else {
-            heif_file.primary.color.cicp.unwrap_or_else(Cicp::srgb)
-        }
+            },
+            Err(_) => Cicp::unspecified(),
+        };
+        rgb_color_encoding(vui_color, &heif_file.primary.color)
     };
 
     let bit_depth = {
@@ -2238,5 +2241,36 @@ mod tests {
         // A VUI without a color description leaves the item's signalling.
         let color = coded_color_metadata(&item, Cicp::unspecified());
         assert_eq!(color.cicp, None);
+    }
+
+    #[test]
+    fn rgb_color_encoding_priority() {
+        let bt709_vui = Cicp {
+            matrix: MatrixCoefficients::Bt709,
+            full_range: false,
+            ..Cicp::unspecified()
+        };
+        let nclx_unspecified = ColorMetadata::from_cicp(Cicp {
+            full_range: true,
+            ..Cicp::unspecified()
+        });
+        // A VUI with a matrix describes the coded samples and wins.
+        assert_eq!(rgb_color_encoding(bt709_vui, &nclx_unspecified), bt709_vui);
+        // Otherwise the item's nclx is used as-is (an unspecified matrix there
+        // is converted as BT.601 by the YCbCr->RGB step).
+        assert_eq!(
+            rgb_color_encoding(Cicp::unspecified(), &nclx_unspecified),
+            nclx_unspecified.cicp.unwrap()
+        );
+        // ICC-only or no `colr`: the MIAF default, full-range BT.601.
+        for item in [
+            ColorMetadata::default(),
+            ColorMetadata::from_icc(vec![0; 4]),
+        ] {
+            let enc = rgb_color_encoding(Cicp::unspecified(), &item);
+            assert_eq!(enc, Cicp::heif_default());
+            assert_eq!(enc.matrix, MatrixCoefficients::Smpte170m);
+            assert!(enc.full_range);
+        }
     }
 }

@@ -185,6 +185,17 @@ impl Cicp {
             full_range: true,
         }
     }
+    /// MIAF default when neither the VUI nor a `colr` box gives a matrix:
+    /// sRGB primaries and transfer, BT.601 matrix, full range (ISO/IEC
+    /// 23000-22 §7.3.6.4; libheif uses the same default).
+    pub const fn heif_default() -> Self {
+        Self {
+            primaries: Primaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            matrix: MatrixCoefficients::Smpte170m,
+            full_range: true,
+        }
+    }
     pub const fn bt709() -> Self {
         Self {
             primaries: Primaries::Bt709,
@@ -247,9 +258,10 @@ impl ColorMetadata {
         }
     }
 
-    /// CICP encoding for driving the YCbCr→RGB conversion; falls back to sRGB.
+    /// CICP encoding for driving the YCbCr→RGB conversion; falls back to the
+    /// MIAF default ([`Cicp::heif_default`]).
     pub fn color_encoding(&self) -> Cicp {
-        self.cicp.unwrap_or_else(Cicp::srgb)
+        self.cicp.unwrap_or_else(Cicp::heif_default)
     }
     pub fn is_empty(&self) -> bool {
         self.cicp.is_none() && self.icc.is_none()
