@@ -48,6 +48,14 @@ const MODE_DC: u8 = 1;
 /// and the diagonal ramp dominate). ~64 CTBs ≈ a 512×512 picture at 64×64 CTBs.
 const WAVEFRONT_MIN_CTBS: usize = 64;
 
+fn box_array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
+    vec![value; N]
+        .into_boxed_slice()
+        .try_into()
+        .ok()
+        .expect("boxed slice length matches the array length")
+}
+
 #[inline(always)]
 fn sort3_u8(mut v: [u8; 3]) -> [u8; 3] {
     if v[1] < v[0] {
@@ -288,6 +296,8 @@ pub(crate) struct FullDecoder<'cab> {
 
     /// Current slice type (0=B, 1=P, 2=I).
     slice_type: u8,
+    /// Whether any independent slice in this picture can write inter motion.
+    may_have_inter: bool,
     /// cabac_init_flag for the current slice (swaps P/B context init tables).
     cabac_init: bool,
     /// Explicit weighted-prediction table for the current slice, when weighted
@@ -331,7 +341,6 @@ pub(crate) struct FullDecoder<'cab> {
     mc_pred0: Vec<i16>,
     mc_pred1: Vec<i16>,
     mc_tmp: Vec<i32>,
-    chroma_scratch: Box<[u16; 1024]>,
 }
 
 impl FullDecoder<'static> {
@@ -573,12 +582,12 @@ impl FullDecoder<'static> {
             wpp_palette_snap: vec![None; ctb_rows],
             wpp_pctx_snap: vec![None; ctb_rows],
             scratch: intra::IntraScratch::new(),
-            deq_scratch: Box::new([0i32; 1024]),
-            res_scratch: Box::new([0i32; 1024]),
-            cross_comp_luma: Box::new([0i32; 1024]),
-            deq_scratch16: Box::new([0i16; 1024]),
-            res_scratch16: Box::new([0i16; 1024]),
-            coeff_scratch: Box::new([0i32; 1024]),
+            deq_scratch: box_array(0),
+            res_scratch: box_array(0),
+            cross_comp_luma: box_array(0),
+            deq_scratch16: box_array(0),
+            res_scratch16: box_array(0),
+            coeff_scratch: box_array(0),
             deblock_scratch: crate::deblock::DeblockScratch::new(
                 w * h,
                 cw * ch,
@@ -590,6 +599,7 @@ impl FullDecoder<'static> {
             cur_tile_id: 0,
             strong_smoothing: true,
             slice_type: hdr.slice_type,
+            may_have_inter: hdr.slice_type != crate::inter::SLICE_I,
             cabac_init: hdr.cabac_init,
             pred_weights: hdr.pred_weights.clone(),
             motion: crate::plane::Plane::owned(
@@ -614,7 +624,6 @@ impl FullDecoder<'static> {
             mc_tmp: Vec::new(),
             sps,
             pps,
-            chroma_scratch: Box::new([0; 1024]),
         })
     }
 }
@@ -735,6 +744,7 @@ impl<'cab> FullDecoder<'cab> {
             // slice-owned state. Dependent segments intentionally retain these
             // values from their parent independent segment.
             self.slice_type = hdr.slice_type;
+            self.may_have_inter |= hdr.slice_type != crate::inter::SLICE_I;
             self.cabac_init = hdr.cabac_init;
             self.pred_weights = hdr.pred_weights.clone();
             self.mvd_l1_zero = hdr.mvd_l1_zero;
@@ -1453,10 +1463,6 @@ impl<'cab> FullDecoder<'cab> {
         // In-loop filters run in HEVC order: deblocking first, then SAO. They
         // are independently gated: deblocking runs unless it is disabled (PPS or
         // a slice-level override), while SAO runs only when the SPS enables it.
-        // Derive the coefficient-based deblock BS (§8.7.2.4) now that the whole
-        // picture's transform edges and nonzero-coefficient flags are known. A
-        // no-op for all-intra pictures (their edges already hold BS 2).
-        self.finalize_coeff_bs();
         // Deblocking runs if *any* slice in the picture enables it; each edge
         // then consults the parameters of the slice that owns its q-side sample
         // (§8.7.2), rather than a single global copy overwritten by the last
@@ -1468,6 +1474,7 @@ impl<'cab> FullDecoder<'cab> {
             !self.deblocking_disabled
         };
         if any_deblock {
+            self.finalize_coeff_bs();
             match deblock_pool {
                 Some(p) if p.threads() > 1 && self.ctb_rows > 1 => {
                     self.apply_deblocking_parallel(p)
@@ -1651,7 +1658,11 @@ impl<'cab> FullDecoder<'cab> {
             default_qp: self.slice_qp as i16,
             log2_ctb: self.log2_ctb,
             qp_y_map: &self.qp_y_map[..],
-            tqb: &self.tqb[..],
+            tqb: if self.pps.transquant_bypass_enabled {
+                &self.tqb[..]
+            } else {
+                &[]
+            },
             edge_v: &self.edge_v[..],
             edge_h: &self.edge_h[..],
             bs_v: &self.bs_v[..],
@@ -1854,8 +1865,7 @@ impl<'cab> FullDecoder<'cab> {
         // while letting the non-exempt neighbour filter normally. The snapshot and
         // the per-cell mask are only built when some CU is actually exempt, so the
         // common (no-PCM, no-TQB) picture pays nothing.
-        let suppress_active = self.tqb.iter().any(|&b| b)
-            || (self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b));
+        let suppress_active = self.has_loop_filter_exempt_blocks();
         // Move the worker-owned scratch out temporarily so the filtering code
         // can continue borrowing the other decoder fields independently.
         let mut deblock_scratch = std::mem::take(&mut self.deblock_scratch);
@@ -2228,6 +2238,12 @@ impl<'cab> FullDecoder<'cab> {
         (active, needs_src)
     }
 
+    fn has_loop_filter_exempt_blocks(&self) -> bool {
+        // Only a PPS that enables transquant bypass can mark any TQB blocks.
+        (self.pps.transquant_bypass_enabled && self.tqb.iter().any(|&b| b))
+            || (self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b))
+    }
+
     /// Whether SAO edge-offset must honour slice/tile/PCM/TQB boundary
     /// availability (§8.7.3.2). False for the common single-slice, no-tile,
     /// no-PCM picture, where the fast SIMD/scalar EO path is exact.
@@ -2245,14 +2261,7 @@ impl<'cab> FullDecoder<'cab> {
         {
             return true;
         }
-        if self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b) {
-            return true;
-        }
-        // Transquant-bypass samples are always loop-filter exempt.
-        if self.tqb.iter().any(|&b| b) {
-            return true;
-        }
-        false
+        self.has_loop_filter_exempt_blocks()
     }
 
     /// Build the boundary map view used by the gated SAO edge-offset path.
@@ -2326,8 +2335,7 @@ impl<'cab> FullDecoder<'cab> {
         // the gated edge-offset kernel already leaves an exempt centre untouched,
         // but the pointwise band-offset kernel does not, so the revert makes both
         // uniform. Only built when a CU is actually exempt.
-        let sao_suppress = self.tqb.iter().any(|&b| b)
-            || (self.sps.pcm_loop_filter_disabled && self.pcm.iter().any(|&b| b));
+        let sao_suppress = self.has_loop_filter_exempt_blocks();
         let (sao_supp, sao_snap_y, sao_snap_cb, sao_snap_cr) = if sao_suppress {
             let supp: Vec<bool> = (0..gw * gh)
                 .map(|g| {
@@ -2977,7 +2985,7 @@ impl<'cab> FullDecoder<'cab> {
         // In an all-intra picture every TU/PU boundary was assigned BS=2 as it
         // was decoded. The post-picture inter/coefficient derivation would only
         // rescan the complete metadata grid without changing anything.
-        if self.motion.iter().all(|mi| mi.is_intra) {
+        if !self.may_have_inter || self.motion.iter().all(|mi| mi.is_intra) {
             return;
         }
         let gw = self.grid_w;
@@ -4373,11 +4381,11 @@ impl<'cab> FullDecoder<'cab> {
         if !ts_or_tqb {
             return (false, None);
         }
-        let rotate = transform_skip
-            && !self.cu_tqb
-            && self.sps.transform_skip_rotation_enabled
-            && n == 4
-            && !self.cur_cu_inter;
+        // §8.6.2 / §8.6.4.2 (and HM `isNonTransformedResidualRotated`): the
+        // rotation applies to every intra 4×4 TB that bypasses the transform,
+        // transquant-bypass included — ffmpeg skips bypass blocks here and is
+        // non-conformant for lossless streams with the flag set.
+        let rotate = self.sps.transform_skip_rotation_enabled && n == 4 && !self.cur_cu_inter;
         let dir = if self.cur_cu_inter {
             self.cur_tu_rdpcm
         } else if self.sps.implicit_rdpcm_enabled && (mode == 10 || mode == 26) {
@@ -4404,6 +4412,71 @@ impl<'cab> FullDecoder<'cab> {
             is_inter: self.cur_cu_inter,
         }
     }
+}
+
+/// Gather the two reference edges one luma metadata cell at a time. Tile,
+/// slice, constrained intra and decoded-state checks are constant within a
+/// 4×4 luma cell. The cell spans `4 / subsampling` samples on each plane axis.
+#[inline]
+fn gather_intra_refs(
+    plane: &[u16],
+    (width, height): (usize, usize),
+    (x0, y0): (usize, usize),
+    (cell_w, cell_h): (usize, usize),
+    above: &mut [Option<u16>],
+    left: &mut [Option<u16>],
+    available: impl Fn(i32, i32) -> bool,
+) -> Option<u16> {
+    let above_y = y0.checked_sub(1).filter(|&y| y < height);
+    let left_x = x0.checked_sub(1).filter(|&x| x < width);
+
+    if let Some(y) = above_y {
+        let valid_w = width.saturating_sub(x0).min(above.len());
+        let (inside, outside) = above.split_at_mut(valid_w);
+        outside.fill(None);
+
+        // TU origins align to whole cells. Fall back to single-sample groups
+        // for any unaligned origin so a group can never cross a cell boundary.
+        let step = if x0 & (cell_w - 1) == 0 { cell_w } else { 1 };
+        for (i, refs) in inside.chunks_mut(step).enumerate() {
+            let x = x0 + i * step;
+            if available(x as i32, y as i32) {
+                let start = y * width + x;
+                let samples = &plane[start..start + refs.len()];
+                for (dst, &sample) in refs.iter_mut().zip(samples) {
+                    *dst = Some(sample);
+                }
+            } else {
+                refs.fill(None);
+            }
+        }
+    } else {
+        above.fill(None);
+    }
+
+    if let Some(x) = left_x {
+        let valid_h = height.saturating_sub(y0).min(left.len());
+        let (inside, outside) = left.split_at_mut(valid_h);
+        outside.fill(None);
+
+        let step = if y0 & (cell_h - 1) == 0 { cell_h } else { 1 };
+        for (i, refs) in inside.chunks_mut(step).enumerate() {
+            let y = y0 + i * step;
+            if available(x as i32, y as i32) {
+                for (dy, dst) in refs.iter_mut().enumerate() {
+                    *dst = Some(plane[(y + dy) * width + x]);
+                }
+            } else {
+                refs.fill(None);
+            }
+        }
+    } else {
+        left.fill(None);
+    }
+
+    left_x
+        .zip(above_y)
+        .and_then(|(x, y)| available(x as i32, y as i32).then(|| plane[y * width + x]))
 }
 
 #[inline]
@@ -4705,36 +4778,6 @@ impl<'cab> FullDecoder<'cab> {
             .unwrap_or(false)
     }
 
-    fn gather_luma_refs_into(
-        &self,
-        x0: usize,
-        y0: usize,
-        n: usize,
-        above: &mut [Option<u16>],
-        left: &mut [Option<u16>],
-    ) -> Option<u16> {
-        let corner = if self.luma_avail(x0 as i32 - 1, y0 as i32 - 1) {
-            Some(self.y[(y0 - 1) * self.w + (x0 - 1)])
-        } else {
-            None
-        };
-        for (i, (above, left)) in above[..2 * n].iter_mut().zip(left.iter_mut()).enumerate() {
-            let ax = x0 as i32 + i as i32;
-            *above = if self.luma_avail(ax, y0 as i32 - 1) {
-                Some(self.y[(y0 - 1) * self.w + ax as usize])
-            } else {
-                None
-            };
-            let ly = y0 as i32 + i as i32;
-            *left = if self.luma_avail(x0 as i32 - 1, ly) {
-                Some(self.y[ly as usize * self.w + (x0 - 1)])
-            } else {
-                None
-            };
-        }
-        corner
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_luma(
         &mut self,
@@ -4971,7 +5014,15 @@ impl<'cab> FullDecoder<'cab> {
     fn predict_luma_block_into(&mut self, x0: usize, y0: usize, n: usize, mode: u8) {
         let mut above = std::mem::take(&mut self.scratch.raw_above);
         let mut left = std::mem::take(&mut self.scratch.raw_left);
-        let corner = self.gather_luma_refs_into(x0, y0, n, &mut above[..2 * n], &mut left[..2 * n]);
+        let corner = gather_intra_refs(
+            &self.y,
+            (self.w, self.h),
+            (x0, y0),
+            (4, 4),
+            &mut above[..2 * n],
+            &mut left[..2 * n],
+            |x, y| self.luma_avail(x, y),
+        );
         let neutral = 1u16
             .checked_shl(self.bd.saturating_sub(1) as u32)
             .unwrap_or(0);
@@ -4983,17 +5034,14 @@ impl<'cab> FullDecoder<'cab> {
             &left[..2 * n],
             n,
             neutral,
-            &mut sc.sub_s,
-            &mut sc.sub_avail,
             &mut sc.above,
             &mut sc.left,
         );
-        intra::filter_refs_into(
-            &sc.above[..2 * n + 1],
-            &sc.left[..2 * n + 1],
+        let (above_refs, left_refs) = intra::filter_refs_into(
+            &sc.above,
+            &sc.left,
             n,
             mode,
-            true,
             !self.sps.intra_smoothing_disabled,
             strong,
             self.bd,
@@ -5002,8 +5050,8 @@ impl<'cab> FullDecoder<'cab> {
         );
         (self.exec.predict)(
             mode,
-            &sc.fa[..2 * n + 1],
-            &sc.fl[..2 * n + 1],
+            above_refs,
+            left_refs,
             n,
             // is_luma gates the DC / pure-horizontal / pure-vertical intra edge
             // filters inside predict. Two things suppress them: the SCC
@@ -5182,38 +5230,6 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    fn gather_chroma_refs_into(
-        &self,
-        is_cb: bool,
-        cx0: usize,
-        cy0: usize,
-        n: usize,
-        above: &mut [Option<u16>],
-        left: &mut [Option<u16>],
-    ) -> Option<u16> {
-        let plane = if is_cb { &self.cb } else { &self.cr };
-        let corner = if self.chroma_avail(cx0 as i32 - 1, cy0 as i32 - 1) {
-            Some(plane[(cy0 - 1) * self.cw + (cx0 - 1)])
-        } else {
-            None
-        };
-        for i in 0..2 * n {
-            let ax = cx0 as i32 + i as i32;
-            above[i] = if self.chroma_avail(ax, cy0 as i32 - 1) {
-                Some(plane[(cy0 - 1) * self.cw + ax as usize])
-            } else {
-                None
-            };
-            let ly = cy0 as i32 + i as i32;
-            left[i] = if self.chroma_avail(cx0 as i32 - 1, ly) {
-                Some(plane[ly as usize * self.cw + (cx0 - 1)])
-            } else {
-                None
-            };
-        }
-        corner
-    }
-
     fn predict_chroma_block_into(
         &mut self,
         is_cb: bool,
@@ -5224,13 +5240,15 @@ impl<'cab> FullDecoder<'cab> {
     ) {
         let mut above = std::mem::take(&mut self.scratch.raw_above);
         let mut left = std::mem::take(&mut self.scratch.raw_left);
-        let corner = self.gather_chroma_refs_into(
-            is_cb,
-            cx0,
-            cy0,
-            n,
+        let plane = if is_cb { &self.cb } else { &self.cr };
+        let corner = gather_intra_refs(
+            plane,
+            (self.cw, self.ch),
+            (cx0, cy0),
+            (4 / self.sub_w, 4 / self.sub_h),
             &mut above[..2 * n],
             &mut left[..2 * n],
+            |x, y| self.chroma_avail(x, y),
         );
         let neutral = 1u16
             .checked_shl(self.bd_c.saturating_sub(1) as u32)
@@ -5242,8 +5260,6 @@ impl<'cab> FullDecoder<'cab> {
             &left[..2 * n],
             n,
             neutral,
-            &mut sc.sub_s,
-            &mut sc.sub_avail,
             &mut sc.above,
             &mut sc.left,
         );
@@ -5252,41 +5268,31 @@ impl<'cab> FullDecoder<'cab> {
         // (HEVC: cIdx>0 filters only when ChromaArrayType==3), but without the luma
         // strong-intra-smoothing path. The DC/H/V prediction edge filter stays off
         // for chroma (is_luma=false in predict_into).
-        if self.sps.chroma_idc == 3 {
+        let (above_refs, left_refs) = if self.sps.chroma_idc == 3 {
             intra::filter_refs_into(
-                &sc.above[..2 * n + 1],
-                &sc.left[..2 * n + 1],
+                &sc.above,
+                &sc.left,
                 n,
                 mode,
-                true, // apply the luma [1 2 1] filtering decision
                 !self.sps.intra_smoothing_disabled,
                 false, // no strong intra smoothing for chroma
                 self.bd_c,
                 &mut sc.fa,
                 &mut sc.fl,
-            );
-            (self.exec.predict)(
-                mode,
-                &sc.fa[..2 * n + 1],
-                &sc.fl[..2 * n + 1],
-                n,
-                false,
-                self.bd_c,
-                &mut sc.pred[..n * n],
-                &mut sc.refs_ang,
-            );
+            )
         } else {
-            (self.exec.predict)(
-                mode,
-                &sc.above[..2 * n + 1],
-                &sc.left[..2 * n + 1],
-                n,
-                false,
-                self.bd_c,
-                &mut sc.pred[..n * n],
-                &mut sc.refs_ang,
-            );
-        }
+            (&sc.above[..2 * n + 1], &sc.left[..2 * n + 1])
+        };
+        (self.exec.predict)(
+            mode,
+            above_refs,
+            left_refs,
+            n,
+            false,
+            self.bd_c,
+            &mut sc.pred[..n * n],
+            &mut sc.refs_ang,
+        );
         self.scratch.raw_above = above;
         self.scratch.raw_left = left;
     }
@@ -5480,14 +5486,12 @@ impl<'cab> FullDecoder<'cab> {
 
     fn predict_only_chroma(&mut self, is_cb: bool, cx0: usize, cy0: usize, n: usize, mode: u8) {
         self.predict_chroma_block_into(is_cb, cx0, cy0, n, mode);
-        let n2 = n * n;
-        self.chroma_scratch[..n2].copy_from_slice(&self.scratch.pred[..n2]);
         let stride = self.cw;
         let valid_w = self.cw.saturating_sub(cx0).min(n);
         let valid_h = self.ch.saturating_sub(cy0).min(n);
         if valid_w != 0 && valid_h != 0 {
             let plane = if is_cb { &mut self.cb } else { &mut self.cr };
-            let pred = &self.chroma_scratch[..n2];
+            let pred = &self.scratch.pred[..n * n];
             if let Some(dst) = plane_tail_mut(plane, stride, cx0, cy0) {
                 copy_pred_block_clipped(dst, stride, pred, n, valid_w, valid_h);
             }
@@ -5731,15 +5735,16 @@ impl RowFactory {
             wpp_palette_snap: Vec::new(),
             wpp_pctx_snap: Vec::new(),
             scratch: intra::IntraScratch::new(),
-            deq_scratch: Box::new([0i32; 1024]),
-            res_scratch: Box::new([0i32; 1024]),
-            cross_comp_luma: Box::new([0i32; 1024]),
-            deq_scratch16: Box::new([0i16; 1024]),
-            res_scratch16: Box::new([0i16; 1024]),
-            coeff_scratch: Box::new([0i32; 1024]),
+            deq_scratch: box_array(0),
+            res_scratch: box_array(0),
+            cross_comp_luma: box_array(0),
+            deq_scratch16: box_array(0),
+            res_scratch16: box_array(0),
+            coeff_scratch: box_array(0),
             deblock_scratch: crate::deblock::DeblockScratch::default(),
             strong_smoothing: self.strong_smoothing,
             slice_type: self.slice_type,
+            may_have_inter: self.slice_type != crate::inter::SLICE_I,
             cabac_init: self.cabac_init,
             pred_weights: self.pred_weights.clone(),
             motion: unsafe { crate::plane::Plane::shared(self.motion.0, self.motion.1) },
@@ -5760,7 +5765,6 @@ impl RowFactory {
             mc_pred0: Vec::new(),
             mc_pred1: Vec::new(),
             mc_tmp: Vec::new(),
-            chroma_scratch: Box::new([0; 1024]),
         })
     }
 }

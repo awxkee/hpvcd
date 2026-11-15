@@ -682,6 +682,29 @@ impl<'a> ScalingMatrix<'a> {
         self.coeffs[sy * 8 + sx] as i64
     }
 
+    /// Four coefficients starting at a four-sample-aligned transform position.
+    #[cfg(any(test, all(feature = "neon", target_arch = "aarch64")))]
+    #[inline]
+    pub(crate) fn coeffs4(self, idx: usize) -> [u8; 4] {
+        debug_assert_eq!(idx % 4, 0);
+        match self.log2_size {
+            2 | 3 => self.coeffs.as_chunks::<4>().0[idx / 4],
+            4 => {
+                let row = idx / (16 * 2);
+                let col = (idx % 16) / 4;
+                let [a, b] = self.coeffs.as_chunks::<2>().0[row * 4 + col];
+                [if idx == 0 { self.dc } else { a }, a, b, b]
+            }
+            5 => {
+                let row = idx / (32 * 4);
+                let col = (idx % 32) / 4;
+                let a = self.coeffs[row * 8 + col];
+                [if idx == 0 { self.dc } else { a }, a, a, a]
+            }
+            _ => std::array::from_fn(|lane| self.coeff(idx + lane) as u8),
+        }
+    }
+
     #[inline]
     pub(crate) fn max_coeff(self) -> i64 {
         self.max_coeff
@@ -1436,6 +1459,18 @@ mod tests {
         assert_eq!(ScalingMatrix::new(&coeffs, 0, 4, false).max_coeff(), 7);
         assert_eq!(ScalingMatrix::new(&coeffs, 0, 8, false).max_coeff(), 255);
         assert_eq!(ScalingMatrix::new(&coeffs, 0, 4, true).max_coeff(), 16);
+    }
+
+    #[test]
+    fn scaling_matrix_groups_match_individual_coefficients() {
+        let coeffs = std::array::from_fn(|i| (3 * i) as u8);
+        for n in [4, 8, 16, 32] {
+            let scaling = ScalingMatrix::new(&coeffs, 200, n, false);
+            for idx in (0..n * n).step_by(4) {
+                let expected = std::array::from_fn(|lane| scaling.coeff(idx + lane) as u8);
+                assert_eq!(scaling.coeffs4(idx), expected, "{n}x{n}, index {idx}");
+            }
+        }
     }
 
     fn validate_dequant_backend(

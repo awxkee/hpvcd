@@ -3,6 +3,7 @@ mod gainmap;
 use hpvcd::{HeicSettings, ImageBuffer, VideoDecoder};
 use image::{DynamicImage, RgbImage};
 use std::fs;
+use std::mem::MaybeUninit;
 use std::time::Instant;
 
 fn main() {
@@ -24,13 +25,13 @@ fn main() {
     // .unwrap();
     // iamge.save("./out_v.jpg").unwrap();
 
-    let bytes = fs::read("./assets/old-safe-wall.heic").unwrap();
+    let bytes = fs::read("./assets/IMG_0933.HEIC").unwrap();
     let mut durations = Vec::with_capacity(20);
     for i in 0..20 {
         let instant = Instant::now();
         let decoded = hpvcd::decode_heic_with_settings(
             &bytes,
-            &HeicSettings::new().with_decode_gain_map(false),
+            &HeicSettings::new().with_decode_gain_map(true),
         )
         .unwrap();
         let elapsed = instant.elapsed();

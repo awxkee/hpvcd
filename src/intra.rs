@@ -43,8 +43,6 @@ pub(crate) const DC: u8 = 1;
 
 /// Pre-allocated scratch for the intra prediction pipeline (reused every TU).
 pub(crate) struct IntraScratch {
-    pub(crate) sub_s: Vec<u16>, // 4*N+1
-    pub(crate) sub_avail: Vec<bool>,
     pub(crate) above: Vec<u16>, // 2*N+1
     pub(crate) left: Vec<u16>,
     pub(crate) fa: Vec<u16>,
@@ -65,8 +63,6 @@ impl IntraScratch {
     pub(crate) fn new() -> Self {
         let max_n = 32usize;
         IntraScratch {
-            sub_s: vec![0u16; 4 * max_n + 1],
-            sub_avail: vec![false; 4 * max_n + 1],
             above: vec![0u16; 2 * max_n + 1],
             left: vec![0u16; 2 * max_n + 1],
             fa: vec![0u16; 2 * max_n + 1],
@@ -79,96 +75,69 @@ impl IntraScratch {
     }
 }
 
-/// Like `substitute_refs` but writes into caller-provided slices (length ≥ 2N+1).
-#[allow(clippy::too_many_arguments)]
+/// Substitute missing references in HEVC scan order, from bottom left across
+/// the corner to the rightmost sample above.
 pub(crate) fn substitute_refs_into(
     raw_corner: Option<u16>,
     raw_above: &[Option<u16>],
     raw_left: &[Option<u16>],
     n: usize,
     neutral: u16,
-    s: &mut [u16],
-    avail: &mut [bool],
     above_out: &mut [u16],
     left_out: &mut [u16],
 ) {
-    let total = 4 * n + 1;
-    let s = &mut s[..total];
-    let avail = &mut avail[..total];
-
-    for v in s.iter_mut() {
-        *v = 0;
-    }
-    for a in avail.iter_mut() {
-        *a = false;
-    }
-
-    for i in 0..2 * n {
-        if let Some(v) = raw_left[2 * n - 1 - i] {
-            s[i] = v;
-            avail[i] = true;
-        }
-    }
-    if let Some(v) = raw_corner {
-        s[2 * n] = v;
-        avail[2 * n] = true;
-    }
-    for i in 0..2 * n {
-        if let Some(v) = raw_above[i] {
-            s[2 * n + 1 + i] = v;
-            avail[2 * n + 1 + i] = true;
-        }
-    }
-
-    if !avail.iter().any(|&a| a) {
-        for v in s.iter_mut() {
-            *v = neutral;
-        }
-    } else {
-        let first = avail.iter().position(|&a| a).unwrap();
-        for i in 0..first {
-            s[i] = s[first];
-        }
-        for i in 1..total {
-            if !avail[i] {
-                s[i] = s[i - 1];
-            }
-        }
-    }
-
+    let raw_above = &raw_above[..2 * n];
+    let raw_left = &raw_left[..2 * n];
     let above_out = &mut above_out[..2 * n + 1];
     let left_out = &mut left_out[..2 * n + 1];
-    above_out[0] = s[2 * n];
-    left_out[0] = s[2 * n];
-    for i in 0..2 * n {
-        above_out[1 + i] = s[2 * n + 1 + i];
-        left_out[1 + i] = s[2 * n - 1 - i];
+
+    let first = raw_left
+        .iter()
+        .rev()
+        .find_map(|&sample| sample)
+        .or(raw_corner)
+        .or_else(|| raw_above.iter().find_map(|&sample| sample));
+    let Some(mut previous) = first else {
+        above_out.fill(neutral);
+        left_out.fill(neutral);
+        return;
+    };
+
+    for (dst, &sample) in left_out[1..].iter_mut().zip(raw_left).rev() {
+        previous = sample.unwrap_or(previous);
+        *dst = previous;
+    }
+    previous = raw_corner.unwrap_or(previous);
+    above_out[0] = previous;
+    left_out[0] = previous;
+    for (dst, &sample) in above_out[1..].iter_mut().zip(raw_above) {
+        previous = sample.unwrap_or(previous);
+        *dst = previous;
     }
 }
 
-/// Like `filter_refs` but writes into `fa_out` / `fl_out`.
+/// Return the references to use for prediction, using scratch only when filtering.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn filter_refs_into(
-    above: &[u16],
-    left: &[u16],
+pub(crate) fn filter_refs_into<'a>(
+    above: &'a [u16],
+    left: &'a [u16],
     n: usize,
     mode: u8,
-    is_luma: bool,
     intra_smoothing_enabled: bool,
     strong_intra_smoothing: bool,
     bit_depth: u8,
-    fa_out: &mut [u16],
-    fl_out: &mut [u16],
-) {
+    fa_out: &'a mut [u16],
+    fl_out: &'a mut [u16],
+) -> (&'a [u16], &'a [u16]) {
     let len = 2 * n + 1;
-    fa_out[..len].copy_from_slice(&above[..len]);
-    fl_out[..len].copy_from_slice(&left[..len]);
+    let above = &above[..len];
+    let left = &left[..len];
 
     // RExt's intra_smoothing_disabled_flag disables the complete reference
     // sample filtering process, including both the normal [1 2 1] filter and
     // the optional strong 32x32 bilinear filter.
-    if !intra_smoothing_enabled || !is_luma || n == 4 || mode == DC {
-        return;
+    if !intra_smoothing_enabled || n == 4 || mode == DC {
+        return (above, left);
     }
 
     let min_dist = (mode as i32 - 26).abs().min((mode as i32 - 10).abs());
@@ -179,9 +148,11 @@ pub(crate) fn filter_refs_into(
         _ => 8,
     };
     if !(mode == PLANAR || min_dist > thresh) {
-        return;
+        return (above, left);
     }
 
+    let fa_out = &mut fa_out[..len];
+    let fl_out = &mut fl_out[..len];
     if strong_intra_smoothing && n == 32 {
         let thr = 1 << (bit_depth - 5);
         let bl = left[2 * n] as i32;
@@ -201,7 +172,7 @@ pub(crate) fn filter_refs_into(
             fl_out[0] = left[0];
             fa_out[2 * n] = above[2 * n];
             fl_out[2 * n] = left[2 * n];
-            return;
+            return (fa_out, fl_out);
         }
     }
 
@@ -217,6 +188,7 @@ pub(crate) fn filter_refs_into(
     }
     fa_out[2 * n] = above[2 * n];
     fl_out[2 * n] = left[2 * n];
+    (fa_out, fl_out)
 }
 
 pub(crate) type PredictFn = fn(u8, &[u16], &[u16], usize, bool, u8, &mut [u16], &mut [i32]);
@@ -373,7 +345,29 @@ pub(crate) fn predict_into_scalar(
 
 #[cfg(test)]
 mod tests {
-    use super::{PLANAR, filter_refs_into};
+    use super::{PLANAR, filter_refs_into, substitute_refs_into};
+
+    #[test]
+    fn substitute_refs_fills_gaps_in_scan_order() {
+        let n = 2;
+        let mut above = [0; 5];
+        let mut left = [0; 5];
+        let raw_above = [None, Some(9), None, Some(12)];
+        let raw_left = [Some(5), None, Some(0), None];
+
+        substitute_refs_into(None, &raw_above, &raw_left, n, 128, &mut above, &mut left);
+        assert_eq!(above, [5, 5, 9, 9, 12]);
+        assert_eq!(left, [5, 5, 0, 0, 0]);
+
+        let missing = [None; 4];
+        substitute_refs_into(None, &raw_above, &missing, n, 128, &mut above, &mut left);
+        assert_eq!(above, [9, 9, 9, 9, 12]);
+        assert_eq!(left, [9; 5]);
+
+        substitute_refs_into(None, &missing, &missing, n, 128, &mut above, &mut left);
+        assert_eq!(above, [128; 5]);
+        assert_eq!(left, [128; 5]);
+    }
 
     #[test]
     fn disabled_reference_smoothing_preserves_samples() {
@@ -383,12 +377,11 @@ mod tests {
         let mut filtered_above = vec![0; 2 * n + 1];
         let mut filtered_left = vec![0; 2 * n + 1];
 
-        filter_refs_into(
+        let (filtered_above, filtered_left) = filter_refs_into(
             &above,
             &left,
             n,
             PLANAR,
-            true,
             false,
             true,
             10,
@@ -396,8 +389,8 @@ mod tests {
             &mut filtered_left,
         );
 
-        assert_eq!(filtered_above, above);
-        assert_eq!(filtered_left, left);
+        assert_eq!(filtered_above, above.as_slice());
+        assert_eq!(filtered_left, left.as_slice());
     }
 
     #[test]
@@ -414,36 +407,34 @@ mod tests {
 
         let mut disabled_above = vec![0; 2 * n + 1];
         let mut disabled_left = vec![0; 2 * n + 1];
-        filter_refs_into(
+        let (disabled_above, disabled_left) = filter_refs_into(
             &above,
             &left,
             n,
             PLANAR,
-            true,
             false,
             true,
             10,
             &mut disabled_above,
             &mut disabled_left,
         );
-        assert_eq!(disabled_above, above);
-        assert_eq!(disabled_left, left);
+        assert_eq!(disabled_above, above.as_slice());
+        assert_eq!(disabled_left, left.as_slice());
 
         let mut enabled_above = vec![0; 2 * n + 1];
         let mut enabled_left = vec![0; 2 * n + 1];
-        filter_refs_into(
+        let (enabled_above, enabled_left) = filter_refs_into(
             &above,
             &left,
             n,
             PLANAR,
             true,
             true,
-            true,
             10,
             &mut enabled_above,
             &mut enabled_left,
         );
-        assert_ne!(enabled_above, above);
-        assert_ne!(enabled_left, left);
+        assert_ne!(enabled_above, above.as_slice());
+        assert_ne!(enabled_left, left.as_slice());
     }
 }
