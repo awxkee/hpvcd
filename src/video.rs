@@ -1233,12 +1233,7 @@ impl VideoDecoder {
         // Create the decoder on the first segment and decode it.
         let cabac0 = &first_rbsp[hdr0.cabac_offset.min(first_rbsp.len())..];
         let mut d = FullDecoder::new(cabac0, sps.clone(), pps.clone(), &hdr0)?;
-        d.set_inter_state(
-            poc,
-            ref_list0.clone(),
-            ref_list1.clone(),
-            ref_frames.clone(),
-        );
+        d.set_inter_state(poc, ref_list0, ref_list1, ref_frames);
         let sub0: Vec<usize> = if hdr0.entry_points.is_empty() {
             Vec::new()
         } else {
@@ -1316,12 +1311,8 @@ impl VideoDecoder {
                     &hdr.list_mod_l0,
                     &hdr.list_mod_l1,
                 )?;
-                d.set_inter_state(
-                    poc,
-                    l0.clone(),
-                    l1.clone(),
-                    self.collect_ref_frames(&l0, &l1),
-                );
+                let frames = self.collect_ref_frames(&l0, &l1);
+                d.set_inter_state(poc, l0, l1, frames);
             }
             let sub: Vec<usize> = if hdr.entry_points.is_empty() {
                 Vec::new()

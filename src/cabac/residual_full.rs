@@ -99,14 +99,14 @@ impl ResidualScanTable {
 }
 
 struct ResidualSigCtxTable {
-    ctx: Vec<[u8; 4]>,
-    width: usize,
+    // Sub-block raster order, neighbor flags, then coefficient scan order.
+    ctx: Vec<[[u8; 16]; 4]>,
 }
 
 impl ResidualSigCtxTable {
-    #[inline(always)]
-    fn ctx(&self, x: usize, y: usize, prev_csbf: u8) -> usize {
-        self.ctx[y * self.width + x][prev_csbf as usize] as usize
+    #[inline]
+    fn subblock(&self, sb_grid: usize, prev_csbf: u8) -> &[u8; 16] {
+        &self.ctx[sb_grid][usize::from(prev_csbf)]
     }
 }
 
@@ -142,25 +142,26 @@ fn build_scan_table(w: usize, scan_idx: u8) -> ResidualScanTable {
 }
 
 fn build_sig_ctx_table(log2_ts: u32, scan_idx: u8, is_luma: bool) -> ResidualSigCtxTable {
-    let width = 1usize << log2_ts;
-    let mut ctx = vec![[0u8; 4]; width * width];
-    for y in 0..width {
-        for x in 0..width {
-            let dst = &mut ctx[y * width + x];
-            for prev_csbf in 0..4u8 {
-                dst[prev_csbf as usize] =
-                    calc_sig_ctx(x, y, prev_csbf, log2_ts, scan_idx, is_luma).min(43) as u8;
-            }
-        }
-    }
-    ResidualSigCtxTable { ctx, width }
+    let sb_width = 1usize << (log2_ts - 2);
+    let order = build_scan_order(4, scan_idx);
+    let ctx = (0..sb_width * sb_width)
+        .map(|sb| {
+            let x0 = (sb % sb_width) * 4;
+            let y0 = (sb / sb_width) * 4;
+            std::array::from_fn(|prev_csbf| {
+                std::array::from_fn(|i| {
+                    let (x, y) = order[i];
+                    calc_sig_ctx(x0 + x, y0 + y, prev_csbf as u8, log2_ts, scan_idx, is_luma)
+                        .min(43) as u8
+                })
+            })
+        })
+        .collect();
+    ResidualSigCtxTable { ctx }
 }
 
 fn dummy_sig_ctx_table() -> ResidualSigCtxTable {
-    ResidualSigCtxTable {
-        ctx: vec![[0u8; 4]; 1],
-        width: 1,
-    }
+    ResidualSigCtxTable { ctx: Vec::new() }
 }
 
 /// Cached scan tables. Sub-block grids are at most 8×8 and the in-sub-block
@@ -448,6 +449,13 @@ pub(crate) fn residual_coding(
     let sb_scan = sb_table.order();
     let pos_scan = pos_table.order();
     let sig_ctx_table = scan_tables.sig_ctx_table(log2_ts, scan_idx, is_luma);
+    // §9.3.4.2.5 uses one dedicated sig-coeff context for TS/TQB blocks
+    // when transform_skip_context_enabled_flag is set.
+    let forced_sig_ctx = if rext.transform_skip_context && (transform_skip || transquant_bypass) {
+        Some(if is_luma { &[42u8; 16] } else { &[43u8; 16] })
+    } else {
+        None
+    };
 
     // Find last scan position within its sub-block + which sub-block.
     let last_sbx = last_x >> 2;
@@ -505,27 +513,22 @@ pub(crate) fn residual_coding(
             Some(scan_top)
         };
         if let Some(start) = start {
-            for (k, &(px, py)) in pos_scan[..=start].iter().enumerate().rev() {
-                let xc = (sbx << 2) + px;
-                let yc = (sby << 2) + py;
-                let significant = if k == 0 && infer_dc && sig_len == 0 {
-                    true
-                } else {
-                    // §9.3.4.2.5: with transform_skip_context enabled, TS/TQB
-                    // blocks use one dedicated context (luma 42, chroma 16).
-                    let ci = if rext.transform_skip_context && (transform_skip || transquant_bypass)
-                    {
-                        if is_luma { 42 } else { 27 + 16 }
-                    } else {
-                        sig_ctx_table.ctx(xc, yc, prev_csbf)
-                    };
-                    dec.decode_bin(&mut ctx.sig_coeff_flag[ci]) != 0
-                };
+            let sig_ctx =
+                forced_sig_ctx.unwrap_or_else(|| sig_ctx_table.subblock(sb_grid, prev_csbf));
+            let coeff_base = 4 * (sby * n + sbx);
+            for (k, (&(px, py), &ci)) in pos_scan[..=start]
+                .iter()
+                .zip(&sig_ctx[..=start])
+                .enumerate()
+                .rev()
+            {
+                let significant = (k == 0 && infer_dc && sig_len == 0)
+                    || dec.decode_bin(&mut ctx.sig_coeff_flag[usize::from(ci)]) != 0;
 
                 // This write is always in-bounds: before each of the at most 16
                 // candidates, sig_len is at most 15.  Advancing conditionally
                 // avoids the unpredictable append branch from the old loop.
-                let coeff_index = yc * n + xc;
+                let coeff_index = coeff_base + py * n + px;
                 sig_entries[sig_len] = ((coeff_index as u16) << 4) | k as u16;
                 sig_len += significant as usize;
             }
@@ -545,7 +548,6 @@ pub(crate) fn residual_coding(
         let mut c1 = 1i32;
         let chroma_off = if is_luma { 0 } else { 16 };
         let mut gr1_mask = 0u16;
-        let mut first_gr1_idx = 16usize;
         let n_gr1 = sig_len.min(8);
         for j in 0..n_gr1 {
             let ci = (ctx_set * 4 + c1.min(3)) as usize + chroma_off;
@@ -553,14 +555,12 @@ pub(crate) fn residual_coding(
             gr1_mask |= (greater1 as u16) << j;
             if greater1 {
                 c1 = 0;
-                if first_gr1_idx == 16 {
-                    first_gr1_idx = j;
-                }
             } else if c1 > 0 && c1 < 3 {
                 c1 += 1;
             }
         }
         c1_carry = c1;
+        let first_gr1_idx = gr1_mask.trailing_zeros() as usize;
         // ── greater2 (only on first greater1 coeff) ──
         let gr2 = if first_gr1_idx < 16 {
             let ci = ctx_set as usize + if is_luma { 0 } else { 4 };

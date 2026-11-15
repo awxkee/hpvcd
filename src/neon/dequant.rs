@@ -74,9 +74,11 @@ fn neon_scaled_i64_factor_ok(params: DequantParams, max_coeff: i64) -> bool {
     base_factor > 0 && base_factor * max_coeff <= i32::MAX as i64
 }
 
-#[inline]
+#[inline(always)]
 fn scaling_factors4(base_factor: i64, scaling: ScalingMatrix<'_>, idx: usize) -> [i32; 4] {
-    std::array::from_fn(|lane| (base_factor * scaling.coeff(idx + lane)) as i32)
+    scaling
+        .coeffs4(idx)
+        .map(|coeff| (base_factor * i64::from(coeff)) as i32)
 }
 
 #[inline]
