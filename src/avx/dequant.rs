@@ -78,7 +78,16 @@ fn avx2_scaled_factor_ok(params: DequantParams, max_coeff: i64) -> bool {
 
 #[inline(always)]
 fn scaling_factors8(base_factor: i64, scaling: ScalingMatrix<'_>, idx: usize) -> [i32; 8] {
-    std::array::from_fn(|lane| (base_factor * scaling.coeff(idx + lane)) as i32)
+    let groups = [scaling.coeffs4(idx), scaling.coeffs4(idx + 4)];
+    let coeffs = groups.as_flattened();
+    std::array::from_fn(|lane| (base_factor * i64::from(coeffs[lane])) as i32)
+}
+
+#[inline(always)]
+fn scaling_factors16(base_factor: i64, scaling: ScalingMatrix<'_>, idx: usize) -> [[i32; 8]; 2] {
+    let groups = scaling.factors16(idx, base_factor);
+    let groups = groups.as_flattened().as_chunks::<8>().0;
+    [groups[0], groups[1]]
 }
 
 #[inline]
@@ -733,10 +742,8 @@ fn dequantize_scaled_into_avx2_mullo_impl(
 
     for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
         let idx = group_idx * 32;
-        let f0 = scaling_factors8(base_factor, scaling, idx);
-        let f1 = scaling_factors8(base_factor, scaling, idx + 8);
-        let f2 = scaling_factors8(base_factor, scaling, idx + 16);
-        let f3 = scaling_factors8(base_factor, scaling, idx + 24);
+        let [f0, f1] = scaling_factors16(base_factor, scaling, idx);
+        let [f2, f3] = scaling_factors16(base_factor, scaling, idx + 16);
         let v0 = dequant8_scaled_avx2_const(&src[0], &f0, add, shift, clip_lo, clip_hi);
         let v1 = dequant8_scaled_avx2_const(&src[1], &f1, add, shift, clip_lo, clip_hi);
         let v2 = dequant8_scaled_avx2_const(&src[2], &f2, add, shift, clip_lo, clip_hi);
@@ -783,10 +790,8 @@ fn dequantize_scaled_into_avx2_16_mullo_impl(
         let idx = group_idx * 32;
         let (src0, _) = src[0].as_chunks::<8>();
         let (src1, _) = src[1].as_chunks::<8>();
-        let f0 = scaling_factors8(base_factor, scaling, idx);
-        let f1 = scaling_factors8(base_factor, scaling, idx + 8);
-        let f2 = scaling_factors8(base_factor, scaling, idx + 16);
-        let f3 = scaling_factors8(base_factor, scaling, idx + 24);
+        let [f0, f1] = scaling_factors16(base_factor, scaling, idx);
+        let [f2, f3] = scaling_factors16(base_factor, scaling, idx + 16);
         let lo0 = dequant8_scaled_avx2_const(&src0[0], &f0, add, shift, clip_lo, clip_hi);
         let hi0 = dequant8_scaled_avx2_const(&src0[1], &f1, add, shift, clip_lo, clip_hi);
         let lo1 = dequant8_scaled_avx2_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
@@ -799,8 +804,7 @@ fn dequantize_scaled_into_avx2_16_mullo_impl(
     for (block_idx, (src, dst)) in level_tail.iter().zip(out_tail.iter_mut()).enumerate() {
         let (src8, _) = src.as_chunks::<8>();
         let idx = tail_base + block_idx * 16;
-        let f0 = scaling_factors8(base_factor, scaling, idx);
-        let f1 = scaling_factors8(base_factor, scaling, idx + 8);
+        let [f0, f1] = scaling_factors16(base_factor, scaling, idx);
         let lo = dequant8_scaled_avx2_const(&src8[0], &f0, add, shift, clip_lo, clip_hi);
         let hi = dequant8_scaled_avx2_const(&src8[1], &f1, add, shift, clip_lo, clip_hi);
         store_i16x16(dst, pack_i32x8_to_i16x16(lo, hi));
@@ -831,10 +835,8 @@ fn dequantize_scaled_into_avx2_saturating_impl(
 
     for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
         let idx = group_idx * 32;
-        let f0 = scaling_factors8(base_factor, scaling, idx);
-        let f1 = scaling_factors8(base_factor, scaling, idx + 8);
-        let f2 = scaling_factors8(base_factor, scaling, idx + 16);
-        let f3 = scaling_factors8(base_factor, scaling, idx + 24);
+        let [f0, f1] = scaling_factors16(base_factor, scaling, idx);
+        let [f2, f3] = scaling_factors16(base_factor, scaling, idx + 16);
         let (p0, n0) = dequant_sat_bounds8(&f0, params.add, params.shift);
         let (p1, n1) = dequant_sat_bounds8(&f1, params.add, params.shift);
         let (p2, n2) = dequant_sat_bounds8(&f2, params.add, params.shift);
@@ -896,10 +898,8 @@ fn dequantize_scaled_into_avx2_16_saturating_impl(
         let idx = group_idx * 32;
         let (src0, _) = src[0].as_chunks::<8>();
         let (src1, _) = src[1].as_chunks::<8>();
-        let f0 = scaling_factors8(base_factor, scaling, idx);
-        let f1 = scaling_factors8(base_factor, scaling, idx + 8);
-        let f2 = scaling_factors8(base_factor, scaling, idx + 16);
-        let f3 = scaling_factors8(base_factor, scaling, idx + 24);
+        let [f0, f1] = scaling_factors16(base_factor, scaling, idx);
+        let [f2, f3] = scaling_factors16(base_factor, scaling, idx + 16);
         let (p0, n0) = dequant_sat_bounds8(&f0, params.add, params.shift);
         let (p1, n1) = dequant_sat_bounds8(&f1, params.add, params.shift);
         let (p2, n2) = dequant_sat_bounds8(&f2, params.add, params.shift);
@@ -924,8 +924,7 @@ fn dequantize_scaled_into_avx2_16_saturating_impl(
     for (block_idx, (src, dst)) in level_tail.iter().zip(out_tail.iter_mut()).enumerate() {
         let (src8, _) = src.as_chunks::<8>();
         let idx = tail_base + block_idx * 16;
-        let f0 = scaling_factors8(base_factor, scaling, idx);
-        let f1 = scaling_factors8(base_factor, scaling, idx + 8);
+        let [f0, f1] = scaling_factors16(base_factor, scaling, idx);
         let (p0, n0) = dequant_sat_bounds8(&f0, params.add, params.shift);
         let (p1, n1) = dequant_sat_bounds8(&f1, params.add, params.shift);
         let lo = dequant8_scaled_avx2_saturating_const(
@@ -956,8 +955,7 @@ fn dequantize_transform_skip_scaled_into_avx2_mullo_impl(
     let clip_lo = _mm256_set1_epi32(-32768);
     let clip_hi = _mm256_set1_epi32(32767);
 
-    let f0 = scaling_factors8(base_factor, scaling, 0);
-    let f1 = scaling_factors8(base_factor, scaling, 8);
+    let [f0, f1] = scaling_factors16(base_factor, scaling, 0);
     let d0 = dequant8_scaled_avx2_const(&levels[0], &f0, add, shift, clip_lo, clip_hi);
     let d1 = dequant8_scaled_avx2_const(&levels[1], &f1, add, shift, clip_lo, clip_hi);
     store_i32x8(
@@ -988,8 +986,7 @@ fn dequantize_transform_skip_scaled_into_avx2_16_mullo_impl(
     let clip_lo = _mm256_set1_epi32(-32768);
     let clip_hi = _mm256_set1_epi32(32767);
 
-    let f0 = scaling_factors8(base_factor, scaling, 0);
-    let f1 = scaling_factors8(base_factor, scaling, 8);
+    let [f0, f1] = scaling_factors16(base_factor, scaling, 0);
     let d0 = dequant8_scaled_avx2_const(&levels[0], &f0, add, shift, clip_lo, clip_hi);
     let d1 = dequant8_scaled_avx2_const(&levels[1], &f1, add, shift, clip_lo, clip_hi);
     let v0 = apply_transform_skip_shift8(d0, params, clip_lo, clip_hi);
@@ -1015,8 +1012,7 @@ fn dequantize_transform_skip_scaled_into_avx2_saturating_impl(
     let clip_lo = _mm256_set1_epi32(-32768);
     let clip_hi = _mm256_set1_epi32(32767);
 
-    let f0 = scaling_factors8(base_factor, scaling, 0);
-    let f1 = scaling_factors8(base_factor, scaling, 8);
+    let [f0, f1] = scaling_factors16(base_factor, scaling, 0);
     let (p0, n0) = dequant_sat_bounds8(&f0, params.dequant.add, params.dequant.shift);
     let (p1, n1) = dequant_sat_bounds8(&f1, params.dequant.add, params.dequant.shift);
     let d0 = dequant8_scaled_avx2_saturating_const(
@@ -1053,8 +1049,7 @@ fn dequantize_transform_skip_scaled_into_avx2_16_saturating_impl(
     let clip_lo = _mm256_set1_epi32(-32768);
     let clip_hi = _mm256_set1_epi32(32767);
 
-    let f0 = scaling_factors8(base_factor, scaling, 0);
-    let f1 = scaling_factors8(base_factor, scaling, 8);
+    let [f0, f1] = scaling_factors16(base_factor, scaling, 0);
     let (p0, n0) = dequant_sat_bounds8(&f0, params.dequant.add, params.dequant.shift);
     let (p1, n1) = dequant_sat_bounds8(&f1, params.dequant.add, params.dequant.shift);
     let d0 = dequant8_scaled_avx2_saturating_const(

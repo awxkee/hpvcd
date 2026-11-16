@@ -37,6 +37,7 @@ use crate::fmt::{BitDepth, ChromaFormat, ImageBuffer, SampleBuf};
 use crate::inter::RefFramePlanes;
 use crate::rps::derive_poc;
 use crate::yuv::YuvPlanes;
+use std::sync::Arc;
 
 /// Everything needed to turn coded planes into a displayable picture: the
 /// conformance-window crop, the chroma format / bit depth, and the colour
@@ -730,10 +731,10 @@ impl VideoDecoder {
             for f in &self.dpb.frames {
                 self.seek_cache
                     .gop_frames
-                    .entry(f.poc)
+                    .entry(f.poc())
                     .or_insert_with(|| VideoFrame {
-                        planes: f.planes.clone(),
-                        poc: f.poc,
+                        planes: f.picture.planes.clone(),
+                        poc: f.poc(),
                         meta: f.meta.clone().unwrap_or_else(|| self.cur_meta.clone()),
                     });
             }
@@ -1237,9 +1238,9 @@ impl VideoDecoder {
         let sub0: Vec<usize> = if hdr0.entry_points.is_empty() {
             Vec::new()
         } else {
-            let src_of = crate::bitreader::rbsp_src_map(first_bytes);
+            let offsets = crate::bitreader::RbspOffsetMap::from_nal(first_bytes);
             crate::wpp::substream_starts_rbsp_rel(
-                &src_of,
+                &offsets,
                 hdr0.cabac_offset,
                 &hdr0.entry_points,
                 first_rbsp.len(),
@@ -1317,9 +1318,9 @@ impl VideoDecoder {
             let sub: Vec<usize> = if hdr.entry_points.is_empty() {
                 Vec::new()
             } else {
-                let src_of = crate::bitreader::rbsp_src_map(seg_bytes);
+                let offsets = crate::bitreader::RbspOffsetMap::from_nal(seg_bytes);
                 crate::wpp::substream_starts_rbsp_rel(
-                    &src_of,
+                    &offsets,
                     hdr.cabac_offset,
                     &hdr.entry_points,
                     seg_rbsp.len(),
@@ -1339,12 +1340,18 @@ impl VideoDecoder {
         // when decoded, regardless of NAL type — a sub-layer non-reference (`_N`)
         // picture may still be referenced by a higher temporal sub-layer. The
         // next picture's RPS performs the subsequent short/long-term marking.
-        let frame = Frame {
+        let (cw, ch) = chroma_dims(&planes);
+        let picture = Arc::new(RefFramePlanes {
             planes,
             poc,
+            cw,
+            ch,
             motion,
             width4,
             height4,
+        });
+        let frame = Frame {
+            picture,
             short_term: true,
             long_term: false,
             needed_for_output: hdr0.pic_output_flag,
@@ -1367,35 +1374,21 @@ impl VideoDecoder {
         Ok(())
     }
 
-    /// Build owned reference-frame views for MC from the DPB entries in the
-    /// current slice's reference lists.
+    /// Share the decoded pictures used by the current slice's reference lists.
     fn collect_ref_frames(
         &self,
         l0: &[crate::dpb::RefEntry],
         l1: &[crate::dpb::RefEntry],
-    ) -> Vec<RefFramePlanes> {
-        let mut out: Vec<RefFramePlanes> = Vec::new();
+    ) -> Vec<Arc<RefFramePlanes>> {
+        let mut out = Vec::new();
         let mut seen = Vec::new();
         for e in l0.iter().chain(l1.iter()) {
             if seen.contains(&e.poc) {
                 continue;
             }
             seen.push(e.poc);
-            if let Some(f) = self.dpb.frames.iter().find(|f| f.poc == e.poc) {
-                let (cw, ch) = chroma_dims(&f.planes);
-                out.push(RefFramePlanes {
-                    poc: f.poc,
-                    y: f.planes.y.clone(),
-                    cb: f.planes.cb.clone(),
-                    cr: f.planes.cr.clone(),
-                    w: f.planes.width,
-                    h: f.planes.height,
-                    cw,
-                    ch,
-                    motion: f.motion.clone(),
-                    width4: f.width4,
-                    height4: f.height4,
-                });
+            if let Some(f) = self.dpb.frames.iter().find(|f| f.poc() == e.poc) {
+                out.push(Arc::clone(&f.picture));
             }
         }
         out

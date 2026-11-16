@@ -47,6 +47,7 @@ pub(crate) struct ExecContext {
     pub(crate) inv_transform_dst4: transform::InvTransform4Fn,
     pub(crate) inv_transform16: transform::InvTransformFn16,
     pub(crate) inv_transform_dst4_16: transform::InvTransform4Fn16,
+    pub(crate) inv_transform_coded32_16: Option<transform::InvTransformCoded32Fn16>,
 
     pub(crate) reconstruct: reconstruct::ReconstructFn,
     pub(crate) reconstruct16: reconstruct::ReconstructFn16,
@@ -101,6 +102,7 @@ impl ExecContext {
             inv_transform_dst4: transform::resolve_inv_transform_dst4(),
             inv_transform16: transform::resolve_inv_transform16(),
             inv_transform_dst4_16: transform::resolve_inv_transform_dst4_16(),
+            inv_transform_coded32_16: transform::resolve_inv_transform_coded32_16(),
 
             reconstruct: reconstruct::resolve_reconstruct_add_clip(),
             reconstruct16: reconstruct::resolve_reconstruct_add_clip16(),

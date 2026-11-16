@@ -130,9 +130,8 @@ pub(crate) fn unescape_rbsp(src: &[u8]) -> Vec<u8> {
 }
 
 /// Like [`unescape_rbsp`], but also returns, for each RBSP (output) byte, the
-/// index of the NAL (source) byte it came from. Only used by tests now; the
-/// production wavefront path builds just the map via [`rbsp_src_map`] (it
-/// already holds the RBSP).
+/// index of the NAL (source) byte it came from. This dense map is used by
+/// tests as a reference for [`RbspOffsetMap`].
 #[cfg(test)]
 pub(crate) fn unescape_rbsp_with_map(src: &[u8]) -> (Vec<u8>, Vec<usize>) {
     let mut out = Vec::with_capacity(src.len());
@@ -154,45 +153,78 @@ pub(crate) fn unescape_rbsp_with_map(src: &[u8]) -> (Vec<u8>, Vec<usize>) {
     (out, src_of)
 }
 
-pub(crate) fn rbsp_src_map(src: &[u8]) -> Vec<usize> {
-    let mut src_of = Vec::with_capacity(src.len());
-    let mut i = 0usize;
-    while i < src.len() {
-        if i + 2 < src.len() && src[i] == 0x00 && src[i + 1] == 0x00 && src[i + 2] == 0x03 {
-            src_of.push(i);
-            src_of.push(i + 1);
-            i += 3;
-        } else {
-            src_of.push(i);
-            i += 1;
-        }
-    }
-    src_of
+/// Translates byte offsets between a NAL and its unescaped RBSP.
+pub(crate) struct RbspOffsetMap {
+    nal_len: usize,
+    // NAL and RBSP offsets at each skipped emulation-prevention byte.
+    skipped: Vec<(usize, usize)>,
 }
 
-/// Translate a NAL-relative byte offset into an RBSP byte offset using the
-/// `src_of` map from [`unescape_rbsp_with_map`]. Returns the first RBSP index
-/// whose source index is ≥ `nal_off`; if none (the offset is past the last kept
-/// byte), returns `src_of.len()` (i.e. the RBSP length).
-pub(crate) fn nal_to_rbsp_offset(src_of: &[usize], nal_off: usize) -> usize {
-    // `src_of` is strictly increasing, so binary-search the partition point.
-    src_of.partition_point(|&s| s < nal_off)
+impl RbspOffsetMap {
+    pub(crate) fn from_nal(nal: &[u8]) -> Self {
+        let mut skipped = Vec::new();
+        // The 00 00 03 pattern cannot overlap itself, so inspecting every
+        // window finds the same positions as advancing past each match.
+        for (start, bytes) in nal.windows(3).enumerate() {
+            if bytes == [0, 0, 3] {
+                let nal_offset = start + 2;
+                skipped.push((nal_offset, nal_offset - skipped.len()));
+            }
+        }
+        Self {
+            nal_len: nal.len(),
+            skipped,
+        }
+    }
+
+    /// NAL index of the byte at an RBSP offset, or `None` at or beyond the end.
+    pub(crate) fn to_nal(&self, rbsp_offset: usize) -> Option<usize> {
+        if rbsp_offset >= self.nal_len - self.skipped.len() {
+            return None;
+        }
+        let skipped = self
+            .skipped
+            .partition_point(|&(_, rbsp)| rbsp <= rbsp_offset);
+        Some(rbsp_offset + skipped)
+    }
+
+    /// First RBSP index whose source index is at least `nal_offset`.
+    pub(crate) fn to_rbsp(&self, nal_offset: usize) -> usize {
+        let nal_offset = nal_offset.min(self.nal_len);
+        let skipped = self.skipped.partition_point(|&(nal, _)| nal < nal_offset);
+        nal_offset - skipped
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::bitreader::{BitReader, rbsp_src_map, unescape_rbsp, unescape_rbsp_with_map};
+    use super::{BitReader, RbspOffsetMap, unescape_rbsp, unescape_rbsp_with_map};
 
     #[test]
-    fn src_map_matches_with_map_variant() {
-        // rbsp_src_map must produce the same offset map as the paired variant,
-        // including across emulation-prevention bytes.
-        let nal = [
-            0x00u8, 0x00, 0x03, 0x00, 0xAA, 0x00, 0x00, 0x03, 0x01, 0xBB, 0xCC,
+    fn sparse_map_matches_dense_at_all_boundaries() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0, 3],
+            &[0, 0, 3],
+            &[0xAA, 0, 0, 3, 0, 0, 3, 0xBB, 0, 0, 3, 1, 0xCC],
+            &[0, 0, 0, 3, 0xFF, 0, 0, 3, 3, 0, 0],
         ];
-        let (_rbsp, map_ref) = unescape_rbsp_with_map(&nal);
-        let map = rbsp_src_map(&nal);
-        assert_eq!(map, map_ref);
+        for &nal in cases {
+            let (_, dense) = unescape_rbsp_with_map(nal);
+            let sparse = RbspOffsetMap::from_nal(nal);
+
+            for nal_offset in (0..=nal.len()).chain([usize::MAX]) {
+                let expected = dense.partition_point(|&source| source < nal_offset);
+                assert_eq!(sparse.to_rbsp(nal_offset), expected, "NAL {nal:?}");
+            }
+            for rbsp_offset in (0..=dense.len()).chain([usize::MAX]) {
+                assert_eq!(
+                    sparse.to_nal(rbsp_offset),
+                    dense.get(rbsp_offset).copied(),
+                    "NAL {nal:?}"
+                );
+            }
+        }
     }
 
     #[test]

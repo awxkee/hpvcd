@@ -81,7 +81,9 @@ fn sse_scaled_i64_factor_ok(params: DequantParams, max_coeff: i64) -> bool {
 
 #[inline]
 fn scaling_factors4(base_factor: i64, scaling: ScalingMatrix<'_>, idx: usize) -> [i32; 4] {
-    std::array::from_fn(|lane| (base_factor * scaling.coeff(idx + lane)) as i32)
+    scaling
+        .coeffs4(idx)
+        .map(|coeff| (base_factor * i64::from(coeff)) as i32)
 }
 
 #[inline]
@@ -451,10 +453,7 @@ fn dequantize_scaled_into_sse41_impl(
 
     for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
         let idx = group_idx * 16;
-        let f0 = scaling_factors4(base_factor, scaling, idx);
-        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
-        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
-        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let [f0, f1, f2, f3] = scaling.factors16(idx, base_factor);
         let v0 = dequant4_scaled_sse41_const(&src[0], &f0, add, shift, clip_lo, clip_hi);
         let v1 = dequant4_scaled_sse41_const(&src[1], &f1, add, shift, clip_lo, clip_hi);
         let v2 = dequant4_scaled_sse41_const(&src[2], &f2, add, shift, clip_lo, clip_hi);
@@ -500,10 +499,7 @@ fn dequantize_scaled_into_sse41_16_impl(
         let idx = group_idx * 16;
         let (src0, _) = src[0].as_chunks::<4>();
         let (src1, _) = src[1].as_chunks::<4>();
-        let f0 = scaling_factors4(base_factor, scaling, idx);
-        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
-        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
-        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let [f0, f1, f2, f3] = scaling.factors16(idx, base_factor);
         let lo0 = dequant4_scaled_sse41_const(&src0[0], &f0, add, shift, clip_lo, clip_hi);
         let hi0 = dequant4_scaled_sse41_const(&src0[1], &f1, add, shift, clip_lo, clip_hi);
         let lo1 = dequant4_scaled_sse41_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
@@ -544,10 +540,7 @@ fn dequantize_transform_skip_scaled_into_sse41_impl(
     let tr_add = _mm_set1_epi32(params.tr_add);
     let tr_shift = _mm_cvtsi32_si128(params.tr_shift.abs());
 
-    let f0 = scaling_factors4(base_factor, scaling, 0);
-    let f1 = scaling_factors4(base_factor, scaling, 4);
-    let f2 = scaling_factors4(base_factor, scaling, 8);
-    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let [f0, f1, f2, f3] = scaling.factors16(0, base_factor);
     let d0 = dequant4_scaled_sse41_const(&levels[0], &f0, add, shift, clip_lo, clip_hi);
     let d1 = dequant4_scaled_sse41_const(&levels[1], &f1, add, shift, clip_lo, clip_hi);
     let d2 = dequant4_scaled_sse41_const(&levels[2], &f2, add, shift, clip_lo, clip_hi);
@@ -597,10 +590,7 @@ fn dequantize_transform_skip_scaled_into_sse41_16_impl(
 
     let (src0, _) = levels[0].as_chunks::<4>();
     let (src1, _) = levels[1].as_chunks::<4>();
-    let f0 = scaling_factors4(base_factor, scaling, 0);
-    let f1 = scaling_factors4(base_factor, scaling, 4);
-    let f2 = scaling_factors4(base_factor, scaling, 8);
-    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let [f0, f1, f2, f3] = scaling.factors16(0, base_factor);
     let d0 = dequant4_scaled_sse41_const(&src0[0], &f0, add, shift, clip_lo, clip_hi);
     let d1 = dequant4_scaled_sse41_const(&src0[1], &f1, add, shift, clip_lo, clip_hi);
     let d2 = dequant4_scaled_sse41_const(&src1[0], &f2, add, shift, clip_lo, clip_hi);
@@ -1020,10 +1010,7 @@ fn dequantize_scaled_into_sse41_i64_impl(
 
     for (group_idx, (src, dst)) in level_groups.iter().zip(out_groups.iter_mut()).enumerate() {
         let idx = group_idx * 16;
-        let f0 = scaling_factors4(base_factor, scaling, idx);
-        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
-        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
-        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let [f0, f1, f2, f3] = scaling.factors16(idx, base_factor);
         let (p0, n0) = dequant_sat_bounds4(&f0, params.add, params.shift);
         let (p1, n1) = dequant_sat_bounds4(&f1, params.add, params.shift);
         let (p2, n2) = dequant_sat_bounds4(&f2, params.add, params.shift);
@@ -1092,10 +1079,7 @@ fn dequantize_scaled_into_sse41_16_i64_impl(
         let idx = group_idx * 16;
         let (src0, _) = src[0].as_chunks::<4>();
         let (src1, _) = src[1].as_chunks::<4>();
-        let f0 = scaling_factors4(base_factor, scaling, idx);
-        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
-        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
-        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let [f0, f1, f2, f3] = scaling.factors16(idx, base_factor);
         let (p0, n0) = dequant_sat_bounds4(&f0, params.add, params.shift);
         let (p1, n1) = dequant_sat_bounds4(&f1, params.add, params.shift);
         let (p2, n2) = dequant_sat_bounds4(&f2, params.add, params.shift);
@@ -1167,10 +1151,7 @@ fn dequantize_transform_skip_scaled_into_sse41_i64_impl(
     let tr_add = _mm_set1_epi32(params.tr_add);
     let tr_shift = _mm_cvtsi32_si128(params.tr_shift.abs());
 
-    let f0 = scaling_factors4(base_factor, scaling, 0);
-    let f1 = scaling_factors4(base_factor, scaling, 4);
-    let f2 = scaling_factors4(base_factor, scaling, 8);
-    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let [f0, f1, f2, f3] = scaling.factors16(0, base_factor);
     let (p0, n0) = dequant_sat_bounds4(&f0, params.dequant.add, params.dequant.shift);
     let (p1, n1) = dequant_sat_bounds4(&f1, params.dequant.add, params.dequant.shift);
     let (p2, n2) = dequant_sat_bounds4(&f2, params.dequant.add, params.dequant.shift);
@@ -1231,10 +1212,7 @@ fn dequantize_transform_skip_scaled_into_sse41_16_i64_impl(
 
     let (src0, _) = levels[0].as_chunks::<4>();
     let (src1, _) = levels[1].as_chunks::<4>();
-    let f0 = scaling_factors4(base_factor, scaling, 0);
-    let f1 = scaling_factors4(base_factor, scaling, 4);
-    let f2 = scaling_factors4(base_factor, scaling, 8);
-    let f3 = scaling_factors4(base_factor, scaling, 12);
+    let [f0, f1, f2, f3] = scaling.factors16(0, base_factor);
     let (p0, n0) = dequant_sat_bounds4(&f0, params.dequant.add, params.dequant.shift);
     let (p1, n1) = dequant_sat_bounds4(&f1, params.dequant.add, params.dequant.shift);
     let (p2, n2) = dequant_sat_bounds4(&f2, params.dequant.add, params.dequant.shift);

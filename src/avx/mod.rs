@@ -59,6 +59,6 @@ pub(crate) use sao::{
     apply_sao_plane_avx2, apply_sao_plane_banded_avx2,
 };
 pub(crate) use transform::{
-    inv_transform_dst_into_avx2, inv_transform_dst_into_avx2_16, inv_transform_into_avx2,
-    inv_transform_into_avx2_16,
+    inv_transform_coded32_into_avx2_16, inv_transform_dst_into_avx2,
+    inv_transform_dst_into_avx2_16, inv_transform_into_avx2, inv_transform_into_avx2_16,
 };

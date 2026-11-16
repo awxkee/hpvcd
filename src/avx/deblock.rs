@@ -220,7 +220,7 @@ fn luma_filter8_avx2(
     // §8.7.2.5.4: each strongly-filtered sample is clipped to ±2·tc around its
     // original value, then to the sample range. `strong_clip(v, orig)` folds both
     // clamps by tightening [0, maxv] to [orig−2tc, orig+2tc]. Omitting the ±2·tc
-    // clip (scalar `deblock_luma_segment` applies it) over-filters high-contrast
+    // clip (scalar `apply_luma_decision` applies it) over-filters high-contrast
     // edges and diverges from the serial decoder.
     let two_tc = _mm256_slli_epi32::<1>(tc);
     let strong_clip = |v: __m256i, orig: __m256i| {

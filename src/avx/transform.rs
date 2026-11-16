@@ -646,7 +646,7 @@ fn pr(a: __m256i, b: __m256i) -> __m256i {
 /// (k0,k1) i16 pair times interleaved lanes: one pmaddwd = two mul-adds.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn pmadd(p: __m256i, k0: i32, k1: i32) -> __m256i {
+fn pmadd_lanes(p: __m256i, k0: i32, k1: i32) -> __m256i {
     _mm256_madd_epi16(p, _mm256_set1_epi32(((k1 & 0xffff) << 16) | (k0 & 0xffff)))
 }
 
@@ -698,9 +698,34 @@ fn tr_store_8x8_i16(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn odd8_p(c: &[__m256i; 8]) -> [__m256i; 4] {
-    let p0 = pr(c[1], c[3]);
-    let p1 = pr(c[5], c[7]);
+fn odd_pair<const ACTIVE: usize, const FIRST: usize>(c: &[__m256i; ACTIVE]) -> Option<__m256i> {
+    if FIRST < ACTIVE {
+        let second = if FIRST + 2 < ACTIVE {
+            c[FIRST + 2]
+        } else {
+            zero()
+        };
+        Some(pr(c[FIRST], second))
+    } else {
+        None
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn pmadd(pair: Option<__m256i>, k0: i32, k1: i32) -> __m256i {
+    if let Some(pair) = pair {
+        pmadd_lanes(pair, k0, k1)
+    } else {
+        zero()
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn odd8_p<const ACTIVE: usize>(c: &[__m256i; ACTIVE]) -> [__m256i; 4] {
+    let p0 = odd_pair::<ACTIVE, 1>(c);
+    let p1 = odd_pair::<ACTIVE, 5>(c);
     [
         add(pmadd(p0, 89, 75), pmadd(p1, 50, 18)),
         add(pmadd(p0, 75, -18), pmadd(p1, -89, -50)),
@@ -711,11 +736,11 @@ fn odd8_p(c: &[__m256i; 8]) -> [__m256i; 4] {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn odd16_p(c: &[__m256i; 16]) -> [__m256i; 8] {
-    let p0 = pr(c[1], c[3]);
-    let p1 = pr(c[5], c[7]);
-    let p2 = pr(c[9], c[11]);
-    let p3 = pr(c[13], c[15]);
+fn odd16_p<const ACTIVE: usize>(c: &[__m256i; ACTIVE]) -> [__m256i; 8] {
+    let p0 = odd_pair::<ACTIVE, 1>(c);
+    let p1 = odd_pair::<ACTIVE, 5>(c);
+    let p2 = odd_pair::<ACTIVE, 9>(c);
+    let p3 = odd_pair::<ACTIVE, 13>(c);
     [
         add(
             add(pmadd(p0, 90, 87), pmadd(p1, 80, 70)),
@@ -754,15 +779,15 @@ fn odd16_p(c: &[__m256i; 16]) -> [__m256i; 8] {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn odd32_p(c: &[__m256i; 32]) -> [__m256i; 16] {
-    let p0 = pr(c[1], c[3]);
-    let p1 = pr(c[5], c[7]);
-    let p2 = pr(c[9], c[11]);
-    let p3 = pr(c[13], c[15]);
-    let p4 = pr(c[17], c[19]);
-    let p5 = pr(c[21], c[23]);
-    let p6 = pr(c[25], c[27]);
-    let p7 = pr(c[29], c[31]);
+fn odd32_p<const ACTIVE: usize>(c: &[__m256i; ACTIVE]) -> [__m256i; 16] {
+    let p0 = odd_pair::<ACTIVE, 1>(c);
+    let p1 = odd_pair::<ACTIVE, 5>(c);
+    let p2 = odd_pair::<ACTIVE, 9>(c);
+    let p3 = odd_pair::<ACTIVE, 13>(c);
+    let p4 = odd_pair::<ACTIVE, 17>(c);
+    let p5 = odd_pair::<ACTIVE, 21>(c);
+    let p6 = odd_pair::<ACTIVE, 25>(c);
+    let p7 = odd_pair::<ACTIVE, 29>(c);
     [
         add(
             add(
@@ -932,17 +957,23 @@ fn odd32_p(c: &[__m256i; 32]) -> [__m256i; 16] {
 fn idct4_p(c: [__m256i; 4]) -> [__m256i; 4] {
     let pe = pr(c[0], c[2]);
     let po = pr(c[1], c[3]);
-    let e0 = pmadd(pe, 64, 64);
-    let e1 = pmadd(pe, 64, -64);
-    let o0 = pmadd(po, 83, 36);
-    let o1 = pmadd(po, 36, -83);
+    let e0 = pmadd_lanes(pe, 64, 64);
+    let e1 = pmadd_lanes(pe, 64, -64);
+    let o0 = pmadd_lanes(po, 83, 36);
+    let o1 = pmadd_lanes(po, 36, -83);
     [add(e0, o0), add(e1, o1), sub(e1, o1), sub(e0, o0)]
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn idct8_p(c: &[__m256i; 8]) -> [__m256i; 8] {
-    let ee = idct4_p([c[0], c[2], c[4], c[6]]);
+fn idct8_p<const ACTIVE: usize>(c: &[__m256i; ACTIVE]) -> [__m256i; 8] {
+    let ee = if ACTIVE == 2 {
+        [pmadd_lanes(pr(c[0], zero()), 64, 0); 4]
+    } else if ACTIVE == 4 {
+        idct4_p([c[0], c[2], zero(), zero()])
+    } else {
+        idct4_p([c[0], c[2], c[4], c[6]])
+    };
     let oo = odd8_p(c);
     let mut out = [zero(); 8];
     for k in 0..4 {
@@ -954,8 +985,16 @@ fn idct8_p(c: &[__m256i; 8]) -> [__m256i; 8] {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn idct16_p(c: &[__m256i; 16]) -> [__m256i; 16] {
-    let ee = idct8_p(&std::array::from_fn(|j| c[2 * j]));
+fn idct16_p<const ACTIVE: usize>(c: &[__m256i; ACTIVE]) -> [__m256i; 16] {
+    let ee = if ACTIVE == 2 {
+        [pmadd_lanes(pr(c[0], zero()), 64, 0); 8]
+    } else if ACTIVE == 4 {
+        idct8_p(&[c[0], c[2]])
+    } else if ACTIVE == 8 {
+        idct8_p::<4>(&std::array::from_fn(|j| c[2 * j]))
+    } else {
+        idct8_p::<8>(&std::array::from_fn(|j| c[2 * j]))
+    };
     let oo = odd16_p(c);
     let mut out = [zero(); 16];
     for k in 0..8 {
@@ -967,8 +1006,13 @@ fn idct16_p(c: &[__m256i; 16]) -> [__m256i; 16] {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn idct32_p(c: &[__m256i; 32]) -> [__m256i; 32] {
-    let ee = idct16_p(&std::array::from_fn(|j| c[2 * j]));
+fn idct32_p<const ACTIVE: usize>(c: &[__m256i; ACTIVE]) -> [__m256i; 32] {
+    let ee = match ACTIVE {
+        4 => idct16_p::<2>(&std::array::from_fn(|j| c[2 * j])),
+        8 => idct16_p::<4>(&std::array::from_fn(|j| c[2 * j])),
+        16 => idct16_p::<8>(&std::array::from_fn(|j| c[2 * j])),
+        _ => idct16_p::<16>(&std::array::from_fn(|j| c[2 * j])),
+    };
     let oo = odd32_p(c);
     let mut out = [zero(); 32];
     for k in 0..16 {
@@ -989,20 +1033,38 @@ fn idct_p<const N: usize>(c: &[__m256i; N]) -> [__m256i; N] {
         }
         8 => {
             let src = std::array::from_fn(|i| c[i]);
-            let r = idct8_p(&src);
+            let r = idct8_p::<8>(&src);
             std::array::from_fn(|i| r[i])
         }
         16 => {
             let src = std::array::from_fn(|i| c[i]);
-            let r = idct16_p(&src);
+            let r = idct16_p::<16>(&src);
             std::array::from_fn(|i| r[i])
         }
         32 => {
             let src = std::array::from_fn(|i| c[i]);
-            let r = idct32_p(&src);
+            let r = idct32_p::<32>(&src);
             std::array::from_fn(|i| r[i])
         }
         _ => unreachable!(),
+    }
+}
+
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+fn inv_dct32_pruned_second_pass<const ACTIVE: usize>(
+    tmp: &[i16; 32 * 32],
+    add: i32,
+    shift: i32,
+    out: &mut [i16],
+) {
+    for r in (0..32).step_by(8) {
+        let src = std::array::from_fn(|k| ld_i16x8(&tmp[k * 32 + r..]));
+        let raw = idct32_p::<ACTIVE>(&src);
+        for x in (0..32).step_by(8) {
+            let v = std::array::from_fn(|j| round_shift_s32x8(raw[x + j], add, shift));
+            tr_store_8x8_i16(out, 32, r, x, v);
+        }
     }
 }
 
@@ -1011,6 +1073,7 @@ fn inv_dct_n_into_avx2_16<const N: usize>(
     coeff: &[i16],
     bit_depth: u8,
     nx: usize,
+    coded_groups: u64,
     out: &mut [i16],
 ) {
     debug_assert!(N == 4 || N == 8 || N == 16 || N == 32);
@@ -1039,12 +1102,39 @@ fn inv_dct_n_into_avx2_16<const N: usize>(
     // Columns >= nx are zero on input; skip them (tmp stays zero there).
     let ncol = ((nx.min(N) + 7) & !7).max(8);
     for c in (0..ncol).step_by(8) {
-        let src: [__m256i; N] = std::array::from_fn(|k| ld_i16_block::<N>(&coeff[k * N + c..]));
-        let raw = idct_p::<N>(&src);
+        let active_groups = if N == 32 && coded_groups != u64::MAX {
+            // An eight-column strip contains two four-column groups.
+            let rows = coded_groups & (0x0303_0303_0303_0303 << (c / 4));
+            (u64::BITS - rows.leading_zeros()).div_ceil(8)
+        } else {
+            (N / 4) as u32
+        };
+        let raw = if N == 32 && active_groups <= 4 {
+            let raw = match active_groups {
+                0 => continue,
+                1 => idct32_p::<4>(&std::array::from_fn(|k| ld_i16x8(&coeff[k * N + c..]))),
+                2 => idct32_p::<8>(&std::array::from_fn(|k| ld_i16x8(&coeff[k * N + c..]))),
+                _ => idct32_p::<16>(&std::array::from_fn(|k| ld_i16x8(&coeff[k * N + c..]))),
+            };
+            std::array::from_fn(|j| raw[j])
+        } else {
+            let src = std::array::from_fn(|k| ld_i16_block::<N>(&coeff[k * N + c..]));
+            idct_p::<N>(&src)
+        };
         for m in (0..N).step_by(8) {
             let v = std::array::from_fn(|j| round_shift_s32x8(raw[m + j], add1, shift1));
             tr_store_8x8_i16(&mut tmp, N, c, m, v);
         }
+    }
+
+    if N == 32 && coded_groups != u64::MAX && nx <= 16 {
+        // Even within the last SIMD strip, lanes past nx have zero input.
+        match nx {
+            ..=4 => inv_dct32_pruned_second_pass::<4>(&tmp, add2, shift2, out),
+            5..=8 => inv_dct32_pruned_second_pass::<8>(&tmp, add2, shift2, out),
+            _ => inv_dct32_pruned_second_pass::<16>(&tmp, add2, shift2, out),
+        }
+        return;
     }
 
     for r in (0..N).step_by(8) {
@@ -1072,8 +1162,8 @@ fn inv_transform_dst4_into_avx2_16(coeff: &[i16], bit_depth: u8, out: &mut [i16]
     let p23 = pr(c[2], c[3]);
     let v = std::array::from_fn(|m| {
         let acc = add(
-            pmadd(p01, DST4[0][m], DST4[1][m]),
-            pmadd(p23, DST4[2][m], DST4[3][m]),
+            pmadd_lanes(p01, DST4[0][m], DST4[1][m]),
+            pmadd_lanes(p23, DST4[2][m], DST4[3][m]),
         );
         round_shift_s32x8(acc, add1, shift1)
     });
@@ -1084,8 +1174,8 @@ fn inv_transform_dst4_into_avx2_16(coeff: &[i16], bit_depth: u8, out: &mut [i16]
     let p23 = pr(c[2], c[3]);
     let v = std::array::from_fn(|m| {
         let acc = add(
-            pmadd(p01, DST4[0][m], DST4[1][m]),
-            pmadd(p23, DST4[2][m], DST4[3][m]),
+            pmadd_lanes(p01, DST4[0][m], DST4[1][m]),
+            pmadd_lanes(p23, DST4[2][m], DST4[3][m]),
         );
         round_shift_s32x8(acc, add2, shift2)
     });
@@ -1101,13 +1191,28 @@ pub(crate) fn inv_transform_into_avx2_16(
 ) {
     unsafe {
         match n {
-            4 => inv_dct_n_into_avx2_16::<4>(coeff, bit_depth, nx, out),
-            8 => inv_dct_n_into_avx2_16::<8>(coeff, bit_depth, nx, out),
-            16 => inv_dct_n_into_avx2_16::<16>(coeff, bit_depth, nx, out),
-            32 => inv_dct_n_into_avx2_16::<32>(coeff, bit_depth, nx, out),
+            4 => inv_dct_n_into_avx2_16::<4>(coeff, bit_depth, nx, u64::MAX, out),
+            8 => inv_dct_n_into_avx2_16::<8>(coeff, bit_depth, nx, u64::MAX, out),
+            16 => inv_dct_n_into_avx2_16::<16>(coeff, bit_depth, nx, u64::MAX, out),
+            32 => inv_dct_n_into_avx2_16::<32>(coeff, bit_depth, nx, u64::MAX, out),
             _ => unreachable!("unsupported inverse transform size"),
         }
     }
+}
+
+/// Inverse DCT with one coded flag per 4×4 input group, in row-major order.
+pub(crate) fn inv_transform_coded32_into_avx2_16(
+    coeff: &[i16],
+    bit_depth: u8,
+    nx: usize,
+    coded_groups: u64,
+    out: &mut [i16],
+) {
+    let coeff = &coeff[..32 * 32];
+    let out = &mut out[..32 * 32];
+    // SAFETY: resolve_inv_transform_coded32_16 selects this backend only on
+    // CPUs that support AVX2. Both slices hold a full 32×32 block.
+    unsafe { inv_dct_n_into_avx2_16::<32>(coeff, bit_depth, nx, coded_groups, out) }
 }
 
 pub(crate) fn inv_transform_dst_into_avx2_16(coeff: &[i16], bit_depth: u8, out: &mut [i16]) {

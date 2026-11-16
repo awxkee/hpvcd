@@ -91,10 +91,9 @@ pub(crate) struct DeblockCtx<'a> {
 
 #[derive(Default)]
 pub(crate) struct DeblockScratch {
-    pub(crate) snap_y: Vec<u16>,
-    pub(crate) snap_cb: Vec<u16>,
-    pub(crate) snap_cr: Vec<u16>,
-    pub(crate) suppressed: Vec<bool>,
+    snap_y: Vec<u16>,
+    snap_cb: Vec<u16>,
+    snap_cr: Vec<u16>,
     bands: Vec<(usize, usize)>,
 }
 
@@ -102,7 +101,6 @@ impl DeblockScratch {
     pub(crate) fn new(
         y_len: usize,
         chroma_len: usize,
-        grid_len: usize,
         plane_heights: (usize, usize),
         log2_ctb: u32,
         sub_h: usize,
@@ -115,7 +113,6 @@ impl DeblockScratch {
             snap_y: Vec::with_capacity(y_len),
             snap_cb: Vec::with_capacity(chroma_len),
             snap_cr: Vec::with_capacity(chroma_len),
-            suppressed: Vec::with_capacity(grid_len),
             bands: Vec::with_capacity(band_capacity),
         }
     }
@@ -198,14 +195,16 @@ impl DeblockCtx<'_> {
         // the reconstructed samples and then restores only the exempt side. The
         // parallel driver performs that substitution after every pass, exactly
         // like the serial path.
-        let sq = self.slice_at(pxq, pyq);
-        let q_across = self
-            .slice_lf_across
-            .get(sq as usize)
-            .copied()
-            .unwrap_or(self.loop_filter_across_slices);
-        if !q_across && self.slice_at(pxp, pyp) != sq {
-            return false;
+        if !self.slice_idx.is_empty() {
+            let sq = self.slice_at(pxq, pyq);
+            let q_across = self
+                .slice_lf_across
+                .get(sq as usize)
+                .copied()
+                .unwrap_or(self.loop_filter_across_slices);
+            if !q_across && self.slice_at(pxp, pyp) != sq {
+                return false;
+            }
         }
         if let Some(g) = &self.tile_grid {
             let c = self.log2_ctb;
@@ -218,6 +217,9 @@ impl DeblockCtx<'_> {
 
     #[inline]
     fn slice_at(&self, px: usize, py: usize) -> u16 {
+        if self.slice_idx.is_empty() {
+            return 0;
+        }
         self.grid(px, py)
             .and_then(|g| self.slice_idx.get(g))
             .copied()
@@ -275,64 +277,6 @@ pub(crate) fn luma_decision(beta: i32, tc: i32, g: impl Fn(usize, i32) -> i32) -
         LumaDecision::Weak {
             do_p1: dp0 + dp3 < side_thr,
             do_q1: dq0 + dq3 < side_thr,
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn deblock_luma_segment(
-    plane: &mut [u16],
-    beta: i32,
-    tc: i32,
-    max_val: i32,
-    at: impl Fn(usize, i32) -> usize,
-) {
-    let g = |plane: &[u16], line: usize, tap: i32| plane[at(line, tap)] as i32;
-
-    let decision = luma_decision(beta, tc, |line, tap| g(plane, line, tap));
-    let (strong, do_p1, do_q1) = match decision {
-        LumaDecision::Skip => return,
-        LumaDecision::Strong => (true, false, false),
-        LumaDecision::Weak { do_p1, do_q1 } => (false, do_p1, do_q1),
-    };
-
-    let tc2 = tc >> 1;
-    for line in 0..4 {
-        let p0 = g(plane, line, -1);
-        let p1 = g(plane, line, -2);
-        let p2 = g(plane, line, -3);
-        let p3 = g(plane, line, -4);
-        let q0 = g(plane, line, 0);
-        let q1 = g(plane, line, 1);
-        let q2 = g(plane, line, 2);
-        let q3 = g(plane, line, 3);
-        if strong {
-            // §8.7.2.5.4: each strongly-filtered sample is additionally clipped
-            // to ±2·tc around its original value.
-            let c = |orig: i32, v: i32| -> u16 {
-                v.clamp(orig - 2 * tc, orig + 2 * tc).clamp(0, max_val) as u16
-            };
-            plane[at(line, -1)] = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-            plane[at(line, -2)] = c(p1, (p2 + p1 + p0 + q0 + 2) >> 2);
-            plane[at(line, -3)] = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-            plane[at(line, 0)] = c(q0, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-            plane[at(line, 1)] = c(q1, (p0 + q0 + q1 + q2 + 2) >> 2);
-            plane[at(line, 2)] = c(q2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
-        } else {
-            let delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
-            if delta0.abs() < tc * 10 {
-                let delta = delta0.clamp(-tc, tc);
-                plane[at(line, -1)] = (p0 + delta).clamp(0, max_val) as u16;
-                plane[at(line, 0)] = (q0 - delta).clamp(0, max_val) as u16;
-                if do_p1 {
-                    let dp1 = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-tc2, tc2);
-                    plane[at(line, -2)] = (p1 + dp1).clamp(0, max_val) as u16;
-                }
-                if do_q1 {
-                    let dq1 = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-tc2, tc2);
-                    plane[at(line, 1)] = (q1 + dq1).clamp(0, max_val) as u16;
-                }
-            }
         }
     }
 }
@@ -1150,39 +1094,44 @@ fn restore_chroma(ctx: &DeblockCtx<'_>, plane: &mut [u16], snapshot: &[u16]) {
     }
 }
 
-/// Parallel deblocking driver. Runs the four ordered passes; within each pass,
-/// CTB-aligned row bands are filtered concurrently on `pool`. Bit-identical to
-/// the serial `apply_deblocking`. `log2_ctb` sets band height; larger CTBs give
-/// coarser (fewer, bigger) bands.
+/// Run the four ordered deblocking passes with the selected filter kernels.
+/// A supplied pool splits each pass into independently filtered row bands.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_deblocking_parallel(
-    pool: &ThreadPool,
+pub(crate) fn apply_deblocking(
+    pool: Option<&ThreadPool>,
     ctx: &DeblockCtx<'_>,
-    log2_ctb: u32,
     scratch: &mut DeblockScratch,
     mut y: Vec<u16>,
     mut cb: Vec<u16>,
     mut cr: Vec<u16>,
 ) -> DeblockPlanes {
-    let ctb = 1usize << log2_ctb;
+    let ctb = 1usize << ctx.log2_ctb;
     let w = ctx.w;
     let cw = ctx.cw;
     let suppress = suppression_active(ctx);
     if suppress {
+        // Every pass restores exempt samples from the same input picture.
+        if (0..ctx.gw * ctx.gh).all(|grid| ctx.sample_suppressed(grid)) {
+            return DeblockPlanes { y, cb, cr };
+        }
         scratch.snapshot(&y, &cb, &cr);
     }
 
     // ---- Luma vertical: row bands, no halo, in place ----
     {
-        ctb_bands(&mut scratch.bands, ctx.h, ctb);
-        let bands = &scratch.bands;
-        let y_dm = DisjointMut::new(std::mem::take(&mut y));
-        parallel_for(pool, bands.len(), |bi| {
-            let (r0, r1) = bands[bi];
-            let mut band = y_dm.slice_mut(r0 * w..r1 * w);
-            luma_vertical(ctx, &mut band, r0, r1);
-        });
-        y = y_dm.into_inner();
+        if let Some(pool) = pool {
+            ctb_bands(&mut scratch.bands, ctx.h, ctb);
+            let bands = &scratch.bands;
+            let y_dm = DisjointMut::new(std::mem::take(&mut y));
+            parallel_for(pool, bands.len(), |bi| {
+                let (r0, r1) = bands[bi];
+                let mut band = y_dm.slice_mut(r0 * w..r1 * w);
+                luma_vertical(ctx, &mut band, r0, r1);
+            });
+            y = y_dm.into_inner();
+        } else {
+            luma_vertical(ctx, &mut y, 0, ctx.h);
+        }
         if suppress {
             restore_luma(ctx, &mut y, &scratch.snap_y);
         }
@@ -1190,15 +1139,19 @@ pub(crate) fn apply_deblocking_parallel(
 
     // ---- Luma horizontal: row bands, in place ----
     {
-        horiz_bands(&mut scratch.bands, ctx.h, ctb);
-        let bands = &scratch.bands;
-        let y_dm = DisjointMut::new(std::mem::take(&mut y));
-        parallel_for(pool, bands.len(), |bi| {
-            let (r0, r1) = bands[bi];
-            let mut band = y_dm.slice_mut(r0 * w..r1 * w);
-            luma_horizontal(ctx, &mut band, r0, r1);
-        });
-        y = y_dm.into_inner();
+        if let Some(pool) = pool {
+            horiz_bands(&mut scratch.bands, ctx.h, ctb);
+            let bands = &scratch.bands;
+            let y_dm = DisjointMut::new(std::mem::take(&mut y));
+            parallel_for(pool, bands.len(), |bi| {
+                let (r0, r1) = bands[bi];
+                let mut band = y_dm.slice_mut(r0 * w..r1 * w);
+                luma_horizontal(ctx, &mut band, r0, r1);
+            });
+            y = y_dm.into_inner();
+        } else {
+            luma_horizontal(ctx, &mut y, 0, ctx.h);
+        }
         if suppress {
             restore_luma(ctx, &mut y, &scratch.snap_y);
         }
@@ -1207,19 +1160,23 @@ pub(crate) fn apply_deblocking_parallel(
     // ---- Chroma vertical: chroma-row bands, no halo, in place ----
     if ctx.cw > 0 && ctx.ch > 0 {
         // Keep chroma bands luma-CTB-aligned by dividing by sub_h.
-        let cband = (ctb / ctx.sub_h).max(1);
-        ctb_bands(&mut scratch.bands, ctx.ch, cband);
-        let bands = &scratch.bands;
-        let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
-        let cr_dm = DisjointMut::new(std::mem::take(&mut cr));
-        parallel_for(pool, bands.len(), |bi| {
-            let (r0, r1) = bands[bi];
-            let mut cbb = cb_dm.slice_mut(r0 * cw..r1 * cw);
-            let mut crb = cr_dm.slice_mut(r0 * cw..r1 * cw);
-            chroma_vertical(ctx, &mut cbb, &mut crb, r0, r1);
-        });
-        cb = cb_dm.into_inner();
-        cr = cr_dm.into_inner();
+        if let Some(pool) = pool {
+            let cband = (ctb / ctx.sub_h).max(1);
+            ctb_bands(&mut scratch.bands, ctx.ch, cband);
+            let bands = &scratch.bands;
+            let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
+            let cr_dm = DisjointMut::new(std::mem::take(&mut cr));
+            parallel_for(pool, bands.len(), |bi| {
+                let (r0, r1) = bands[bi];
+                let mut cbb = cb_dm.slice_mut(r0 * cw..r1 * cw);
+                let mut crb = cr_dm.slice_mut(r0 * cw..r1 * cw);
+                chroma_vertical(ctx, &mut cbb, &mut crb, r0, r1);
+            });
+            cb = cb_dm.into_inner();
+            cr = cr_dm.into_inner();
+        } else {
+            chroma_vertical(ctx, &mut cb, &mut cr, 0, ctx.ch);
+        }
         if suppress {
             restore_chroma(ctx, &mut cb, &scratch.snap_cb);
             restore_chroma(ctx, &mut cr, &scratch.snap_cr);
@@ -1228,19 +1185,23 @@ pub(crate) fn apply_deblocking_parallel(
 
     // ---- Chroma horizontal: chroma-row bands, in place ----
     if ctx.cw > 0 && ctx.ch > 0 {
-        let cband = (ctb / ctx.sub_h).max(1);
-        horiz_bands(&mut scratch.bands, ctx.ch, cband);
-        let bands = &scratch.bands;
-        let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
-        let cr_dm = DisjointMut::new(std::mem::take(&mut cr));
-        parallel_for(pool, bands.len(), |bi| {
-            let (r0, r1) = bands[bi];
-            let mut cbb = cb_dm.slice_mut(r0 * cw..r1 * cw);
-            let mut crb = cr_dm.slice_mut(r0 * cw..r1 * cw);
-            chroma_horizontal(ctx, &mut cbb, &mut crb, r0, r1);
-        });
-        cb = cb_dm.into_inner();
-        cr = cr_dm.into_inner();
+        if let Some(pool) = pool {
+            let cband = (ctb / ctx.sub_h).max(1);
+            horiz_bands(&mut scratch.bands, ctx.ch, cband);
+            let bands = &scratch.bands;
+            let cb_dm = DisjointMut::new(std::mem::take(&mut cb));
+            let cr_dm = DisjointMut::new(std::mem::take(&mut cr));
+            parallel_for(pool, bands.len(), |bi| {
+                let (r0, r1) = bands[bi];
+                let mut cbb = cb_dm.slice_mut(r0 * cw..r1 * cw);
+                let mut crb = cr_dm.slice_mut(r0 * cw..r1 * cw);
+                chroma_horizontal(ctx, &mut cbb, &mut crb, r0, r1);
+            });
+            cb = cb_dm.into_inner();
+            cr = cr_dm.into_inner();
+        } else {
+            chroma_horizontal(ctx, &mut cb, &mut cr, 0, ctx.ch);
+        }
         if suppress {
             restore_chroma(ctx, &mut cb, &scratch.snap_cb);
             restore_chroma(ctx, &mut cr, &scratch.snap_cr);
@@ -1431,6 +1392,48 @@ mod tests {
         let c3 = ctx(&edge_v, &z, &bs_v, &zb, &z, &pcm, &s, true, false);
         assert_eq!(c3.bs_v_at(4, 0), 2);
         assert!(!c3.sample_suppressed(1));
+    }
+
+    #[test]
+    fn deblock_skips_only_when_every_coded_cell_is_exempt() {
+        let edge = [false; 25];
+        let bs = [0; 25];
+        let owner = [0; 25];
+        let all = [true; 25];
+        let mut tqb = all;
+        tqb[24] = false;
+        let mut pcm = [false; 25];
+        pcm[24] = true;
+
+        for (tqb, pcm, pcm_disabled, skipped) in [
+            (&all[..], &[][..], false, true),
+            (&[][..], &all[..], true, true),
+            (&tqb[..], &pcm[..], true, true),
+            (&tqb[..], &pcm[..], false, false),
+            (&tqb[..24], &[][..], false, false),
+        ] {
+            let mut c = ctx(
+                &edge,
+                &edge,
+                &bs,
+                &bs,
+                tqb,
+                pcm,
+                &owner,
+                false,
+                pcm_disabled,
+            );
+            (c.w, c.h, c.cw, c.ch, c.gw, c.gh) = (17, 19, 9, 10, 5, 5);
+            let y = vec![7; c.w * c.h];
+            let cb = vec![11; c.cw * c.ch];
+            let cr = vec![19; c.cw * c.ch];
+            let mut scratch = DeblockScratch::default();
+            let out = apply_deblocking(None, &c, &mut scratch, y.clone(), cb.clone(), cr.clone());
+            assert_eq!(scratch.snap_y.is_empty(), skipped);
+            assert_eq!(out.y, y);
+            assert_eq!(out.cb, cb);
+            assert_eq!(out.cr, cr);
+        }
     }
 
     #[test]

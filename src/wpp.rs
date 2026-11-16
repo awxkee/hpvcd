@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::threadpool::ProgressGate;
 
+use crate::bitreader::RbspOffsetMap;
 use crate::cabac::{ContextSet, IntraModeContexts, PaletteContexts};
 use crate::decode::FullDecoder;
 use crate::error::DecodeError;
@@ -50,8 +51,7 @@ pub(crate) struct RowSubstream {
 
 /// Compute per-row sub-stream byte ranges inside the unescaped RBSP.
 ///
-/// * `src_of` — the NAL→RBSP source-index map from
-///   [`crate::bitreader::unescape_rbsp_with_map`] for the whole NAL RBSP.
+/// * `offsets` — byte offset map for the whole NAL.
 /// * `cabac_rbsp_off` — RBSP byte offset where CABAC slice data begins
 ///   (`SliceHeader::cabac_offset`).
 /// * `entry_points` — `entry_point_offset_minus1[i] + 1` values (NAL byte
@@ -63,7 +63,7 @@ pub(crate) struct RowSubstream {
 /// not match `ctb_rows - 1`, or offsets run past the payload), signalling the
 /// caller to fall back to the serial decode.
 pub(crate) fn row_substreams(
-    src_of: &[usize],
+    offsets: &RbspOffsetMap,
     cabac_rbsp_off: usize,
     entry_points: &[u32],
     rbsp_len: usize,
@@ -82,12 +82,8 @@ pub(crate) fn row_substreams(
     }
 
     // NAL byte offset where CABAC data begins.
-    let nal_data_start = if cabac_rbsp_off < src_of.len() {
-        src_of[cabac_rbsp_off]
-    } else {
-        // cabac data begins exactly at RBSP end → empty payload.
-        return None;
-    };
+    // CABAC data cannot start at the RBSP end (empty payload).
+    let nal_data_start = offsets.to_nal(cabac_rbsp_off)?;
 
     let mut rows = Vec::with_capacity(ctb_rows);
     // Cumulative NAL offset of each sub-stream boundary.
@@ -96,7 +92,7 @@ pub(crate) fn row_substreams(
     for (i, _) in (0..ctb_rows).enumerate() {
         let rbsp_end = if i + 1 < ctb_rows {
             nal_cursor += entry_points[i] as usize;
-            let e = crate::bitreader::nal_to_rbsp_offset(src_of, nal_cursor);
+            let e = offsets.to_rbsp(nal_cursor);
             e.min(rbsp_len)
         } else {
             rbsp_len
@@ -253,15 +249,15 @@ fn default_contexts() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitreader::unescape_rbsp_with_map;
+    use crate::bitreader::unescape_rbsp;
 
     #[test]
     fn substreams_without_emulation_bytes() {
         // RBSP == NAL (no 0x00 0x00 03). 3 rows, entry points 4 and 5 bytes.
         let nal = vec![0xAAu8; 20];
-        let (_rbsp, src_of) = unescape_rbsp_with_map(&nal);
+        let offsets = RbspOffsetMap::from_nal(&nal);
         // cabac starts at offset 2 (after a 2-byte header, say).
-        let rows = row_substreams(&src_of, 2, &[4, 5], 20, 3).unwrap();
+        let rows = row_substreams(&offsets, 2, &[4, 5], 20, 3).unwrap();
         assert_eq!(rows[0], RowSubstream { start: 2, end: 6 });
         assert_eq!(rows[1], RowSubstream { start: 6, end: 11 });
         assert_eq!(rows[2], RowSubstream { start: 11, end: 20 });
@@ -270,9 +266,9 @@ mod tests {
     #[test]
     fn wrong_entry_point_count_rejected() {
         let nal = vec![0xAAu8; 20];
-        let (_r, src_of) = unescape_rbsp_with_map(&nal);
+        let offsets = RbspOffsetMap::from_nal(&nal);
         // 3 rows need 2 entry points; give 1 → None.
-        assert!(row_substreams(&src_of, 2, &[4], 20, 3).is_none());
+        assert!(row_substreams(&offsets, 2, &[4], 20, 3).is_none());
     }
 
     #[test]
@@ -282,11 +278,12 @@ mod tests {
         // src_of:              0  1     3  4 ...
         let mut nal = vec![0x00, 0x00, 0x03, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         nal.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-        let (rbsp, src_of) = unescape_rbsp_with_map(&nal);
+        let rbsp = unescape_rbsp(&nal);
+        let offsets = RbspOffsetMap::from_nal(&nal);
         // RBSP is one byte shorter than NAL.
         assert_eq!(rbsp.len(), nal.len() - 1);
         // Single row: whole payload from cabac offset 0.
-        let rows = row_substreams(&src_of, 0, &[], rbsp.len(), 1).unwrap();
+        let rows = row_substreams(&offsets, 0, &[], rbsp.len(), 1).unwrap();
         assert_eq!(
             rows[0],
             RowSubstream {
@@ -297,7 +294,7 @@ mod tests {
         // Two rows, first sub-stream 5 NAL bytes long starting at NAL 0.
         // NAL boundary at 5 → RBSP offset: src_of.partition_point(s<5).
         // src_of = [0,1,3,4,5,6,7,8,9,10,11,12] (index 2 removed).
-        let rows2 = row_substreams(&src_of, 0, &[5], rbsp.len(), 2).unwrap();
+        let rows2 = row_substreams(&offsets, 0, &[5], rbsp.len(), 2).unwrap();
         // NAL offset 5 maps to first RBSP index whose src >= 5 → that's rbsp idx 4.
         assert_eq!(rows2[0].start, 0);
         assert_eq!(rows2[0].end, 4);
@@ -314,14 +311,14 @@ mod tests {
 /// prevention bytes make the NAL and RBSP domains diverge, so the accumulation
 /// must be done in NAL space and mapped back per boundary.
 pub(crate) fn substream_starts_rbsp_rel(
-    src_of: &[usize],
+    offsets: &RbspOffsetMap,
     cabac_rbsp_off: usize,
     entry_points: &[u32],
     rbsp_len: usize,
 ) -> Vec<usize> {
     let mut starts = Vec::with_capacity(entry_points.len() + 1);
     starts.push(0usize);
-    if cabac_rbsp_off >= src_of.len() {
+    let Some(nal_data_start) = offsets.to_nal(cabac_rbsp_off) else {
         // No emulation map available; fall back to treating entries as RBSP-rel.
         let mut acc = 0usize;
         for &len in entry_points {
@@ -329,12 +326,11 @@ pub(crate) fn substream_starts_rbsp_rel(
             starts.push(acc.min(rbsp_len.saturating_sub(cabac_rbsp_off)));
         }
         return starts;
-    }
-    let nal_data_start = src_of[cabac_rbsp_off];
+    };
     let mut nal_cursor = nal_data_start;
     for &len in entry_points {
         nal_cursor += len as usize;
-        let rbsp_abs = crate::bitreader::nal_to_rbsp_offset(src_of, nal_cursor).min(rbsp_len);
+        let rbsp_abs = offsets.to_rbsp(nal_cursor).min(rbsp_len);
         starts.push(rbsp_abs.saturating_sub(cabac_rbsp_off));
     }
     starts

@@ -34,11 +34,12 @@ use crate::error::DecodeError;
 use crate::exec::ExecContext;
 use crate::fast_divide::FastDivU32;
 use crate::fmt::BitDepth;
-use crate::inter::MotionInfo;
+use crate::inter::{MotionInfo, RefFramePlanes};
 use crate::intra;
 use crate::transform;
 use crate::yuv::YuvPlanes;
 use std::ops::DerefMut;
+use std::sync::Arc;
 
 const MODE_PLANAR: u8 = 0;
 const MODE_DC: u8 = 1;
@@ -47,6 +48,10 @@ const MODE_DC: u8 = 1;
 /// Below this the serial per-row decode is faster (spawn/coordination overhead
 /// and the diagonal ramp dominate). ~64 CTBs ≈ a 512×512 picture at 64×64 CTBs.
 const WAVEFRONT_MIN_CTBS: usize = 64;
+
+/// Avoid waking workers for small pictures, where filter dispatch can cost
+/// more than running the same kernels over a single band.
+const PARALLEL_FILTER_MIN_LUMA_SAMPLES: usize = 256 * 1024;
 
 fn box_array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
     vec![value; N]
@@ -332,9 +337,8 @@ pub(crate) struct FullDecoder<'cab> {
     /// Collocated picture selection for temporal MVP (from the slice header).
     collocated_from_l0: bool,
     collocated_ref_idx: usize,
-    /// Reference frame planes (cloned Y/Cb/Cr) indexed by DPB index used in
-    /// ref lists, supplied by the driver before decoding the slice.
-    ref_frames: Vec<crate::inter::RefFramePlanes>,
+    /// Shared decoded pictures looked up by POC from the slice's reference lists.
+    ref_frames: Vec<Arc<RefFramePlanes>>,
     /// Motion-compensation scratch reused for L0/L1 intermediates and separable
     /// interpolation temporaries. Capacity grows to the largest PU seen and then
     /// stays hot for subsequent inter blocks.
@@ -591,7 +595,6 @@ impl FullDecoder<'static> {
             deblock_scratch: crate::deblock::DeblockScratch::new(
                 w * h,
                 cw * ch,
-                grid_w * grid_h,
                 (h, ch),
                 log2_ctb,
                 sub_h,
@@ -943,12 +946,11 @@ impl<'cab> FullDecoder<'cab> {
         if total_ctbs < WAVEFRONT_MIN_CTBS || !enough_rows {
             return Ok(false);
         }
-        // Only now (wavefront is actually going to run) build the NAL→RBSP
-        // offset map — it costs ~8 bytes per RBSP byte, so we avoid it on the
-        // common serial / non-WPP path entirely.
-        let src_of = crate::bitreader::rbsp_src_map(nal_bytes);
+        // The offset map is only needed after accepting the geometry for
+        // wavefront decoding.
+        let offsets = crate::bitreader::RbspOffsetMap::from_nal(nal_bytes);
         let rows = match crate::wpp::row_substreams(
-            &src_of,
+            &offsets,
             hdr.cabac_offset,
             &hdr.entry_points,
             rbsp.len(),
@@ -1473,14 +1475,11 @@ impl<'cab> FullDecoder<'cab> {
         } else {
             !self.deblocking_disabled
         };
+        let parallel_filters =
+            self.ctb_rows > 1 && self.w * self.h >= PARALLEL_FILTER_MIN_LUMA_SAMPLES;
         if any_deblock {
             self.finalize_coeff_bs();
-            match deblock_pool {
-                Some(p) if p.threads() > 1 && self.ctb_rows > 1 => {
-                    self.apply_deblocking_parallel(p)
-                }
-                _ => self.apply_deblocking(),
-            }
+            self.apply_deblocking(deblock_pool.filter(|p| parallel_filters && p.threads() > 1));
         }
         if self.sps.sao_enabled {
             // Parallel SAO only when a pool is supplied (single-item path where
@@ -1491,7 +1490,7 @@ impl<'cab> FullDecoder<'cab> {
             // (§8.7.3.2) always takes the serial gated path.
             let restricted = self.sao_boundary_restricted();
             match sao_pool {
-                Some(p) if p.threads() > 1 && self.ctb_rows > 1 && !restricted => {
+                Some(p) if parallel_filters && p.threads() > 1 && !restricted => {
                     self.apply_sao_parallel(p)?
                 }
                 _ => self.apply_sao()?,
@@ -1628,10 +1627,7 @@ impl<'cab> FullDecoder<'cab> {
         self.sao[idx] = s;
     }
 
-    /// Parallel deblocking: dispatch CTB-aligned row bands across the pool.
-    /// Bit-identical to [`Self::apply_deblocking`]; see
-    /// [`crate::deblock::apply_deblocking_parallel`].
-    fn apply_deblocking_parallel(&mut self, pool: &crate::threadpool::ThreadPool) {
+    fn apply_deblocking(&mut self, pool: Option<&crate::threadpool::ThreadPool>) {
         // Move planes out first so the immutable borrows in `ctx` (qp_y_map,
         // tqb) don't conflict with taking `&mut self.y/cb/cr`.
         let y = self.y.take_vec();
@@ -1668,7 +1664,11 @@ impl<'cab> FullDecoder<'cab> {
             bs_v: &self.bs_v[..],
             bs_h: &self.bs_h[..],
             pcm: &self.pcm[..],
-            slice_idx: &self.slice_idx[..],
+            slice_idx: if self.slice_lf_across.len() > 2 {
+                &self.slice_idx[..]
+            } else {
+                &[]
+            },
             slice_deblock: &self.slice_deblock,
             slice_lf_across: &self.slice_lf_across,
             pcm_loop_filter_disabled: self.sps.pcm_loop_filter_disabled,
@@ -1678,100 +1678,11 @@ impl<'cab> FullDecoder<'cab> {
                 _ => None,
             },
         };
-        let out = crate::deblock::apply_deblocking_parallel(
-            pool,
-            &ctx,
-            self.log2_ctb,
-            &mut self.deblock_scratch,
-            y,
-            cb,
-            cr,
-        );
+        let out =
+            crate::deblock::apply_deblocking(pool, &ctx, &mut self.deblock_scratch, y, cb, cr);
         self.y = crate::plane::Plane::owned(out.y);
         self.cb = crate::plane::Plane::owned(out.cb);
         self.cr = crate::plane::Plane::owned(out.cr);
-    }
-
-    /// Boundary strength for the vertical edge to the *left* of luma pixel
-    /// `(px, py)` (px on the 8-sample grid). Returns 0 when the edge should not
-    /// be filtered: not a real TU/PU/CU boundary, a disabled cross-slice or
-    /// cross-tile boundary, or a PCM/transquant-bypass exemption (§8.7.2).
-    #[inline]
-    fn deblock_bs_v(&self, px: usize, py: usize) -> u8 {
-        if px == 0 || px >= self.w || py >= self.h {
-            return 0;
-        }
-        let g = match self.grid_idx(px, py) {
-            Some(g) => g,
-            None => return 0,
-        };
-        if !self.edge_v.get(g).copied().unwrap_or(false) {
-            return 0;
-        }
-        if !self.filter_across_boundary(px - 1, py, px, py) {
-            return 0;
-        }
-        self.bs_v.get(g).copied().unwrap_or(0)
-    }
-
-    /// Boundary strength for the horizontal edge *above* luma pixel `(px, py)`.
-    #[inline]
-    fn deblock_bs_h(&self, px: usize, py: usize) -> u8 {
-        if py == 0 || px >= self.w || py >= self.h {
-            return 0;
-        }
-        let g = match self.grid_idx(px, py) {
-            Some(g) => g,
-            None => return 0,
-        };
-        if !self.edge_h.get(g).copied().unwrap_or(false) {
-            return 0;
-        }
-        if !self.filter_across_boundary(px, py - 1, px, py) {
-            return 0;
-        }
-        self.bs_h.get(g).copied().unwrap_or(0)
-    }
-
-    /// Whether the boundary between P pixel `(pxp, pyp)` and Q pixel
-    /// `(pxq, pyq)` may be filtered given slice/tile/PCM/TQB exemptions.
-    #[inline]
-    fn filter_across_boundary(&self, pxp: usize, pyp: usize, pxq: usize, pyq: usize) -> bool {
-        // Transquant-bypass and I_PCM (with pcm_loop_filter_disabled) samples are
-        // *not* removed from the edge here: §8.7.2.5.7 filters the edge normally
-        // using the reconstructed samples and only substitutes the exempt side's
-        // output back with its input. That per-sample restore is applied after
-        // each deblock pass in `apply_deblocking`, so the *non-exempt* neighbour
-        // still gets filtered (which a whole-edge skip would wrongly suppress).
-        // Cross-slice filtering: disabled when the current (q-side) slice's
-        // slice_loop_filter_across_slices_enabled_flag is 0 and the two sides
-        // are in different slices (§8.7.1). The flag is per-slice, so consult
-        // the slice that owns the q sample rather than the PPS default.
-        let sq = self.slice_idx_at(pxq, pyq);
-        let q_across = self
-            .slice_lf_across
-            .get(sq as usize)
-            .copied()
-            .unwrap_or(self.pps.loop_filter_across_slices);
-        if !q_across {
-            let sp = self.slice_idx_at(pxp, pyp);
-            if sp != sq {
-                return false;
-            }
-        }
-        // Cross-tile filtering: if disabled and the two sides are in different
-        // tiles, do not filter.
-        if let Some(g) = &self.tiles
-            && !g.loop_filter_across_tiles
-        {
-            let ctb = self.log2_ctb;
-            let tp = g.tile_id_at(pxp >> ctb, pyp >> ctb);
-            let tq = g.tile_id_at(pxq >> ctb, pyq >> ctb);
-            if tp != tq {
-                return false;
-            }
-        }
-        true
     }
 
     #[inline]
@@ -1783,394 +1694,6 @@ impl<'cab> FullDecoder<'cab> {
             .and_then(|g| self.slice_idx.get(g))
             .copied()
             .unwrap_or(0)
-    }
-
-    #[inline]
-    fn slice_deblock_at(&self, px: usize, py: usize) -> SliceDeblock {
-        let idx = self.slice_idx_at(px, py) as usize;
-        self.slice_deblock
-            .get(idx)
-            .copied()
-            .unwrap_or(SliceDeblock {
-                disabled: self.deblocking_disabled,
-                beta_offset_div2: self.beta_offset_div2,
-                tc_offset_div2: self.tc_offset_div2,
-            })
-    }
-
-    fn apply_deblocking(&mut self) {
-        // HEVC §8.7.2.4 Tables 8-10 / 8-11 (beta, tC)
-        #[rustfmt::skip]
-        static BETA: [i32; 52] = [
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 6, 7, 8, 9,
-            10,11,12,13,14,15,16,17,18,20,
-            22,24,26,28,30,32,34,36,38,40,
-            42,44,46,48,50,52,54,56,58,60,
-            62,64,
-        ];
-        #[rustfmt::skip]
-        static TC: [i32; 54] = [
-            0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,1,1,
-            1,1,1,1,1,1,1,2,2,2,
-            2,3,3,3,3,4,4,4,5,5,
-            6,6,7,8,9,10,11,13,14,16,
-            18,20,22,24,
-        ];
-
-        // Deblocking offsets and the disabled flag are per-slice; they are
-        // resolved per edge from the q-side sample's owning slice (§8.7.2).
-        // §8.7.2.5.3/§8.7.2.5.5: β′ and tC′ are read from the tables at Q = qPL
-        // (plus the slice offsets) — QpBdOffset is *not* added to the table index
-        // — and the results are then scaled to the sample bit depth:
-        // β = β′ << (BitDepthY−8), tC = tC′ << (BitDepthY−8). For 8-bit both the
-        // (absent) offset and this shift are zero, so the common path is unchanged.
-        let bd_shift = (self.bd - 8) as u32;
-        let bd_shift_c = (self.bd_c - 8) as u32;
-
-        // QP for dequantization (per 4×4 grid). For intra-only all Bs=2.
-        // We use the CTB average QP — approximation good enough.
-        let w = self.w;
-        let h = self.h;
-        let cw = self.cw;
-        let ch = self.ch;
-        let gw = self.grid_w;
-        let gh = self.grid_h;
-        let default_qp = self.slice_qp as i16;
-
-        // Helper: look up qp_y_map for a luma pixel (rounded to 4×4 grid).
-        // Fuzzed / malformed pictures can be smaller than 4 pixels in one
-        // dimension; avoid the old `w / 4 - 1` / `h / 4 - 1` underflow and
-        // treat missing grid entries as the slice QP.
-        let qp_at = |qp_map: &[i16], px: usize, py: usize| -> i32 {
-            if qp_map.is_empty() || gw == 0 || gh == 0 {
-                return default_qp as i32;
-            }
-            let gx = (px / 4).min(gw.saturating_sub(1));
-            let gy = (py / 4).min(gh.saturating_sub(1));
-            gy.checked_mul(gw)
-                .and_then(|base| base.checked_add(gx))
-                .and_then(|idx| qp_map.get(idx))
-                .copied()
-                .unwrap_or(default_qp) as i32
-        };
-
-        // §8.7.2.5.7 / §8.7.3.1: samples of a transquant-bypass CU, or of an
-        // I_PCM CU when pcm_loop_filter_disabled_flag is set, are exempt from the
-        // in-loop filters — their filtered value is replaced by the input value.
-        // Because a min-size CU (8×8) is wider than the filter reach (≤3) and
-        // edges are 8-aligned, an exempt CU covers a whole side of any edge, so a
-        // per-4×4-cell restore after each pass reproduces the per-sample rule
-        // while letting the non-exempt neighbour filter normally. The snapshot and
-        // the per-cell mask are only built when some CU is actually exempt, so the
-        // common (no-PCM, no-TQB) picture pays nothing.
-        let suppress_active = self.has_loop_filter_exempt_blocks();
-        // Move the worker-owned scratch out temporarily so the filtering code
-        // can continue borrowing the other decoder fields independently.
-        let mut deblock_scratch = std::mem::take(&mut self.deblock_scratch);
-        deblock_scratch.suppressed.clear();
-        if suppress_active {
-            deblock_scratch.suppressed.extend((0..gw * gh).map(|g| {
-                self.tqb.get(g).copied().unwrap_or(false)
-                    || (self.sps.pcm_loop_filter_disabled
-                        && self.pcm.get(g).copied().unwrap_or(false))
-            }));
-            deblock_scratch.snap_y.clear();
-            deblock_scratch.snap_y.extend_from_slice(&self.y);
-            deblock_scratch.snap_cb.clear();
-            deblock_scratch.snap_cb.extend_from_slice(&self.cb);
-            deblock_scratch.snap_cr.clear();
-            deblock_scratch.snap_cr.extend_from_slice(&self.cr);
-        }
-        let supp = &deblock_scratch.suppressed;
-
-        // Restore exempt luma samples (whole 4×4 cells) from the pre-deblock
-        // snapshot. Called after each luma pass so the next pass reads the
-        // unfiltered values for exempt samples.
-        let restore_luma = |plane: &mut [u16], snap: &[u16], supp: &[bool]| {
-            for gy in 0..gh {
-                for gx in 0..gw {
-                    if !supp[gy * gw + gx] {
-                        continue;
-                    }
-                    for dy in 0..4 {
-                        let y = gy * 4 + dy;
-                        if y >= h {
-                            break;
-                        }
-                        for dx in 0..4 {
-                            let x = gx * 4 + dx;
-                            if x >= w {
-                                break;
-                            }
-                            plane[y * w + x] = snap[y * w + x];
-                        }
-                    }
-                }
-            }
-        };
-        // As `restore_luma`, but mapping chroma pixels back to the luma 4×4 grid
-        // through the subsampling factors.
-        let restore_chroma = |plane: &mut [u16], snap: &[u16], supp: &[bool]| {
-            for cy in 0..ch {
-                let ly = cy * self.sub_h;
-                for cx in 0..cw {
-                    let lx = cx * self.sub_w;
-                    let g = (ly / 4) * gw + (lx / 4);
-                    if supp.get(g).copied().unwrap_or(false) {
-                        plane[cy * cw + cx] = snap[cy * cw + cx];
-                    }
-                }
-            }
-        };
-
-        // Vertical edges first (filter across columns), then horizontal.
-        for pass in 0..2usize {
-            // pass 0 = vertical edges (x mod 8 == 0, filter across x boundary)
-            // pass 1 = horizontal edges (y mod 8 == 0, filter across y boundary)
-            let (edge_step, scan_step, edge_max, scan_max) = if pass == 0 {
-                (8, 1, w, h)
-            } else {
-                (8, 1, h, w)
-            };
-            let _ = scan_step;
-
-            let mut edge = 8; // skip image boundary
-            // The luma filter reads/writes up to p3 and q3. On fuzzed edge
-            // geometry the final nominal 8-pixel edge can be too close to the
-            // picture boundary, so only run full filtering when both sides have
-            // all required samples.
-            let last_full_edge = edge_max.saturating_sub(4);
-            while edge <= last_full_edge {
-                // For each 4-pixel segment along the edge
-                let mut scan = 0;
-                while scan + 4 <= scan_max {
-                    // p-side: pixels going into the block (edge-1, edge-2, edge-3, edge-4)
-                    // q-side: pixels going out (edge, edge+1, edge+2, edge+3)
-                    if pass == 0 {
-                        // vertical edge at x=edge, rows scan..scan+3
-                        let mid = scan + 1; // representative row
-                        // Only a real TU/PU/CU boundary with Bs>0 that isn't a
-                        // disabled slice/tile/PCM/TQB boundary is filtered
-                        // (§8.7.2). For intra pictures Bs is 2 at such edges.
-                        let bs_v = self.deblock_bs_v(edge, mid);
-                        if bs_v == 0 {
-                            scan += 4;
-                            continue;
-                        }
-                        // Parameters come from the slice owning the q-side sample.
-                        let sd = self.slice_deblock_at(edge, mid);
-                        if sd.disabled {
-                            scan += 4;
-                            continue;
-                        }
-                        let beta_offset = sd.beta_offset_div2 * 2;
-                        let tc_offset = sd.tc_offset_div2 * 2;
-                        let qp_p = qp_at(&self.qp_y_map[..], edge - 1, mid);
-                        let qp_q = qp_at(&self.qp_y_map[..], edge, mid);
-                        let avg_qp = (qp_p + qp_q + 1) >> 1;
-                        let beta_prime = (avg_qp + beta_offset).clamp(0, 51);
-                        let tc_prime = (avg_qp + 2 * (bs_v as i32 - 1) + tc_offset).clamp(0, 53);
-                        let beta = BETA[beta_prime as usize] << bd_shift;
-                        let tc = TC[tc_prime as usize] << bd_shift;
-                        if tc == 0 {
-                            scan += 4;
-                            continue;
-                        }
-
-                        // Vertical edge at x=edge; the 4 lines are rows
-                        // scan..scan+4. tap<0 selects the p side (edge-1-..),
-                        // tap>=0 the q side (edge+..).
-                        if scan + 4 <= h {
-                            let maxv = (1i32 << self.bd) - 1;
-                            crate::deblock::deblock_luma_segment(
-                                &mut self.y[..],
-                                beta,
-                                tc,
-                                maxv,
-                                |line, tap| {
-                                    let col = (edge as i32 + tap) as usize;
-                                    (scan + line) * w + col
-                                },
-                            );
-                        }
-                        scan += 4;
-                        continue;
-                    } else {
-                        // horizontal edge at y=edge, cols scan..scan+3
-                        let mid = scan + 1;
-                        let bs_h = self.deblock_bs_h(mid, edge);
-                        if bs_h == 0 {
-                            scan += 4;
-                            continue;
-                        }
-                        let sd = self.slice_deblock_at(mid, edge);
-                        if sd.disabled {
-                            scan += 4;
-                            continue;
-                        }
-                        let beta_offset = sd.beta_offset_div2 * 2;
-                        let tc_offset = sd.tc_offset_div2 * 2;
-                        let qp_p = qp_at(&self.qp_y_map[..], mid, edge - 1);
-                        let qp_q = qp_at(&self.qp_y_map[..], mid, edge);
-                        let avg_qp = (qp_p + qp_q + 1) >> 1;
-                        let beta_prime = (avg_qp + beta_offset).clamp(0, 51);
-                        let tc_prime = (avg_qp + 2 * (bs_h as i32 - 1) + tc_offset).clamp(0, 53);
-                        let beta = BETA[beta_prime as usize] << bd_shift;
-                        let tc = TC[tc_prime as usize] << bd_shift;
-                        if tc == 0 {
-                            scan += 4;
-                            continue;
-                        }
-
-                        // Horizontal edge at y=edge; the 4 lines are columns
-                        // scan..scan+4. tap<0 selects the p side (rows above),
-                        // tap>=0 the q side (rows below).
-                        if scan + 4 <= w && edge + 4 <= h {
-                            let maxv = (1i32 << self.bd) - 1;
-                            crate::deblock::deblock_luma_segment(
-                                &mut self.y[..],
-                                beta,
-                                tc,
-                                maxv,
-                                |line, tap| {
-                                    let row = (edge as i32 + tap) as usize;
-                                    row * w + (scan + line)
-                                },
-                            );
-                        }
-                        scan += 4;
-                        continue;
-                    }
-                }
-                edge += edge_step;
-            }
-            // Substitute exempt luma samples back before the next pass reads them
-            // (and after the final pass, before SAO).
-            if suppress_active {
-                restore_luma(&mut self.y[..], &deblock_scratch.snap_y, supp);
-            }
-        }
-
-        for pass in 0..2usize {
-            let (edge_step, scan_max) = if pass == 0 { (8, ch) } else { (8, cw) };
-            let maxv_c = (1i32 << self.bd_c) - 1;
-
-            let mut edge = 8;
-            let chroma_edge_max = if pass == 0 { cw } else { ch };
-            // Chroma filter reads p1 and q1 around the edge, so require at
-            // least one q-side sample beyond the boundary.
-            let last_full_chroma_edge = chroma_edge_max.saturating_sub(2);
-            while edge <= last_full_chroma_edge {
-                let mut scan = 0;
-                while scan + 4 <= scan_max {
-                    let mid = scan + 1;
-                    // Chroma is filtered only where the co-located luma edge has
-                    // Bs == 2 and is a real, non-disabled boundary (§8.7.2.4).
-                    let (lex, ley) = if pass == 0 {
-                        (edge * self.sub_w, mid * self.sub_h)
-                    } else {
-                        (mid * self.sub_w, edge * self.sub_h)
-                    };
-                    let bs = if pass == 0 {
-                        self.deblock_bs_v(lex, ley)
-                    } else {
-                        self.deblock_bs_h(lex, ley)
-                    };
-                    if bs < 2 {
-                        scan += 4;
-                        continue;
-                    }
-                    // Parameters (tC offset and Cb/Cr QP offsets) come from the
-                    // slice owning the q-side luma sample (§8.7.2, §8.7.2.5.5).
-                    let lqx = lex.min(w - 1);
-                    let lqy = ley.min(h - 1);
-                    let sd = self.slice_deblock_at(lqx, lqy);
-                    if sd.disabled {
-                        scan += 4;
-                        continue;
-                    }
-                    let tc_offset = sd.tc_offset_div2 * 2;
-                    // Chroma QP derivation (§8.7.2.5.5): average the co-located
-                    // luma QpY of the two sides of the edge. The P sample is to
-                    // the left for a vertical edge and above for a horizontal
-                    // edge; Q is at the edge. Add the per-plane chroma QP offset
-                    // (Cb vs Cr differ), then map through QpC and derive tC.
-                    let (px_p, py_p) = if pass == 0 {
-                        (lex.saturating_sub(1).min(w - 1), ley.min(h - 1))
-                    } else {
-                        (lex.min(w - 1), ley.saturating_sub(1).min(h - 1))
-                    };
-                    let qp_p_l = qp_at(&self.qp_y_map[..], px_p, py_p);
-                    let qp_q_l = qp_at(&self.qp_y_map[..], lqx, lqy);
-                    let avg_qp_l = (qp_p_l + qp_q_l + 1) >> 1;
-
-                    for plane in 0..2usize {
-                        // cQpPicOffset (§8.7.2.5.5): the *picture*-level chroma QP
-                        // offset only — pps_cb/cr_qp_offset. The spec deliberately
-                        // excludes slice_cb/cr_qp_offset (and the CU offset) here so
-                        // the deblock chroma QP stays constant within the picture,
-                        // unlike the reconstruction path which adds them.
-                        let cqp_offset = if plane == 0 {
-                            self.pps.cb_qp_offset
-                        } else {
-                            self.pps.cr_qp_offset
-                        };
-                        let qp_c = qpc(avg_qp_l + cqp_offset, self.sps.chroma_idc, self.bd_c);
-                        let tc_prime_c = (qp_c + 2 + tc_offset).clamp(0, 53);
-                        let tc_c = TC[tc_prime_c as usize] << bd_shift_c;
-                        if tc_c == 0 {
-                            continue;
-                        }
-                        let pix = if plane == 0 {
-                            &mut self.cb
-                        } else {
-                            &mut self.cr
-                        };
-                        for s in scan..scan + 4 {
-                            if s >= scan_max {
-                                continue;
-                            }
-                            let (p0, p1, q0, q1) = if pass == 0 {
-                                (
-                                    pix[s * cw + edge - 1] as i32,
-                                    pix[s * cw + edge - 2] as i32,
-                                    pix[s * cw + edge] as i32,
-                                    pix[s * cw + edge + 1] as i32,
-                                )
-                            } else {
-                                (
-                                    pix[(edge - 1) * cw + s] as i32,
-                                    pix[(edge - 2) * cw + s] as i32,
-                                    pix[(edge) * cw + s] as i32,
-                                    pix[(edge + 1) * cw + s] as i32,
-                                )
-                            };
-                            let delta = ((q0 - p0) * 4 + p1 - q1 + 4) >> 3;
-                            let delta = delta.clamp(-tc_c, tc_c);
-                            if delta != 0 {
-                                let (ip, iq) = if pass == 0 {
-                                    (s * cw + edge - 1, s * cw + edge)
-                                } else {
-                                    ((edge - 1) * cw + s, edge * cw + s)
-                                };
-                                pix[ip] = (p0 + delta).clamp(0, maxv_c) as u16;
-                                pix[iq] = (q0 - delta).clamp(0, maxv_c) as u16;
-                            }
-                        }
-                    }
-                    scan += 4;
-                }
-                edge += edge_step;
-            }
-            // Substitute exempt chroma samples back after each chroma pass.
-            if suppress_active {
-                restore_chroma(&mut self.cb[..], &deblock_scratch.snap_cb, supp);
-                restore_chroma(&mut self.cr[..], &deblock_scratch.snap_cr, supp);
-            }
-        }
-        self.deblock_scratch = deblock_scratch;
     }
 
     /// Parallel SAO: flatten per-CTB params and dispatch CTB-row bands across
@@ -2248,12 +1771,12 @@ impl<'cab> FullDecoder<'cab> {
     /// availability (§8.7.3.2). False for the common single-slice, no-tile,
     /// no-PCM picture, where the fast SIMD/scalar EO path is exact.
     fn sao_boundary_restricted(&self) -> bool {
-        // Any slice (not just the PPS default) may disable cross-slice
-        // filtering; if so, SAO must take the boundary-aware path.
-        if self.slice_lf_across.iter().any(|&f| !f) {
-            return true;
-        }
-        if !self.pps.loop_filter_across_slices {
+        // Entry 0 is reserved, and dependent segments share their parent's
+        // entry. With only one independent slice, no neighbor can cross a
+        // slice boundary regardless of the filtering flags.
+        if self.slice_lf_across.len() > 2
+            && (!self.pps.loop_filter_across_slices || self.slice_lf_across.iter().any(|&f| !f))
+        {
             return true;
         }
         if let Some(g) = &self.tiles
@@ -2684,48 +2207,26 @@ impl<'cab> FullDecoder<'cab> {
             return;
         }
 
-        let npu = if nxn { 2 } else { 1 };
-        let pu_size = cb_size / npu;
+        let pu_size = cb_size >> usize::from(nxn);
         let mut luma_modes = [MODE_DC; 4];
-
-        // prev_intra_luma_pred_flag for each PU
-        let mut prev_flags = [false; 4];
-        for dst in prev_flags[..npu * npu].iter_mut() {
-            *dst = self
+        if nxn {
+            // HEVC signals all four prev flags before any mode values.
+            let prev_flags: [bool; 4] = std::array::from_fn(|_| {
+                self.cab
+                    .decode_bin(&mut self.ictx.prev_intra_luma_pred_flag)
+                    != 0
+            });
+            for (i, (mode, prev_flag)) in luma_modes.iter_mut().zip(prev_flags).enumerate() {
+                let pux = x0 + (i & 1) * pu_size;
+                let puy = y0 + (i >> 1) * pu_size;
+                *mode = self.decode_luma_pu_mode(pux, puy, pu_size, prev_flag);
+            }
+        } else {
+            let prev_flag = self
                 .cab
                 .decode_bin(&mut self.ictx.prev_intra_luma_pred_flag)
                 != 0;
-        }
-        let mut mpm_or_rem = [0u8; 4];
-        for (&src, dst) in prev_flags[..npu * npu].iter().zip(mpm_or_rem.iter_mut()) {
-            if src {
-                // mpm_idx: TR cMax=2, bypass
-                let mut v = 0u8;
-                if self.cab.decode_bypass() != 0 {
-                    v = 1 + self.cab.decode_bypass();
-                }
-                *dst = v;
-            } else {
-                let mut v = 0u8;
-                for _ in 0..5 {
-                    v = (v << 1) | self.cab.decode_bypass();
-                }
-                *dst = v;
-            }
-        }
-
-        let npu_sqr = npu * npu;
-        for (i, ((luma_mode, &prev_flag), &mpm_or_rem)) in luma_modes[..npu_sqr]
-            .iter_mut()
-            .zip(prev_flags[..npu_sqr].iter())
-            .zip(mpm_or_rem[..npu_sqr].iter())
-            .enumerate()
-        {
-            let pux = x0 + (i % npu) * pu_size;
-            let puy = y0 + (i / npu) * pu_size;
-            let mode = self.derive_luma_mode(pux, puy, prev_flag, mpm_or_rem);
-            *luma_mode = mode;
-            self.set_mode(pux, puy, pu_size, mode);
+            luma_modes[0] = self.decode_luma_pu_mode(x0, y0, pu_size, prev_flag);
         }
 
         // intra_chroma_pred_mode (§7.3.8.5): one per CU, except ChromaArrayType
@@ -2895,13 +2396,13 @@ impl<'cab> FullDecoder<'cab> {
     /// filter can distinguish real block edges from transform-interior 8-grid
     /// lines. For an all-intra picture `bs` is 2 (§8.7.2.4 rule: a boundary with
     /// an intra block on either side has Bs = 2).
-    /// Mark the left/top boundaries of a transform block on the 4×4 grid.
+    /// Mark the left/top boundaries that fall on the deblocking grid.
     /// Mirrors de265's `markTransformBlockBoundary` leaf case: every TU leaf
     /// (and, for CUs without a transform tree, the CB itself) contributes its
     /// left and top edge as a transform edge.
     fn mark_tu_edges(&mut self, x0: usize, y0: usize, size: usize) {
         let gw = self.grid_w;
-        if x0 > 0 && x0 < self.w {
+        if x0 > 0 && x0 < self.w && x0.is_multiple_of(8) {
             let gx = x0 / 4;
             let y_end = (y0 + size).min(self.h);
             let mut g = (y0 / 4) * gw + gx;
@@ -2912,7 +2413,7 @@ impl<'cab> FullDecoder<'cab> {
                 yy += 4;
             }
         }
-        if y0 > 0 && y0 < self.h {
+        if y0 > 0 && y0 < self.h && y0.is_multiple_of(8) {
             let x_end = (x0 + size).min(self.w);
             let mut g = (y0 / 4) * gw + x0 / 4;
             let mut xx = x0;
@@ -2928,7 +2429,7 @@ impl<'cab> FullDecoder<'cab> {
     /// that starts inside its CU) so `finalize_coeff_bs` evaluates its inter
     /// boundary strength even if it is not a transform edge.
     fn mark_pu_edge_v(&mut self, x0: usize, y0: usize, height: usize) {
-        if x0 == 0 || x0 >= self.w {
+        if x0 == 0 || x0 >= self.w || !x0.is_multiple_of(8) {
             return;
         }
         let gw = self.grid_w;
@@ -2946,7 +2447,7 @@ impl<'cab> FullDecoder<'cab> {
     /// Mark an internal prediction-unit horizontal boundary (top edge of a PU
     /// that starts inside its CU).
     fn mark_pu_edge_h(&mut self, x0: usize, y0: usize, width: usize) {
-        if y0 == 0 || y0 >= self.h {
+        if y0 == 0 || y0 >= self.h || !y0.is_multiple_of(8) {
             return;
         }
         let gw = self.grid_w;
@@ -2990,54 +2491,51 @@ impl<'cab> FullDecoder<'cab> {
         }
         let gw = self.grid_w;
         let gh = self.grid_h;
-        let have_motion = self.motion.len() >= gw * gh;
-        let is_intra = |m: &[crate::inter::MotionInfo], g: usize| have_motion && m[g].is_intra;
-        for gy in 0..gh {
-            let row = gy * gw;
-            for gx in 0..gw {
-                let g = row + gx;
-                let v_edge = self.tu_edge_v[g] || self.pu_edge_v[g];
-                if gx > 0 && v_edge {
-                    if self.bs_v[g] < 2
-                        && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - 1))
-                    {
-                        self.bs_v[g] = 2;
-                        self.edge_v[g] = true;
-                    } else if self.bs_v[g] < 1
-                        && self.tu_edge_v[g]
-                        && (self.nz_coeff[g] || self.nz_coeff[g - 1])
-                    {
-                        // Coefficient-based bS is a transform-edge property.
-                        self.bs_v[g] = 1;
-                        self.edge_v[g] = true;
-                    } else if self.bs_v[g] < 1
-                        && have_motion
-                        && inter_motion_differs(&self.motion[g], &self.motion[g - 1])
-                    {
-                        self.bs_v[g] = 1;
-                        self.edge_v[g] = true;
+        let motion = self.motion.get(..gw * gh);
+        let nz_coeff = &self.nz_coeff[..];
+
+        // Only the 8-sample grid is filtered. A vertical edge uses every
+        // 4-sample row, but only even columns in the metadata grid. A
+        // horizontal edge uses every column, but only even rows.
+        let directions = [
+            (
+                (0..gh).step_by(1),
+                (2..gw).step_by(2),
+                1,
+                &self.tu_edge_v[..],
+                &self.pu_edge_v[..],
+                &mut self.bs_v[..],
+                &mut self.edge_v[..],
+            ),
+            (
+                (2..gh).step_by(2),
+                (0..gw).step_by(1),
+                gw,
+                &self.tu_edge_h[..],
+                &self.pu_edge_h[..],
+                &mut self.bs_h[..],
+                &mut self.edge_h[..],
+            ),
+        ];
+        for (rows, cols, neighbor_step, tu_edge, pu_edge, bs, edge) in directions {
+            for row in rows {
+                let base = row * gw;
+                for col in cols.clone() {
+                    let q = base + col;
+                    if bs[q] >= 2 || !(tu_edge[q] || pu_edge[q]) {
+                        continue;
                     }
-                }
-                let h_edge = self.tu_edge_h[g] || self.pu_edge_h[g];
-                if gy > 0 && h_edge {
-                    #[allow(clippy::if_same_then_else)]
-                    if self.bs_h[g] < 2
-                        && (is_intra(&self.motion[..], g) || is_intra(&self.motion[..], g - gw))
+                    let p = q - neighbor_step;
+                    let motion_pair = motion.map(|m| (&m[p], &m[q]));
+                    if motion_pair.is_some_and(|(p, q)| p.is_intra || q.is_intra) {
+                        bs[q] = 2;
+                        edge[q] = true;
+                    } else if bs[q] == 0
+                        && ((tu_edge[q] && (nz_coeff[p] || nz_coeff[q]))
+                            || motion_pair.is_some_and(|(p, q)| inter_motion_differs(p, q)))
                     {
-                        self.bs_h[g] = 2;
-                        self.edge_h[g] = true;
-                    } else if self.bs_h[g] < 1
-                        && self.tu_edge_h[g]
-                        && (self.nz_coeff[g] || self.nz_coeff[g - gw])
-                    {
-                        self.bs_h[g] = 1;
-                        self.edge_h[g] = true;
-                    } else if self.bs_h[g] < 1
-                        && have_motion
-                        && inter_motion_differs(&self.motion[g], &self.motion[g - gw])
-                    {
-                        self.bs_h[g] = 1;
-                        self.edge_h[g] = true;
+                        bs[q] = 1;
+                        edge[q] = true;
                     }
                 }
             }
@@ -3049,7 +2547,7 @@ impl<'cab> FullDecoder<'cab> {
         // Left vertical edge: the column of 4×4 cells at x0, for each row. The
         // grid column is fixed (x0/4), so step the row index directly instead of
         // recomputing `grid_idx` (bounds + mul) every iteration.
-        if x0 > 0 && x0 < self.w {
+        if x0 > 0 && x0 < self.w && x0.is_multiple_of(8) {
             let gx = x0 / 4;
             let y_end = (y0 + size).min(self.h);
             let mut g = (y0 / 4) * gw + gx;
@@ -3064,7 +2562,7 @@ impl<'cab> FullDecoder<'cab> {
             }
         }
         // Top horizontal edge: the grid row is fixed (y0/4), step columns.
-        if y0 > 0 && y0 < self.h {
+        if y0 > 0 && y0 < self.h && y0.is_multiple_of(8) {
             let x_end = (x0 + size).min(self.w);
             let base = (y0 / 4) * gw;
             let mut g = base + x0 / 4;
@@ -3230,10 +2728,32 @@ impl<'cab> FullDecoder<'cab> {
         );
     }
 
+    #[inline]
+    fn decode_luma_pu_mode(&mut self, x0: usize, y0: usize, size: usize, prev: bool) -> u8 {
+        let val = if prev {
+            // mpm_idx is truncated unary with a maximum of two.
+            if self.cab.decode_bypass() != 0 {
+                1 + self.cab.decode_bypass()
+            } else {
+                0
+            }
+        } else {
+            self.cab.decode_bypass_bits(5) as u8
+        };
+        let mode = self.derive_luma_mode(x0, y0, prev, val);
+        self.set_mode(x0, y0, size, mode);
+        mode
+    }
+
     fn derive_luma_mode(&self, x0: usize, y0: usize, prev: bool, val: u8) -> u8 {
-        let cand_a = self.neighbor_mode(x0 as i32 - 1, y0 as i32, true);
-        let cand_b = self.neighbor_mode(x0 as i32, y0 as i32 - 1, false);
-        let mpm = mpm_list(cand_a, cand_b, y0, self.log2_ctb);
+        let cand_a = self.neighbor_mode(x0 as i32 - 1, y0 as i32);
+        // An above neighbor in another CTB row always contributes DC.
+        let cand_b = if y0 & ((1 << self.log2_ctb) - 1) == 0 {
+            MODE_DC
+        } else {
+            self.neighbor_mode(x0 as i32, y0 as i32 - 1)
+        };
+        let mpm = mpm_list(cand_a, cand_b);
         if prev {
             mpm[val as usize]
         } else {
@@ -3248,17 +2768,15 @@ impl<'cab> FullDecoder<'cab> {
         }
     }
 
-    fn neighbor_mode(&self, x: i32, y: i32, _left: bool) -> u8 {
+    fn neighbor_mode(&self, x: i32, y: i32) -> u8 {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
             return MODE_DC;
         }
         // §8.4.2: a neighbor in a different tile is unavailable and contributes
         // candIntraPredMode = DC. The z-scan/decoded availability of the left and
-        // above neighbors is already guaranteed by raster decode order, and the
-        // above-CTB-row boundary case is handled by `mpm_list`, so only the tile
-        // boundary needs checking here — using full `luma_avail` (which also
-        // tests the `decoded` map) would wrongly zero valid candidates and
-        // desync CABAC.
+        // above neighbors is already guaranteed by raster decode order.
+        // An earlier prediction unit of this CU can supply a mode before
+        // its samples have been reconstructed.
         if !self.same_tile(x as usize, y as usize) {
             return MODE_DC;
         }
@@ -3280,11 +2798,8 @@ impl<'cab> FullDecoder<'cab> {
         let derived = if is_derived_mode {
             luma_mode // DM
         } else {
-            let mut idx = 0u8;
-            for _ in 0..2 {
-                idx = (idx << 1) | self.cab.decode_bypass();
-            }
-            let cand = [0u8, 26, 10, 1][idx as usize];
+            let idx = self.cab.decode_bypass_bits(2) as usize;
+            let cand = [0u8, 26, 10, 1][idx];
             if cand == luma_mode { 34 } else { cand }
         };
         // HEVC §8.4.3 / Table 8-3: for ChromaArrayType==2 (4:2:2) the derived chroma
@@ -3307,14 +2822,7 @@ static MODE_422_MAP: [u8; 35] = [
 ];
 
 /// MPM candidate list (§8.4.2).
-fn mpm_list(mut cand_a: u8, cand_b: u8, y0: usize, log2_ctb: u32) -> [u8; 3] {
-    // candB from a different CTB row → DC
-    let cand_b = if y0 > 0 && ((y0 - 1) >> log2_ctb) != (y0 >> log2_ctb) {
-        MODE_DC
-    } else {
-        cand_b
-    };
-    let _ = &mut cand_a;
+fn mpm_list(cand_a: u8, cand_b: u8) -> [u8; 3] {
     if cand_a == cand_b {
         if cand_a < 2 {
             [MODE_PLANAR, MODE_DC, 26]
@@ -3596,7 +3104,7 @@ impl<'cab> FullDecoder<'cab> {
                 None
             };
             let rext = self.rext_residual(luma_mode, true);
-            let (transform_skip, max_x, _last_y, max_abs_level, rdpcm) = residual_coding(
+            let (transform_skip, max_x, coded_groups, max_abs_level, rdpcm) = residual_coding(
                 &mut self.cab,
                 &mut self.ctx,
                 self.exec.residual_scans,
@@ -3616,6 +3124,7 @@ impl<'cab> FullDecoder<'cab> {
                 log2_ts,
                 luma_mode,
                 max_x + 1,
+                coded_groups,
                 max_abs_level,
                 transform_skip,
                 cross_comp,
@@ -3780,7 +3289,7 @@ impl<'cab> FullDecoder<'cab> {
             None
         };
         let rext = self.rext_residual(mode, is_luma);
-        let (transform_skip, _max_x, _last_y, max_abs_level, rdpcm) = residual_coding(
+        let (transform_skip, _max_x, _coded_groups, max_abs_level, rdpcm) = residual_coding(
             &mut self.cab,
             &mut self.ctx,
             self.exec.residual_scans,
@@ -4414,69 +3923,164 @@ impl<'cab> FullDecoder<'cab> {
     }
 }
 
-/// Gather the two reference edges one luma metadata cell at a time. Tile,
-/// slice, constrained intra and decoded-state checks are constant within a
-/// 4×4 luma cell. The cell spans `4 / subsampling` samples on each plane axis.
+enum IntraComponent {
+    Luma,
+    Chroma { is_cb: bool, mode: u8 },
+}
+
+/// Read reference samples and substitute gaps in HEVC order, from bottom
+/// left across the corner to the rightmost sample above. Availability is
+/// constant in each 4×4 luma cell (4 / subsampling samples per plane axis).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn gather_intra_refs(
     plane: &[u16],
     (width, height): (usize, usize),
     (x0, y0): (usize, usize),
     (cell_w, cell_h): (usize, usize),
-    above: &mut [Option<u16>],
-    left: &mut [Option<u16>],
-    available: impl Fn(i32, i32) -> bool,
-) -> Option<u16> {
+    above: &mut [u16],
+    left: &mut [u16],
+    neutral: u16,
+    available: impl Fn(usize, usize) -> bool,
+) {
+    let (above_corner, above) = above.split_first_mut().unwrap();
+    let (left_corner, left) = left.split_first_mut().unwrap();
     let above_y = y0.checked_sub(1).filter(|&y| y < height);
     let left_x = x0.checked_sub(1).filter(|&x| x < width);
 
-    if let Some(y) = above_y {
-        let valid_w = width.saturating_sub(x0).min(above.len());
-        let (inside, outside) = above.split_at_mut(valid_w);
-        outside.fill(None);
-
-        // TU origins align to whole cells. Fall back to single-sample groups
-        // for any unaligned origin so a group can never cross a cell boundary.
-        let step = if x0 & (cell_w - 1) == 0 { cell_w } else { 1 };
-        for (i, refs) in inside.chunks_mut(step).enumerate() {
-            let x = x0 + i * step;
-            if available(x as i32, y as i32) {
-                let start = y * width + x;
-                let samples = &plane[start..start + refs.len()];
-                for (dst, &sample) in refs.iter_mut().zip(samples) {
-                    *dst = Some(sample);
-                }
-            } else {
-                refs.fill(None);
-            }
-        }
-    } else {
-        above.fill(None);
-    }
-
+    // Leave leading gaps unwritten until we find the first available sample.
+    let mut previous = None;
     if let Some(x) = left_x {
         let valid_h = height.saturating_sub(y0).min(left.len());
-        let (inside, outside) = left.split_at_mut(valid_h);
-        outside.fill(None);
-
+        // An unaligned origin needs unit steps so no group crosses a cell.
         let step = if y0 & (cell_h - 1) == 0 { cell_h } else { 1 };
-        for (i, refs) in inside.chunks_mut(step).enumerate() {
-            let y = y0 + i * step;
-            if available(x as i32, y as i32) {
-                for (dy, dst) in refs.iter_mut().enumerate() {
-                    *dst = Some(plane[(y + dy) * width + x]);
+        for start in (0..valid_h).step_by(step).rev() {
+            let y = y0 + start;
+            let end = (start + step).min(valid_h);
+            if available(x, y) {
+                for (dy, dst) in left[start..end].iter_mut().enumerate() {
+                    *dst = plane[(y + dy) * width + x];
                 }
-            } else {
-                refs.fill(None);
+                if previous.is_none() {
+                    let first = left[end - 1];
+                    left[end..].fill(first);
+                }
+                previous = Some(left[start]);
+            } else if let Some(last) = previous {
+                left[start..end].fill(last);
             }
         }
-    } else {
-        left.fill(None);
     }
 
-    left_x
-        .zip(above_y)
-        .and_then(|(x, y)| available(x as i32, y as i32).then(|| plane[y * width + x]))
+    if let Some((x, y)) = left_x.zip(above_y)
+        && available(x, y)
+    {
+        let sample = plane[y * width + x];
+        if previous.is_none() {
+            left.fill(sample);
+        }
+        previous = Some(sample);
+    }
+    let mut corner = previous;
+
+    let mut valid_w = 0;
+    if let Some(y) = above_y {
+        valid_w = width.saturating_sub(x0).min(above.len());
+        let step = if x0 & (cell_w - 1) == 0 { cell_w } else { 1 };
+        let row_start = y * width + x0;
+        let mut start = 0;
+        let mut present = valid_w != 0 && available(x0, y);
+        while start < valid_w {
+            // The next run starts where availability changes. Its first
+            // group's status is already known, so check each group once.
+            let mut end = start + step;
+            while end < valid_w && available(x0 + end, y) == present {
+                end += step;
+            }
+            let end = end.min(valid_w);
+            if present {
+                let samples = &plane[row_start + start..row_start + end];
+                if previous.is_none() {
+                    let first = samples[0];
+                    left.fill(first);
+                    above[..start].fill(first);
+                    corner = Some(first);
+                }
+                above[start..end].copy_from_slice(samples);
+                previous = Some(samples[samples.len() - 1]);
+            } else if let Some(last) = previous {
+                above[start..end].fill(last);
+            }
+            start = end;
+            present = !present;
+        }
+    }
+
+    if let Some(last) = previous {
+        above[valid_w..].fill(last);
+    } else {
+        above.fill(neutral);
+        left.fill(neutral);
+    }
+    *above_corner = corner.unwrap_or(neutral);
+    *left_corner = *above_corner;
+}
+
+/// Gather the only edge read by an unfiltered, nonnegative-angle chroma
+/// predictor. A missing sample in the required span needs full substitution.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gather_chroma_primary_edge(
+    plane: &[u16],
+    (width, height): (usize, usize),
+    (x0, y0): (usize, usize),
+    (shift_x, shift_y): (u32, u32),
+    grid_w: usize,
+    decoded: &[bool],
+    vertical: bool,
+    refs: &mut [u16],
+) -> bool {
+    let count = refs.len();
+    if vertical {
+        if y0 == 0 || y0 > height || x0 + count > width {
+            return false;
+        }
+        let y = y0 - 1;
+        let grid_row = (y >> shift_y) * grid_w;
+        let first = grid_row + (x0 >> shift_x);
+        let last = grid_row + ((x0 + count - 1) >> shift_x);
+        if !decoded
+            .get(first..=last)
+            .is_some_and(|cells| cells.iter().all(|&cell| cell))
+        {
+            return false;
+        }
+        let start = y * width + x0;
+        refs.copy_from_slice(&plane[start..start + count]);
+    } else {
+        if x0 == 0 || x0 > width || y0 + count > height {
+            return false;
+        }
+        let x = x0 - 1;
+        let grid_col = x >> shift_x;
+        let first = (y0 >> shift_y) * grid_w + grid_col;
+        let last = ((y0 + count - 1) >> shift_y) * grid_w + grid_col;
+        if !decoded
+            .get(first..=last)
+            .is_some_and(|cells| cells.iter().step_by(grid_w).all(|&cell| cell))
+        {
+            return false;
+        }
+        let start = y0 * width + x;
+        let last = start + (count - 1) * width;
+        for (dst, &sample) in refs
+            .iter_mut()
+            .zip(plane[start..=last].iter().step_by(width))
+        {
+            *dst = sample;
+        }
+    }
+    true
 }
 
 #[inline]
@@ -4736,46 +4340,100 @@ impl<'cab> FullDecoder<'cab> {
             .unwrap_or(false)
     }
 
-    fn luma_avail(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
-            return false;
+    #[inline]
+    fn gather_prediction_refs(
+        &mut self,
+        n: usize,
+        origin: (usize, usize),
+        neutral: u16,
+        component: IntraComponent,
+    ) {
+        let (plane, dimensions, (sub_w, sub_h), chroma_mode) = match component {
+            IntraComponent::Luma => (&self.y, (self.w, self.h), (1, 1), None),
+            IntraComponent::Chroma { is_cb, mode } => (
+                if is_cb { &self.cb } else { &self.cr },
+                (self.cw, self.ch),
+                (self.sub_w, self.sub_h),
+                Some(mode),
+            ),
+        };
+        let cell_w = 4 / sub_w;
+        let cell_h = 4 / sub_h;
+        let above = &mut self.scratch.above[..2 * n + 1];
+        let left = &mut self.scratch.left[..2 * n + 1];
+        if self.tiles.is_none() && self.cur_slice_idx <= 1 && !self.pps._constrained_intra_pred {
+            let shift_x = cell_w.trailing_zeros();
+            let shift_y = cell_h.trailing_zeros();
+            let grid_w = self.grid_w;
+            let decoded = &self.decoded[..];
+            if let Some(mode @ (2..=10 | 26..=34)) = chroma_mode
+                && (self.sps.chroma_idc != 3 || self.sps.intra_smoothing_disabled || n == 4)
+            {
+                let vertical = mode >= 26;
+                let angle = intra::INTRA_PRED_ANGLE[usize::from(mode) - 2] as usize;
+                // Each output uses n consecutive samples displaced by at most
+                // n*angle/32 and may interpolate from one more sample.
+                let count = n + (n * angle).div_ceil(32);
+                let edge = if vertical { &mut *above } else { &mut *left };
+                if gather_chroma_primary_edge(
+                    plane,
+                    dimensions,
+                    origin,
+                    (shift_x, shift_y),
+                    grid_w,
+                    decoded,
+                    vertical,
+                    &mut edge[1..=count],
+                ) {
+                    return;
+                }
+            }
+
+            // Gathering already clips to the coded plane. A chroma sample in
+            // that plane maps to a luma coordinate within the coded picture.
+            gather_intra_refs(
+                plane,
+                dimensions,
+                origin,
+                (cell_w, cell_h),
+                above,
+                left,
+                neutral,
+                |x, y| {
+                    let cell = (y >> shift_y) * grid_w + (x >> shift_x);
+                    decoded.get(cell).copied().unwrap_or(false)
+                },
+            );
+            return;
         }
-        if !self.same_tile(x as usize, y as usize) {
-            return false;
-        }
-        if !self.same_slice(x as usize, y as usize) {
-            return false;
-        }
-        if !self.constrained_intra_ok(x as usize, y as usize) {
-            return false;
-        }
-        self.grid_idx(x as usize, y as usize)
-            .and_then(|g| self.decoded.get(g))
-            .copied()
-            .unwrap_or(false)
-    }
-    fn chroma_avail(&self, cx: i32, cy: i32) -> bool {
-        if cx < 0 || cy < 0 || cx as usize >= self.cw || cy as usize >= self.ch {
-            return false;
-        }
-        let lx = cx as usize * self.sub_w;
-        let ly = cy as usize * self.sub_h;
-        if lx >= self.w || ly >= self.h {
-            return false;
-        }
-        if !self.same_tile(lx, ly) {
-            return false;
-        }
-        if !self.same_slice(lx, ly) {
-            return false;
-        }
-        if !self.constrained_intra_ok(lx, ly) {
-            return false;
-        }
-        self.grid_idx(lx, ly)
-            .and_then(|g| self.decoded.get(g))
-            .copied()
-            .unwrap_or(false)
+        let available = |x: usize, y: usize| {
+            let x = x * sub_w;
+            let y = y * sub_h;
+            if x >= self.w || y >= self.h {
+                return false;
+            }
+
+            // Coded dimensions are capped before the 4×4 metadata grid is built.
+            let cell = (y / 4) * self.grid_w + x / 4;
+            self.decoded.get(cell).copied().unwrap_or(false)
+                && self.tiles.as_ref().is_none_or(|tiles| {
+                    tiles.tile_id_at(x >> self.log2_ctb, y >> self.log2_ctb) == self.cur_tile_id
+                })
+                && (self.cur_slice_idx <= 1
+                    || self.slice_idx.get(cell) == Some(&self.cur_slice_idx))
+                && (!self.pps._constrained_intra_pred
+                    || self.motion.get(cell).is_some_and(|motion| motion.is_intra))
+        };
+        gather_intra_refs(
+            plane,
+            dimensions,
+            origin,
+            (cell_w, cell_h),
+            above,
+            left,
+            neutral,
+            available,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4786,6 +4444,7 @@ impl<'cab> FullDecoder<'cab> {
         log2_ts: u32,
         mode: u8,
         nx: usize,
+        coded_groups: u64,
         max_abs_level: i32,
         transform_skip: bool,
         capture_cross_comp: bool,
@@ -4855,11 +4514,13 @@ impl<'cab> FullDecoder<'cab> {
                             &mut self.res_scratch16[..n * n],
                         );
                     } else {
-                        (self.exec.inv_transform16)(
+                        inverse_transform_into_i16(
+                            &self.exec,
                             &self.deq_scratch16[..n * n],
                             n,
                             self.bd,
                             nx,
+                            (!self.cur_cu_inter).then_some(coded_groups),
                             &mut self.res_scratch16[..n * n],
                         );
                     }
@@ -5012,31 +4673,12 @@ impl<'cab> FullDecoder<'cab> {
     }
 
     fn predict_luma_block_into(&mut self, x0: usize, y0: usize, n: usize, mode: u8) {
-        let mut above = std::mem::take(&mut self.scratch.raw_above);
-        let mut left = std::mem::take(&mut self.scratch.raw_left);
-        let corner = gather_intra_refs(
-            &self.y,
-            (self.w, self.h),
-            (x0, y0),
-            (4, 4),
-            &mut above[..2 * n],
-            &mut left[..2 * n],
-            |x, y| self.luma_avail(x, y),
-        );
         let neutral = 1u16
             .checked_shl(self.bd.saturating_sub(1) as u32)
             .unwrap_or(0);
         let strong = self.strong_smoothing && self.sps.strong_intra_smoothing;
+        self.gather_prediction_refs(n, (x0, y0), neutral, IntraComponent::Luma);
         let sc = &mut self.scratch;
-        intra::substitute_refs_into(
-            corner,
-            &above[..2 * n],
-            &left[..2 * n],
-            n,
-            neutral,
-            &mut sc.above,
-            &mut sc.left,
-        );
         let (above_refs, left_refs) = intra::filter_refs_into(
             &sc.above,
             &sc.left,
@@ -5068,8 +4710,6 @@ impl<'cab> FullDecoder<'cab> {
             &mut sc.pred[..n * n],
             &mut sc.refs_ang,
         );
-        self.scratch.raw_above = above;
-        self.scratch.raw_left = left;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5134,7 +4774,7 @@ impl<'cab> FullDecoder<'cab> {
                     None
                 };
                 let rext = self.rext_residual(mode, false);
-                let (transform_skip, max_x, _, max_abs_level, rdpcm) = residual_coding(
+                let (transform_skip, max_x, coded_groups, max_abs_level, rdpcm) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     self.exec.residual_scans,
@@ -5156,6 +4796,7 @@ impl<'cab> FullDecoder<'cab> {
                     mode,
                     qp_prime_cb,
                     max_x + 1,
+                    coded_groups,
                     max_abs_level,
                     transform_skip,
                     cb_scale,
@@ -5196,7 +4837,7 @@ impl<'cab> FullDecoder<'cab> {
                     None
                 };
                 let rext = self.rext_residual(mode, false);
-                let (transform_skip, max_x, _, max_abs_level, rdpcm) = residual_coding(
+                let (transform_skip, max_x, coded_groups, max_abs_level, rdpcm) = residual_coding(
                     &mut self.cab,
                     &mut self.ctx,
                     self.exec.residual_scans,
@@ -5218,6 +4859,7 @@ impl<'cab> FullDecoder<'cab> {
                     mode,
                     qp_prime_cr,
                     max_x + 1,
+                    coded_groups,
                     max_abs_level,
                     transform_skip,
                     cr_scale,
@@ -5238,36 +4880,20 @@ impl<'cab> FullDecoder<'cab> {
         n: usize,
         mode: u8,
     ) {
-        let mut above = std::mem::take(&mut self.scratch.raw_above);
-        let mut left = std::mem::take(&mut self.scratch.raw_left);
-        let plane = if is_cb { &self.cb } else { &self.cr };
-        let corner = gather_intra_refs(
-            plane,
-            (self.cw, self.ch),
-            (cx0, cy0),
-            (4 / self.sub_w, 4 / self.sub_h),
-            &mut above[..2 * n],
-            &mut left[..2 * n],
-            |x, y| self.chroma_avail(x, y),
-        );
         let neutral = 1u16
             .checked_shl(self.bd_c.saturating_sub(1) as u32)
             .unwrap_or(0);
-        let sc = &mut self.scratch;
-        intra::substitute_refs_into(
-            corner,
-            &above[..2 * n],
-            &left[..2 * n],
+        self.gather_prediction_refs(
             n,
+            (cx0, cy0),
             neutral,
-            &mut sc.above,
-            &mut sc.left,
+            IntraComponent::Chroma { is_cb, mode },
         );
-        // Reference filtering: 4:2:0/4:2:2 chroma TBs are 4×4 and never filtered.
-        // 4:4:4 chroma (≥8×8) filters references with the same [1 2 1] rule as luma
-        // (HEVC: cIdx>0 filters only when ChromaArrayType==3), but without the luma
-        // strong-intra-smoothing path. The DC/H/V prediction edge filter stays off
-        // for chroma (is_luma=false in predict_into).
+        let sc = &mut self.scratch;
+        // 4:4:4 chroma filters references with the luma [1 2 1] rule, without
+        // strong smoothing. Chroma prediction itself uses no DC/H/V edge filter.
+        // For the primary-only path, keep the two full-length scratch slices
+        // for SIMD loads. Only the written prefix can contribute to any output.
         let (above_refs, left_refs) = if self.sps.chroma_idc == 3 {
             intra::filter_refs_into(
                 &sc.above,
@@ -5293,8 +4919,6 @@ impl<'cab> FullDecoder<'cab> {
             &mut sc.pred[..n * n],
             &mut sc.refs_ang,
         );
-        self.scratch.raw_above = above;
-        self.scratch.raw_left = left;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5307,6 +4931,7 @@ impl<'cab> FullDecoder<'cab> {
         mode: u8,
         qp_prime: i32,
         nx: usize,
+        coded_groups: u64,
         max_abs_level: i32,
         transform_skip: bool,
         res_scale: i32,
@@ -5361,11 +4986,13 @@ impl<'cab> FullDecoder<'cab> {
                         scaling,
                         &mut self.deq_scratch16[..n2],
                     );
-                    (self.exec.inv_transform16)(
+                    inverse_transform_into_i16(
+                        &self.exec,
                         &self.deq_scratch16[..n2],
                         n,
                         self.bd_c,
                         nx,
+                        (!self.cur_cu_inter).then_some(coded_groups),
                         &mut self.res_scratch16[..n2],
                     );
                 }
@@ -5597,7 +5224,7 @@ pub(crate) struct RowFactory {
     collocated_ref_idx: usize,
     ref_list0: Vec<crate::dpb::RefEntry>,
     ref_list1: Vec<crate::dpb::RefEntry>,
-    ref_frames: Vec<crate::inter::RefFramePlanes>,
+    ref_frames: Vec<Arc<RefFramePlanes>>,
     pred_weights: Option<crate::inter::PredWeightTable>,
 }
 
@@ -6040,6 +5667,26 @@ fn dequantize_transform_skip_scaled_into_i16(
 }
 
 #[inline]
+fn inverse_transform_into_i16(
+    exec: &ExecContext,
+    coeff: &[i16],
+    n: usize,
+    bit_depth: u8,
+    nx: usize,
+    intra_coded_groups: Option<u64>,
+    out: &mut [i16],
+) {
+    if n == 32
+        && let Some(coded_groups) = intra_coded_groups
+        && let Some(inv_transform) = exec.inv_transform_coded32_16
+    {
+        inv_transform(coeff, bit_depth, nx, coded_groups, out);
+        return;
+    }
+    (exec.inv_transform16)(coeff, n, bit_depth, nx, out);
+}
+
+#[inline]
 fn inverse_transform_into_i32(
     exec: &ExecContext,
     coeff: &[i32],
@@ -6134,7 +5781,7 @@ struct DecoderNeighbors<'a> {
     w: usize,
     h: usize,
     cur_poc: i32,
-    ref_frames: &'a [crate::inter::RefFramePlanes],
+    ref_frames: &'a [Arc<RefFramePlanes>],
     ref_list0: &'a [crate::dpb::RefEntry],
     ref_list1: &'a [crate::dpb::RefEntry],
     collocated_from_l0: bool,
@@ -7074,10 +6721,10 @@ impl<'cab> FullDecoder<'cab> {
                     0,
                 ) {
                     let rp = crate::mc::RefPlane {
-                        data: &frame.y,
-                        stride: frame.w,
-                        width: frame.w,
-                        height: frame.h,
+                        data: &frame.planes.y,
+                        stride: frame.planes.width,
+                        width: frame.planes.width,
+                        height: frame.planes.height,
                     };
                     let ix = x0 as isize + (mi.mv[0].x >> 2) as isize;
                     let iy = y0 as isize + (mi.mv[0].y >> 2) as isize;
@@ -7123,10 +6770,10 @@ impl<'cab> FullDecoder<'cab> {
                     1,
                 ) {
                     let rp = crate::mc::RefPlane {
-                        data: &frame.y,
-                        stride: frame.w,
-                        width: frame.w,
-                        height: frame.h,
+                        data: &frame.planes.y,
+                        stride: frame.planes.width,
+                        width: frame.planes.width,
+                        height: frame.planes.height,
                     };
                     let ix = x0 as isize + (mi.mv[1].x >> 2) as isize;
                     let iy = y0 as isize + (mi.mv[1].y >> 2) as isize;
@@ -7303,7 +6950,11 @@ impl<'cab> FullDecoder<'cab> {
                         mi.ref_idx[0],
                         0,
                     ) {
-                        let data = if plane == 0 { &frame.cb } else { &frame.cr };
+                        let data = if plane == 0 {
+                            &frame.planes.cb
+                        } else {
+                            &frame.planes.cr
+                        };
                         let rp = crate::mc::RefPlane {
                             data,
                             stride: frame.cw,
@@ -7379,7 +7030,11 @@ impl<'cab> FullDecoder<'cab> {
                         mi.ref_idx[1],
                         1,
                     ) {
-                        let data = if plane == 0 { &frame.cb } else { &frame.cr };
+                        let data = if plane == 0 {
+                            &frame.planes.cb
+                        } else {
+                            &frame.planes.cr
+                        };
                         let rp = crate::mc::RefPlane {
                             data,
                             stride: frame.cw,
@@ -7518,7 +7173,7 @@ impl<'cab> FullDecoder<'cab> {
         cur_poc: i32,
         ref_list0: Vec<crate::dpb::RefEntry>,
         ref_list1: Vec<crate::dpb::RefEntry>,
-        ref_frames: Vec<crate::inter::RefFramePlanes>,
+        ref_frames: Vec<Arc<RefFramePlanes>>,
     ) {
         self.cur_poc = cur_poc;
         self.ref_list0 = ref_list0;
@@ -7529,8 +7184,7 @@ impl<'cab> FullDecoder<'cab> {
     /// Extract the coded picture's motion field and grid dimensions for storage
     /// in the DPB (temporal MV prediction of later pictures).
     pub(crate) fn take_motion(&mut self) -> (Vec<MotionInfo>, usize, usize) {
-        let m = std::mem::take(&mut self.motion);
-        (m.to_vec(), self.grid_w, self.grid_h)
+        (self.motion.take_vec(), self.grid_w, self.grid_h)
     }
 }
 
@@ -7548,12 +7202,12 @@ fn combine_mvp_mvd(pred: i16, diff: i16, integer: bool) -> i16 {
 
 #[inline]
 fn ref_frame_for_lists<'a>(
-    ref_frames: &'a [crate::inter::RefFramePlanes],
+    ref_frames: &'a [Arc<RefFramePlanes>],
     ref_list0: &[crate::dpb::RefEntry],
     ref_list1: &[crate::dpb::RefEntry],
     ref_idx: i8,
     list: usize,
-) -> Option<&'a crate::inter::RefFramePlanes> {
+) -> Option<&'a RefFramePlanes> {
     if ref_idx < 0 {
         return None;
     }
@@ -7562,7 +7216,10 @@ fn ref_frame_for_lists<'a>(
     } else {
         ref_list1.get(ref_idx as usize)
     }?;
-    ref_frames.iter().find(|f| f.poc == entry.poc)
+    ref_frames
+        .iter()
+        .map(Arc::as_ref)
+        .find(|f| f.poc == entry.poc)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8200,12 +7857,224 @@ mod tests {
     use super::InterPartMode;
     use super::{
         ceil_log2, clamp_qpy, combine_mvp_mvd, derive_qpy_from_delta, fill_slice_owner_rect,
-        inter_motion_differs, load_plane_block_clipped, peek_slice_pps_id,
-        promote_first_slice_owners, qp_prime, qpc, qpy_min, sao_offset_abs_max,
-        sao_offset_scale_is_valid, scale_sao_offsets, scaling_matrix_from_lists,
+        gather_chroma_primary_edge, gather_intra_refs, inter_motion_differs,
+        load_plane_block_clipped, peek_slice_pps_id, promote_first_slice_owners, qp_prime, qpc,
+        qpy_min, sao_offset_abs_max, sao_offset_scale_is_valid, scale_sao_offsets,
+        scaling_matrix_from_lists,
     };
     use crate::config::ScalingList;
     use crate::inter::{MotionInfo, Mv, PredFlags};
+
+    #[test]
+    fn rext_rdpcm_preserves_rotation_order_and_block_bounds() {
+        let input: [i16; 17] = std::array::from_fn(|i| i as i16 + 1);
+        let mut horizontal = input;
+        super::apply_rext_residual_ops(&mut horizontal, 4, false, Some(0));
+        assert_eq!(
+            horizontal,
+            [
+                1, 3, 6, 10, 5, 11, 18, 26, 9, 19, 30, 42, 13, 27, 42, 58, 17
+            ],
+        );
+
+        let mut vertical = input.map(i32::from);
+        super::apply_rext_residual_ops(&mut vertical, 4, true, Some(1));
+        assert_eq!(
+            vertical,
+            [
+                16, 15, 14, 13, 28, 26, 24, 22, 36, 33, 30, 27, 40, 36, 32, 28, 17
+            ],
+        );
+    }
+
+    #[test]
+    fn primary_chroma_edge_matches_full_reference_prediction() {
+        use crate::intra::{INTRA_PRED_ANGLE, predict_into_scalar, resolve_predict};
+
+        for (shift_x, shift_y) in [(1u32, 1u32), (1, 2), (2, 2)] {
+            for n in [2usize, 4, 8, 16, 32] {
+                for mode in (2..=10).chain(26..=34) {
+                    let vertical = mode >= 26;
+                    let angle = INTRA_PRED_ANGLE[usize::from(mode) - 2] as usize;
+                    let count = n + (n * angle).div_ceil(32);
+                    let (x0, y0) = (3, 3);
+                    // The required primary span just fits, even when extending
+                    // the edge to its full 2n samples would leave the picture.
+                    let (w, h) = (x0 + count, y0 + count);
+                    let grid_w = w.div_ceil(1 << shift_x);
+                    let mut decoded = vec![true; grid_w * h.div_ceil(1 << shift_y)];
+
+                    for bit_depth in [8, 10, 16] {
+                        let max = (1u32 << bit_depth) - 1;
+                        let plane: Vec<u16> = (0..w * h)
+                            .map(|i| (i as u32 * 38317 & max) as u16)
+                            .collect();
+                        let mut full_above = vec![0; 2 * n + 1];
+                        let mut full_left = vec![0; 2 * n + 1];
+                        gather_intra_refs(
+                            &plane,
+                            (w, h),
+                            (x0, y0),
+                            (1 << shift_x, 1 << shift_y),
+                            &mut full_above,
+                            &mut full_left,
+                            1 << (bit_depth - 1),
+                            |_, _| true,
+                        );
+
+                        // Poison the ignored prefix, tail and opposite edge.
+                        let mut above = vec![u16::MAX; 2 * n + 1];
+                        let mut left = vec![u16::MAX; 2 * n + 1];
+                        let refs = if vertical { &mut above } else { &mut left };
+                        assert!(gather_chroma_primary_edge(
+                            &plane,
+                            (w, h),
+                            (x0, y0),
+                            (shift_x, shift_y),
+                            grid_w,
+                            &decoded,
+                            vertical,
+                            &mut refs[1..=count],
+                        ));
+
+                        let mut expected = vec![0; n * n];
+                        let mut actual = vec![0; n * n];
+                        let mut angular = vec![0; 3 * n + 1];
+                        for predict in [resolve_predict(), predict_into_scalar] {
+                            predict(
+                                mode,
+                                &full_above,
+                                &full_left,
+                                n,
+                                false,
+                                bit_depth,
+                                &mut expected,
+                                &mut angular,
+                            );
+                            predict(
+                                mode,
+                                &above,
+                                &left,
+                                n,
+                                false,
+                                bit_depth,
+                                &mut actual,
+                                &mut angular,
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "mode {mode}, size {n}, depth {bit_depth}"
+                            );
+                        }
+                    }
+
+                    let (ref_x, ref_y) = if vertical { (x0, y0 - 1) } else { (x0 - 1, y0) };
+                    decoded[(ref_y >> shift_y) * grid_w + (ref_x >> shift_x)] = false;
+                    assert!(!gather_chroma_primary_edge(
+                        &vec![0; w * h],
+                        (w, h),
+                        (x0, y0),
+                        (shift_x, shift_y),
+                        grid_w,
+                        &decoded,
+                        vertical,
+                        &mut vec![0; count],
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gather_intra_refs_checks_each_above_group_once() {
+        let plane: Vec<u16> = (0..37).collect();
+        let mut above = [0; 41];
+        let mut left = [0; 41];
+        let visited = std::cell::RefCell::new(Vec::new());
+        gather_intra_refs(
+            &plane,
+            (37, 1),
+            (4, 1),
+            (4, 4),
+            &mut above,
+            &mut left,
+            128,
+            |x, y| {
+                visited.borrow_mut().push((x, y));
+                matches!(x / 4, 3 | 4 | 7..=9)
+            },
+        );
+
+        assert_eq!(
+            visited.into_inner(),
+            [
+                (3, 0),
+                (4, 0),
+                (8, 0),
+                (12, 0),
+                (16, 0),
+                (20, 0),
+                (24, 0),
+                (28, 0),
+                (32, 0),
+                (36, 0)
+            ],
+        );
+        assert_eq!(left, [12; 41]);
+        assert_eq!(above[..9], [12; 9]);
+        assert_eq!(above[9..17], [12, 13, 14, 15, 16, 17, 18, 19]);
+        assert_eq!(above[17..25], [19; 8]);
+        assert_eq!(above[25..34], [28, 29, 30, 31, 32, 33, 34, 35, 36]);
+        assert_eq!(above[34..], [36; 7]);
+    }
+
+    #[test]
+    fn gather_intra_refs_fills_gaps_in_scan_order() {
+        let plane: Vec<u16> = (0..48).collect();
+        let mut above = [u16::MAX; 9];
+        let mut left = [u16::MAX; 9];
+
+        // The left edge stops at the last coded row and the corner is missing.
+        gather_intra_refs(
+            &plane,
+            (8, 6),
+            (4, 4),
+            (4, 4),
+            &mut above,
+            &mut left,
+            128,
+            |x, y| x >= 4 || y >= 4,
+        );
+        assert_eq!(above, [35, 28, 29, 30, 31, 31, 31, 31, 31]);
+        assert_eq!(left, [35, 35, 43, 43, 43, 43, 43, 43, 43]);
+
+        // A zero-valued first sample substitutes the whole unavailable left edge.
+        gather_intra_refs(
+            &plane,
+            (8, 6),
+            (0, 1),
+            (4, 4),
+            &mut above,
+            &mut left,
+            128,
+            |_, _| true,
+        );
+        assert_eq!(above, [0, 0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(left, [0; 9]);
+
+        gather_intra_refs(
+            &plane,
+            (8, 6),
+            (4, 4),
+            (4, 4),
+            &mut above,
+            &mut left,
+            128,
+            |_, _| false,
+        );
+        assert_eq!(above, [128; 9]);
+        assert_eq!(left, [128; 9]);
+    }
 
     // Build a slice-header prefix: 2-byte NAL header, first_slice flag,
     // [no_output_of_prior_pics if IRAP], then pps_id as ue(v). Values are packed
@@ -8439,24 +8308,29 @@ fn apply_rext_residual_ops<T>(res: &mut [T], n: usize, rotate: bool, rdpcm: Opti
 where
     T: Copy + core::ops::Add<Output = T>,
 {
+    if n < 2 {
+        return;
+    }
     if rotate {
-        let n2 = n * n;
-        for i in 0..n2 / 2 {
-            res.swap(i, n2 - 1 - i);
-        }
+        res[..n * n].reverse();
     }
     match rdpcm {
         Some(1) => {
-            for y in 1..n {
-                for x in 0..n {
-                    res[y * n + x] = res[y * n + x] + res[(y - 1) * n + x];
+            let (first, rest) = res[..n * n].split_at_mut(n);
+            let mut previous: &[T] = first;
+            for row in rest.chunks_exact_mut(n) {
+                for (sample, &above) in row.iter_mut().zip(previous) {
+                    *sample = *sample + above;
                 }
+                previous = row;
             }
         }
         Some(_) => {
-            for y in 0..n {
-                for x in 1..n {
-                    res[y * n + x] = res[y * n + x] + res[y * n + x - 1];
+            for row in res[..n * n].chunks_exact_mut(n) {
+                let mut previous = row[0];
+                for sample in &mut row[1..] {
+                    previous = *sample + previous;
+                    *sample = previous;
                 }
             }
         }

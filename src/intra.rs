@@ -47,10 +47,8 @@ pub(crate) struct IntraScratch {
     pub(crate) left: Vec<u16>,
     pub(crate) fa: Vec<u16>,
     pub(crate) fl: Vec<u16>,
-    pub(crate) refs_ang: Vec<i32>,          // 3*N+1
-    pub(crate) pred: Vec<u16>,              // N*N
-    pub(crate) raw_above: Vec<Option<u16>>, // 2*N, reused for ref gathering (no per-TU alloc)
-    pub(crate) raw_left: Vec<Option<u16>>,  // 2*N
+    pub(crate) refs_ang: Vec<i32>, // 3*N+1
+    pub(crate) pred: Vec<u16>,     // N*N
 }
 
 impl Default for IntraScratch {
@@ -69,50 +67,7 @@ impl IntraScratch {
             fl: vec![0u16; 2 * max_n + 1],
             refs_ang: vec![0i32; 3 * max_n + 1],
             pred: vec![0u16; max_n * max_n],
-            raw_above: vec![None; 2 * max_n],
-            raw_left: vec![None; 2 * max_n],
         }
-    }
-}
-
-/// Substitute missing references in HEVC scan order, from bottom left across
-/// the corner to the rightmost sample above.
-pub(crate) fn substitute_refs_into(
-    raw_corner: Option<u16>,
-    raw_above: &[Option<u16>],
-    raw_left: &[Option<u16>],
-    n: usize,
-    neutral: u16,
-    above_out: &mut [u16],
-    left_out: &mut [u16],
-) {
-    let raw_above = &raw_above[..2 * n];
-    let raw_left = &raw_left[..2 * n];
-    let above_out = &mut above_out[..2 * n + 1];
-    let left_out = &mut left_out[..2 * n + 1];
-
-    let first = raw_left
-        .iter()
-        .rev()
-        .find_map(|&sample| sample)
-        .or(raw_corner)
-        .or_else(|| raw_above.iter().find_map(|&sample| sample));
-    let Some(mut previous) = first else {
-        above_out.fill(neutral);
-        left_out.fill(neutral);
-        return;
-    };
-
-    for (dst, &sample) in left_out[1..].iter_mut().zip(raw_left).rev() {
-        previous = sample.unwrap_or(previous);
-        *dst = previous;
-    }
-    previous = raw_corner.unwrap_or(previous);
-    above_out[0] = previous;
-    left_out[0] = previous;
-    for (dst, &sample) in above_out[1..].iter_mut().zip(raw_above) {
-        previous = sample.unwrap_or(previous);
-        *dst = previous;
     }
 }
 
@@ -345,29 +300,7 @@ pub(crate) fn predict_into_scalar(
 
 #[cfg(test)]
 mod tests {
-    use super::{PLANAR, filter_refs_into, substitute_refs_into};
-
-    #[test]
-    fn substitute_refs_fills_gaps_in_scan_order() {
-        let n = 2;
-        let mut above = [0; 5];
-        let mut left = [0; 5];
-        let raw_above = [None, Some(9), None, Some(12)];
-        let raw_left = [Some(5), None, Some(0), None];
-
-        substitute_refs_into(None, &raw_above, &raw_left, n, 128, &mut above, &mut left);
-        assert_eq!(above, [5, 5, 9, 9, 12]);
-        assert_eq!(left, [5, 5, 0, 0, 0]);
-
-        let missing = [None; 4];
-        substitute_refs_into(None, &raw_above, &missing, n, 128, &mut above, &mut left);
-        assert_eq!(above, [9, 9, 9, 9, 12]);
-        assert_eq!(left, [9; 5]);
-
-        substitute_refs_into(None, &missing, &missing, n, 128, &mut above, &mut left);
-        assert_eq!(above, [128; 5]);
-        assert_eq!(left, [128; 5]);
-    }
+    use super::{PLANAR, filter_refs_into};
 
     #[test]
     fn disabled_reference_smoothing_preserves_samples() {

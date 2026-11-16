@@ -47,7 +47,9 @@ pub(crate) use dequant::{
     dequantize_transform_skip_into_neon16, dequantize_transform_skip_scaled_into_neon,
     dequantize_transform_skip_scaled_into_neon16,
 };
-pub(crate) use i16::{inv_transform_dst_into_neon16, inv_transform_into_neon16};
+pub(crate) use i16::{
+    inv_transform_coded32_into_neon16, inv_transform_dst_into_neon16, inv_transform_into_neon16,
+};
 pub(crate) use i32::{inv_transform_dst_into_neon, inv_transform_into_neon};
 pub(crate) use intra::predict_into_neon;
 pub(crate) use mc::{

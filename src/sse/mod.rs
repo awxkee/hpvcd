@@ -57,6 +57,6 @@ pub(crate) use sao::{
     apply_sao_plane_banded_sse41, apply_sao_plane_sse41,
 };
 pub(crate) use transform::{
-    inv_transform_dst_into_sse41, inv_transform_dst_into_sse41_16, inv_transform_into_sse41,
-    inv_transform_into_sse41_16,
+    inv_transform_coded32_into_sse41_16, inv_transform_dst_into_sse41,
+    inv_transform_dst_into_sse41_16, inv_transform_into_sse41, inv_transform_into_sse41_16,
 };

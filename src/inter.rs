@@ -33,6 +33,7 @@
 
 use crate::bitreader::BitReader;
 use crate::error::DecodeError;
+use crate::yuv::YuvPlanes;
 
 fn e(s: &'static str) -> DecodeError {
     DecodeError::Bitstream(s.into())
@@ -329,16 +330,10 @@ pub(crate) const SLICE_B: u8 = 0;
 pub(crate) const SLICE_P: u8 = 1;
 pub(crate) const SLICE_I: u8 = 2;
 
-/// An owned reference picture the motion-compensation path reads from. Planes
-/// are stored at coded (CTB-aligned) dimensions matching the current picture.
-#[derive(Clone)]
+/// Immutable decoded picture shared by the DPB and inter prediction.
 pub(crate) struct RefFramePlanes {
     pub(crate) poc: i32,
-    pub(crate) y: Vec<u16>,
-    pub(crate) cb: Vec<u16>,
-    pub(crate) cr: Vec<u16>,
-    pub(crate) w: usize,
-    pub(crate) h: usize,
+    pub(crate) planes: YuvPlanes,
     pub(crate) cw: usize,
     pub(crate) ch: usize,
     /// Per-4×4 motion field of the reference (for temporal MVP).

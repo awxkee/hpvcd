@@ -80,18 +80,6 @@ fn store_u16x2(dst: &mut [u16], v: uint16x8_t) {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn mul_const(v: int32x4_t, c: i32) -> int32x4_t {
-    vmulq_s32(v, vdupq_n_s32(c))
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn round_shift_s32x4(v: int32x4_t, add: i32, shift: i32) -> int32x4_t {
-    vshlq_s32(vaddq_s32(v, vdupq_n_s32(add)), vdupq_n_s32(-shift))
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 fn pack_u16x8(lo: int32x4_t, hi: int32x4_t) -> uint16x8_t {
     vcombine_u16(
         vqmovn_u32(vreinterpretq_u32_s32(lo)),
@@ -100,7 +88,6 @@ fn pack_u16x8(lo: int32x4_t, hi: int32x4_t) -> uint16x8_t {
 }
 
 static X_LANE_OFFSETS: [i32; 4] = [1, 2, 3, 4];
-static NX_LANE_OFFSETS: [i32; 4] = [0, 1, 2, 3];
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -110,20 +97,8 @@ fn x_lane_offsets() -> int32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn nx_lane_offsets() -> int32x4_t {
-    unsafe { vld1q_s32(NX_LANE_OFFSETS.as_ptr()) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 fn x_lanes(base: usize) -> int32x4_t {
     vaddq_s32(vdupq_n_s32(base as i32), x_lane_offsets())
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn nx_lanes(n: usize, base: usize) -> int32x4_t {
-    vsubq_s32(vdupq_n_s32((n - 1 - base) as i32), nx_lane_offsets())
 }
 
 #[inline]
@@ -139,25 +114,18 @@ fn widen_hi_u16x4(v: uint16x8_t) -> int32x4_t {
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
 fn planar4_neon(
     above: int32x4_t,
     x: usize,
-    n: usize,
-    left_y: i32,
-    tr: i32,
-    bl_part: i32,
-    ny: i32,
-    add: i32,
-    shift: i32,
+    row_base: int32x4_t,
+    slope: int32x4_t,
+    above_weight: int32x4_t,
+    shift: int32x4_t,
 ) -> int32x4_t {
-    let h = vaddq_s32(
-        vmulq_s32(nx_lanes(n, x), vdupq_n_s32(left_y)),
-        mul_const(x_lanes(x), tr),
-    );
-    let v = vaddq_s32(mul_const(above, ny), vdupq_n_s32(bl_part));
-    round_shift_s32x4(vaddq_s32(h, v), add, shift)
+    let accum = vmlaq_s32(row_base, x_lanes(x), slope);
+    let accum = vmlaq_s32(accum, above, above_weight);
+    vrshlq_s32(accum, shift)
 }
 
 #[inline]
@@ -169,16 +137,18 @@ fn store_planar_row_neon(
     tr: i32,
     bl: i32,
     y: usize,
-    n: usize,
+    shift: int32x4_t,
 ) {
-    let shift = n.trailing_zeros() as i32 + 1;
-    let add = n as i32;
-    let ny = (n - 1 - y) as i32;
-    let bl_part = (y + 1) as i32 * bl;
+    let n = out.len();
+    // (n - 1 - x) * left + (x + 1) * top_right
+    //     = n * left + (x + 1) * (top_right - left).
+    let row_base = vdupq_n_s32(n as i32 * left_y + (y + 1) as i32 * bl);
+    let slope = vdupq_n_s32(tr - left_y);
+    let above_weight = vdupq_n_s32((n - 1 - y) as i32);
 
     if n == 2 {
         let a = load_u16x4(&above[1..]);
-        let lo = planar4_neon(widen_lo_u16x4(a), 0, n, left_y, tr, bl_part, ny, add, shift);
+        let lo = planar4_neon(widen_lo_u16x4(a), 0, row_base, slope, above_weight, shift);
         store_u16x2(out, pack_u16x8(lo, vdupq_n_s32(0)));
         return;
     }
@@ -190,48 +160,29 @@ fn store_planar_row_neon(
         let x = block * 16;
         let a0 = load_u16x8(&a[..]);
         let a1 = load_u16x8(&a[8..]);
-        let lo0 = planar4_neon(
-            widen_lo_u16x4(a0),
-            x,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
-            shift,
-        );
+        let lo0 = planar4_neon(widen_lo_u16x4(a0), x, row_base, slope, above_weight, shift);
         let hi0 = planar4_neon(
             widen_hi_u16x4(a0),
             x + 4,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_base,
+            slope,
+            above_weight,
             shift,
         );
         let lo1 = planar4_neon(
             widen_lo_u16x4(a1),
             x + 8,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_base,
+            slope,
+            above_weight,
             shift,
         );
         let hi1 = planar4_neon(
             widen_hi_u16x4(a1),
             x + 12,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_base,
+            slope,
+            above_weight,
             shift,
         );
         store_u16x8(&mut dst[..], pack_u16x8(lo0, hi0));
@@ -244,16 +195,13 @@ fn store_planar_row_neon(
     for (block, (a, dst)) in above8.iter().zip(out8.iter_mut()).enumerate() {
         let x = x8_base + block * 8;
         let a = load_u16x8(&a[..]);
-        let lo = planar4_neon(widen_lo_u16x4(a), x, n, left_y, tr, bl_part, ny, add, shift);
+        let lo = planar4_neon(widen_lo_u16x4(a), x, row_base, slope, above_weight, shift);
         let hi = planar4_neon(
             widen_hi_u16x4(a),
             x + 4,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_base,
+            slope,
+            above_weight,
             shift,
         );
         store_u16x8(&mut dst[..], pack_u16x8(lo, hi));
@@ -262,7 +210,7 @@ fn store_planar_row_neon(
     if !above_tail.is_empty() {
         let x = x8_base + above8.len() * 8;
         let a = load_u16x8(&above[1 + x..]);
-        let lo = planar4_neon(widen_lo_u16x4(a), x, n, left_y, tr, bl_part, ny, add, shift);
+        let lo = planar4_neon(widen_lo_u16x4(a), x, row_base, slope, above_weight, shift);
         store_u16x4(out_tail, pack_u16x8(lo, vdupq_n_s32(0)));
     }
 }
@@ -654,10 +602,12 @@ fn predict_planar_neon(above: &[u16], left: &[u16], n: usize, out: &mut [u16]) {
     debug_assert!(left.len() > 2 * n);
     debug_assert!(out.len() >= n * n);
 
-    let tr = above[n + 1] as i32;
-    let bl = left[n + 1] as i32;
+    let tr = i32::from(above[n + 1]);
+    let bl = i32::from(left[n + 1]);
+    // A rounding shift by log2(n) + 1 adds n before shifting.
+    let shift = vdupq_n_s32(-(n.trailing_zeros() as i32 + 1));
     for (y, row) in out[..n * n].chunks_exact_mut(n).enumerate() {
-        store_planar_row_neon(row, above, left[y + 1] as i32, tr, bl, y, n);
+        store_planar_row_neon(row, above, i32::from(left[y + 1]), tr, bl, y, shift);
     }
 }
 
@@ -767,6 +717,34 @@ pub(crate) fn predict_into_neon(
             26 => predict_mode26_neon(above, left, n, is_luma, bit_depth, out),
             2..=34 => predict_angular_neon(mode, above, left, n, bit_depth, out, refs_ang),
             _ => predict_into_scalar(mode, above, left, n, is_luma, bit_depth, out, refs_ang),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PLANAR, predict_into_neon, predict_into_scalar};
+
+    #[test]
+    fn planar_multiply_adds_match_scalar() {
+        let ramp: [u16; 65] = std::array::from_fn(|i| (i * 8_341 + 19) as u16);
+        let inverse = ramp.map(|sample| u16::MAX - sample);
+        let black = [0; 65];
+        let white = [u16::MAX; 65];
+        let refs = [&ramp, &inverse, &black, &white];
+        let mut expected = [0u16; 32 * 32];
+        let mut actual = [0u16; 32 * 32];
+        let mut tmp = [0; 3 * 32 + 1];
+        for n in [2, 4, 8, 16, 32] {
+            for above in refs {
+                for left in refs {
+                    let above = &above[..2 * n + 1];
+                    let left = &left[..2 * n + 1];
+                    predict_into_scalar(PLANAR, above, left, n, true, 16, &mut expected, &mut tmp);
+                    predict_into_neon(PLANAR, above, left, n, true, 16, &mut actual, &mut tmp);
+                    assert_eq!(&actual[..n * n], &expected[..n * n], "size {n}");
+                }
+            }
         }
     }
 }

@@ -75,9 +75,15 @@ fn chroma_simd_bounds(
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn load_u16x8_i32_pair(src: &[u16]) -> (int32x4_t, int32x4_t) {
+fn load_u16x8(src: &[u16]) -> uint16x8_t {
     debug_assert!(src.len() >= 8);
-    let v = unsafe { vld1q_u16(src.as_ptr()) };
+    unsafe { vld1q_u16(src.as_ptr()) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_u16x8_i32_pair(src: &[u16]) -> (int32x4_t, int32x4_t) {
+    let v = load_u16x8(src);
     (
         vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v))),
         vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(v))),
@@ -112,28 +118,44 @@ fn store_i16x8_interp(dst: &mut [i16], lo: int32x4_t, hi: int32x4_t) {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn conv_u16x8_i32_8tap(src: &[u16], f: &[i32; 8]) -> (int32x4_t, int32x4_t) {
-    let mut lo = vdupq_n_s32(0);
-    let mut hi = vdupq_n_s32(0);
-    for (i, &c) in f.iter().enumerate() {
-        let (slo, shi) = load_u16x8_i32_pair(&src[i..]);
-        let c = vdupq_n_s32(c);
-        lo = vmlaq_s32(lo, slo, c);
-        hi = vmlaq_s32(hi, shi, c);
-    }
-    (lo, hi)
+fn filter_lanes<const N: usize>(filter: &[i32; N]) -> int16x8_t {
+    let lanes: [i16; 8] = std::array::from_fn(|tap| if tap < N { filter[tap] as i16 } else { 0 });
+    load_i16x8(&lanes)
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn conv_u16x8_i32_4tap(src: &[u16], f: &[i32; 4]) -> (int32x4_t, int32x4_t) {
-    let mut lo = vdupq_n_s32(0);
-    let mut hi = vdupq_n_s32(0);
-    for (i, &c) in f.iter().enumerate() {
-        let (slo, shi) = load_u16x8_i32_pair(&src[i..]);
-        let c = vdupq_n_s32(c);
-        lo = vmlaq_s32(lo, slo, c);
-        hi = vmlaq_s32(hi, shi, c);
+fn conv_u16x8_i32<const N: usize>(src: &[u16], f: int16x8_t) -> (int32x4_t, int32x4_t) {
+    // Center unsigned samples in i16 for widening lane multiplies. Every
+    // HEVC interpolation filter sums to 64, so correct the bias once per lane.
+    let bias = vdupq_n_u16(1 << 15);
+    let first = vreinterpretq_s16_u16(veorq_u16(load_u16x8(src), bias));
+    let last = vreinterpretq_s16_u16(veorq_u16(load_u16x8(&src[N - 1..]), bias));
+    // The second load ends on the final sample used by the filter. Rotate to
+    // make its first lanes start at source index eight.
+    let last = if N == 8 {
+        vextq_s16::<1>(last, last)
+    } else {
+        vextq_s16::<5>(last, last)
+    };
+    let mut lo = vdupq_n_s32(64 * (1 << 15));
+    let mut hi = lo;
+    macro_rules! tap {
+        ($i:literal) => {{
+            let samples = vextq_s16::<$i>(first, last);
+            lo = vmlal_laneq_s16::<$i>(lo, vget_low_s16(samples), f);
+            hi = vmlal_high_laneq_s16::<$i>(hi, samples, f);
+        }};
+    }
+    tap!(0);
+    tap!(1);
+    tap!(2);
+    tap!(3);
+    if N == 8 {
+        tap!(4);
+        tap!(5);
+        tap!(6);
+        tap!(7);
     }
     (lo, hi)
 }
@@ -160,9 +182,10 @@ fn copy_scaled_row_neon(src: &[u16], dst: &mut [i16], s1: i32) {
 #[target_feature(enable = "neon")]
 fn filter_h_8tap_row_neon(src: &[u16], dst: &mut [i16], f: &[i32; 8], s1: i32) {
     let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let lanes = filter_lanes(f);
     for (chunk_idx, dst) in dst8.iter_mut().enumerate() {
         let x = chunk_idx * 8;
-        let (lo, hi) = conv_u16x8_i32_8tap(&src[x..], f);
+        let (lo, hi) = conv_u16x8_i32::<8>(&src[x..], lanes);
         store_i16x8_interp(dst, shr_s32(lo, s1), shr_s32(hi, s1));
     }
     let x0 = dst8.len() * 8;
@@ -180,9 +203,10 @@ fn filter_h_8tap_row_neon(src: &[u16], dst: &mut [i16], f: &[i32; 8], s1: i32) {
 #[target_feature(enable = "neon")]
 fn filter_h_4tap_row_neon(src: &[u16], dst: &mut [i16], f: &[i32; 4], s1: i32) {
     let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let lanes = filter_lanes(f);
     for (chunk_idx, dst) in dst8.iter_mut().enumerate() {
         let x = chunk_idx * 8;
-        let (lo, hi) = conv_u16x8_i32_4tap(&src[x..], f);
+        let (lo, hi) = conv_u16x8_i32::<4>(&src[x..], lanes);
         store_i16x8_interp(dst, shr_s32(lo, s1), shr_s32(hi, s1));
     }
     let x0 = dst8.len() * 8;
@@ -200,9 +224,10 @@ fn filter_h_4tap_row_neon(src: &[u16], dst: &mut [i16], f: &[i32; 4], s1: i32) {
 #[target_feature(enable = "neon")]
 fn filter_h_8tap_tmp_row_neon(src: &[u16], dst: &mut [i32], f: &[i32; 8], s1: i32) {
     let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let lanes = filter_lanes(f);
     for (chunk_idx, dst) in dst8.iter_mut().enumerate() {
         let x = chunk_idx * 8;
-        let (lo, hi) = conv_u16x8_i32_8tap(&src[x..], f);
+        let (lo, hi) = conv_u16x8_i32::<8>(&src[x..], lanes);
         store_i32x4(&mut dst[..4], shr_s32(lo, s1));
         store_i32x4(&mut dst[4..], shr_s32(hi, s1));
     }
@@ -221,9 +246,10 @@ fn filter_h_8tap_tmp_row_neon(src: &[u16], dst: &mut [i32], f: &[i32; 8], s1: i3
 #[target_feature(enable = "neon")]
 fn filter_h_4tap_tmp_row_neon(src: &[u16], dst: &mut [i32], f: &[i32; 4], s1: i32) {
     let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let lanes = filter_lanes(f);
     for (chunk_idx, dst) in dst8.iter_mut().enumerate() {
         let x = chunk_idx * 8;
-        let (lo, hi) = conv_u16x8_i32_4tap(&src[x..], f);
+        let (lo, hi) = conv_u16x8_i32::<4>(&src[x..], lanes);
         store_i32x4(&mut dst[..4], shr_s32(lo, s1));
         store_i32x4(&mut dst[4..], shr_s32(hi, s1));
     }
