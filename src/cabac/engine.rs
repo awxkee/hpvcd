@@ -71,8 +71,9 @@ static TRANS_IDX_LPS: [u8; 64] = [
 // indexed by the complete packed context byte (pStateIdx + valMPS) and the
 // current range class.  Keeping this generated from the normative tables makes
 // the hot decision path smaller without duplicating hand-maintained constants.
-const fn build_decision_table() -> [[u32; 4]; 128] {
-    let mut table = [[0u32; 4]; 128];
+// The unused upper state bit is ignored, so every u8 can index the table.
+const fn build_decision_table() -> [[u32; 4]; 256] {
+    let mut table = [[0u32; 4]; 256];
     let mut packed_state = 0usize;
     while packed_state < table.len() {
         let state = packed_state & 63;
@@ -93,7 +94,19 @@ const fn build_decision_table() -> [[u32; 4]; 128] {
     table
 }
 
-static DECISION_TABLE: [[u32; 4]; 128] = build_decision_table();
+static DECISION_TABLE: [[u32; 4]; 256] = build_decision_table();
+
+const fn build_bypass_reciprocals() -> [u32; 256] {
+    let mut reciprocals = [0u32; 256];
+    let mut i = 0;
+    while i < reciprocals.len() {
+        reciprocals[i] = ((1u64 << 32) / (256 + i) as u64) as u32;
+        i += 1;
+    }
+    reciprocals
+}
+
+static BYPASS_RECIPROCALS: [u32; 256] = build_bypass_reciprocals();
 
 /// CABAC decoder. Feed it EBSP-unescaped slice payload bytes.
 pub(crate) struct CabacDecoder<'a> {
@@ -218,7 +231,8 @@ impl<'a> CabacDecoder<'a> {
     #[inline(always)]
     pub(crate) fn decode_bin(&mut self, ctx: &mut CtxModel) -> u8 {
         let packed_state = ctx.state;
-        let mps = packed_state >> 6;
+        debug_assert!(packed_state < 128);
+        let mps = (packed_state >> 6) & 1;
         let decision = DECISION_TABLE[packed_state as usize][(self.range >> 6) as usize & 3];
         let lps = decision & 0xff;
         let next_mps = (decision >> 8) as u8;
@@ -284,6 +298,30 @@ impl<'a> CabacDecoder<'a> {
         }
         self.offset = offset;
         bins
+    }
+
+    /// Decode the sign bins of one coefficient group.
+    #[inline(always)]
+    pub(crate) fn decode_coeff_signs(&mut self, count: u32, is_intra: bool) -> u32 {
+        let range = self.range;
+        if !is_intra
+            || !(8..=16).contains(&count)
+            || !(256..=511).contains(&range)
+            || self.offset >= range
+        {
+            return self.decode_bypass_bits(count);
+        }
+
+        // Each bypass bin is one quotient bit, with the decoder offset as
+        // the remainder. For at most 16 bins the combined numerator is
+        // below 2^25. The reciprocal gives the exact quotient or one less.
+        let combined = (self.offset << count) | self.read_bits(count);
+        let reciprocal = BYPASS_RECIPROCALS[(range - 256) as usize];
+        let quotient = ((u64::from(combined) * u64::from(reciprocal)) >> 32) as u32;
+        let remainder = combined - quotient * range;
+        let correction = u32::from(remainder >= range);
+        self.offset = remainder - correction * range;
+        quotient + correction
     }
 
     /// Decode terminate bin (end_of_slice / end_of_sub_stream).
@@ -362,9 +400,9 @@ mod tests {
 
     #[test]
     fn packed_decision_table_matches_normative_tables() {
-        for packed_state in 0u8..128 {
+        for packed_state in 0u8..=u8::MAX {
             let state = usize::from(packed_state & 63);
-            let mps = packed_state >> 6;
+            let mps = (packed_state >> 6) & 1;
             let expected_mps = TRANS_IDX_MPS[state] | (mps << 6);
             let lps_mps = if state == 0 { mps ^ 1 } else { mps };
             let expected_lps = TRANS_IDX_LPS[state] | (lps_mps << 6);
@@ -463,6 +501,37 @@ mod tests {
                     batched.byte_pos * 8 - batched.bitcnt as usize,
                     scalar.byte_pos * 8 - scalar.bitcnt as usize
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn coefficient_sign_batch_matches_generic_bypass() {
+        let short = [0x00, 0x77];
+        let full = [0x41, 0x00, 0xfe, 0xc3, 0x18, 0x5f, 0x20, 0x16, 0x84];
+        for data in [short.as_slice(), full.as_slice()] {
+            for range in 255..=512 {
+                for count in 7..=17 {
+                    for offset in [0, 1, range / 2, range - 1, range, range + 1] {
+                        let mut expected = CabacDecoder::new_borrowed(data).unwrap();
+                        expected.range = range;
+                        expected.offset = offset;
+                        let mut signs = CabacDecoder::new_borrowed(data).unwrap();
+                        signs.range = range;
+                        signs.offset = offset;
+
+                        assert_eq!(
+                            signs.decode_coeff_signs(count, true),
+                            expected.decode_bypass_bits(count),
+                            "range {range}, offset {offset}, count {count}"
+                        );
+                        assert_eq!(signs.offset, expected.offset);
+                        assert_eq!(signs.range, expected.range);
+                        assert_eq!(signs.bitbuf, expected.bitbuf);
+                        assert_eq!(signs.bitcnt, expected.bitcnt);
+                        assert_eq!(signs.byte_pos, expected.byte_pos);
+                    }
+                }
             }
         }
     }

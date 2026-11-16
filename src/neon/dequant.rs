@@ -848,10 +848,7 @@ fn dequantize_scaled_into_neon16_i32_impl(
         let idx = group_idx * 16;
         let (src0, _) = src[0].as_chunks::<4>();
         let (src1, _) = src[1].as_chunks::<4>();
-        let f0 = scaling_factors4(base_factor, scaling, idx);
-        let f1 = scaling_factors4(base_factor, scaling, idx + 4);
-        let f2 = scaling_factors4(base_factor, scaling, idx + 8);
-        let f3 = scaling_factors4(base_factor, scaling, idx + 12);
+        let [f0, f1, f2, f3] = scaling.factors16(idx, base_factor);
         let lo0 = vqmovn_s32(dequant4_scaled_neon_i32_const(
             &src0[0], &f0, add, shift, clip_lo, clip_hi,
         ));

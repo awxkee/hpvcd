@@ -32,19 +32,14 @@
 //! (POC) order. Rewritten in safe Rust following de265's `decctx`/`dpb` flow.
 
 use crate::error::DecodeError;
-use crate::inter::MotionInfo;
+use crate::inter::RefFramePlanes;
 use crate::rps::ShortTermRps;
 use crate::yuv::YuvPlanes;
+use std::sync::Arc;
 
 /// One stored picture and its decode-time metadata.
 pub(crate) struct Frame {
-    pub(crate) planes: YuvPlanes,
-    pub(crate) poc: i32,
-    /// Per-4x4-block motion field in raster order over the coded picture,
-    /// `width4 * height4` entries.
-    pub(crate) motion: Vec<MotionInfo>,
-    pub(crate) width4: usize,
-    pub(crate) height4: usize,
+    pub(crate) picture: Arc<RefFramePlanes>,
     /// Reference-marking state.
     pub(crate) short_term: bool,
     pub(crate) long_term: bool,
@@ -62,9 +57,20 @@ pub(crate) struct Frame {
 
 impl Frame {
     #[inline]
+    pub(crate) fn poc(&self) -> i32 {
+        self.picture.poc
+    }
+
+    #[inline]
     pub(crate) fn is_reference(&self) -> bool {
         self.short_term || self.long_term
     }
+}
+
+pub(crate) struct OutputFrame {
+    pub(crate) planes: YuvPlanes,
+    pub(crate) poc: i32,
+    pub(crate) meta: Option<crate::video::FrameMeta>,
 }
 
 /// A reference picture list entry: an index into the DPB plus whether it is a
@@ -163,18 +169,18 @@ impl Dpb {
 
     /// Run the Annex C output process before decoding the next picture. RPS
     /// marking has already released references not needed by that picture.
-    pub(crate) fn bump_before_decode(&mut self) -> Vec<Frame> {
+    pub(crate) fn bump_before_decode(&mut self) -> Vec<OutputFrame> {
         self.bump_before_picture(true)
     }
 
     /// At a new CVS, reference-capacity pressure is resolved by the impending
     /// reference reset. Only reorder/latency constraints can make a prior
     /// picture due before no_output_of_prior_pics_flag discards the remainder.
-    pub(crate) fn bump_before_irap(&mut self) -> Vec<Frame> {
+    pub(crate) fn bump_before_irap(&mut self) -> Vec<OutputFrame> {
         self.bump_before_picture(false)
     }
 
-    fn bump_before_picture(&mut self, check_fullness: bool) -> Vec<Frame> {
+    fn bump_before_picture(&mut self, check_fullness: bool) -> Vec<OutputFrame> {
         // RPS marking runs immediately before this process. Purge pictures that
         // it made unused and that were already output before evaluating DPB
         // fullness; counting those dead slots causes premature leading-picture
@@ -207,7 +213,7 @@ impl Dpb {
     fn find_by_poc(&self, poc: i32) -> Option<usize> {
         self.frames
             .iter()
-            .position(|f| f.poc == poc && f.is_reference())
+            .position(|f| f.poc() == poc && f.is_reference())
     }
 
     /// As `apply_rps`, but also marks long-term references. `lt_refs` is the
@@ -253,12 +259,15 @@ impl Dpb {
             let matched = if has_msb && max_poc_lsb > 0 {
                 let cur_lsb = cur_poc.rem_euclid(max_poc_lsb);
                 let poc_lt = cur_poc - delta_cycle * max_poc_lsb - (cur_lsb - val);
-                self.frames.iter().find(|f| f.poc == poc_lt).map(|f| f.poc)
+                self.frames
+                    .iter()
+                    .find(|f| f.poc() == poc_lt)
+                    .map(Frame::poc)
             } else if max_poc_lsb > 0 {
                 self.frames
                     .iter()
-                    .find(|f| f.poc.rem_euclid(max_poc_lsb) == val.rem_euclid(max_poc_lsb))
-                    .map(|f| f.poc)
+                    .find(|f| f.poc().rem_euclid(max_poc_lsb) == val.rem_euclid(max_poc_lsb))
+                    .map(Frame::poc)
             } else {
                 None
             };
@@ -278,14 +287,14 @@ impl Dpb {
             .copied()
             .collect();
         for f in &mut self.frames {
-            if lt_keep.contains(&f.poc) {
+            if lt_keep.contains(&f.poc()) {
                 // Reclassify as a long-term reference.
                 f.long_term = true;
                 f.short_term = false;
-            } else if f.long_term && !lt_keep.contains(&f.poc) {
+            } else if f.long_term && !lt_keep.contains(&f.poc()) {
                 f.long_term = false;
             }
-            if f.short_term && !keep.contains(&f.poc) {
+            if f.short_term && !keep.contains(&f.poc()) {
                 f.short_term = false;
             }
         }
@@ -388,10 +397,9 @@ impl Dpb {
         Ok((list0, list1))
     }
 
-    /// Emit frames that are no longer needed for reference and are due for output
-    /// (POC order). Called after each picture; returns POC-ordered outputs and
-    /// removes them from the DPB. `flush` forces all remaining outputs.
-    pub(crate) fn bump(&mut self, flush: bool) -> Vec<Frame> {
+    /// Emit frames due for output in POC order, retaining those still needed as
+    /// references. `flush` forces all remaining outputs.
+    pub(crate) fn bump(&mut self, flush: bool) -> Vec<OutputFrame> {
         let mut out = Vec::new();
         loop {
             let pending = self.frames.iter().filter(|f| f.needed_for_output).count();
@@ -415,38 +423,28 @@ impl Dpb {
         out
     }
 
-    fn bump_one(&mut self) -> Option<Frame> {
+    fn bump_one(&mut self) -> Option<OutputFrame> {
         let best = self
             .frames
             .iter()
             .enumerate()
             .filter(|(_, f)| f.needed_for_output)
-            .min_by_key(|(_, f)| f.poc)
+            .min_by_key(|(_, f)| f.poc())
             .map(|(i, _)| i)?;
-        self.frames[best].needed_for_output = false;
-        if self.frames[best].is_reference() {
-            Some(self.frames[best].shallow_output())
+        let frame = &mut self.frames[best];
+        frame.needed_for_output = false;
+        let poc = frame.poc();
+        let (planes, meta) = if frame.is_reference() {
+            (frame.picture.planes.clone(), frame.meta.clone())
         } else {
-            Some(self.frames.remove(best))
-        }
-    }
-}
-
-impl Frame {
-    /// Produce an output-only copy of the frame (planes cloned, motion dropped).
-    fn shallow_output(&self) -> Frame {
-        Frame {
-            planes: self.planes.clone(),
-            poc: self.poc,
-            motion: Vec::new(),
-            width4: 0,
-            height4: 0,
-            short_term: false,
-            long_term: false,
-            needed_for_output: false,
-            latency: 0,
-            meta: self.meta.clone(),
-        }
+            let frame = self.frames.remove(best);
+            let planes = match Arc::try_unwrap(frame.picture) {
+                Ok(picture) => picture.planes,
+                Err(picture) => picture.planes.clone(),
+            };
+            (planes, frame.meta)
+        };
+        Some(OutputFrame { planes, poc, meta })
     }
 }
 
@@ -526,19 +524,23 @@ mod tests {
 
     fn frame(poc: i32, short_term: bool, needed_for_output: bool) -> Frame {
         Frame {
-            planes: YuvPlanes {
-                y: vec![poc as u16],
-                cb: Vec::new(),
-                cr: Vec::new(),
-                width: 1,
-                height: 1,
-                chroma: ChromaFormat::Monochrome,
-                bit_depth: BitDepth::Eight,
-            },
-            poc,
-            motion: Vec::new(),
-            width4: 0,
-            height4: 0,
+            picture: Arc::new(RefFramePlanes {
+                poc,
+                planes: YuvPlanes {
+                    y: vec![poc as u16],
+                    cb: Vec::new(),
+                    cr: Vec::new(),
+                    width: 1,
+                    height: 1,
+                    chroma: ChromaFormat::Monochrome,
+                    bit_depth: BitDepth::Eight,
+                },
+                cw: 0,
+                ch: 0,
+                motion: Vec::new(),
+                width4: 0,
+                height4: 0,
+            }),
             short_term,
             long_term: false,
             needed_for_output,
@@ -580,7 +582,21 @@ mod tests {
 
         assert!(dpb.bump_before_decode().is_empty());
         assert_eq!(dpb.frames.len(), 1);
-        assert_eq!(dpb.frames[0].poc, 2);
+        assert_eq!(dpb.frames[0].poc(), 2);
+    }
+
+    #[test]
+    fn output_copies_a_retained_reference_and_moves_a_retired_picture() {
+        let mut dpb = Dpb::new(2);
+        dpb.push(frame(1, true, true));
+        let retired = frame(2, false, true);
+        let retired_luma = retired.picture.planes.y.as_ptr();
+        dpb.push(retired);
+
+        let mut out = dpb.bump(true);
+        out[0].planes.y[0] = 9;
+        assert_eq!(dpb.frames[0].picture.planes.y, [1]);
+        assert_eq!(out[1].planes.y.as_ptr(), retired_luma);
     }
 
     #[test]

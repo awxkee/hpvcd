@@ -119,39 +119,6 @@ fn store_u16x2(dst: &mut [u16], v: __m128i) {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn x_lanes8(base: usize) -> __m256i {
-    _mm256_add_epi32(
-        _mm256_set1_epi32(base as i32),
-        _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 8),
-    )
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-fn nx_lanes8(n: usize, base: usize) -> __m256i {
-    _mm256_sub_epi32(
-        _mm256_set1_epi32((n - 1 - base) as i32),
-        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-    )
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-fn mul_const(v: __m256i, c: i32) -> __m256i {
-    _mm256_mullo_epi32(v, _mm256_set1_epi32(c))
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-fn round_shift_s32x8(v: __m256i, add: i32, shift: i32) -> __m256i {
-    _mm256_sra_epi32(
-        _mm256_add_epi32(v, _mm256_set1_epi32(add)),
-        _mm_cvtsi32_si128(shift),
-    )
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
 fn clip_s32x8(v: __m256i, max_v: __m256i) -> __m256i {
     _mm256_min_epi32(_mm256_max_epi32(v, _mm256_setzero_si256()), max_v)
 }
@@ -201,24 +168,17 @@ fn store_i32x16_as_u16(dst: &mut [u16], lo: __m256i, hi: __m256i, max_v: __m256i
 
 #[inline]
 #[target_feature(enable = "avx2")]
-#[allow(clippy::too_many_arguments)]
 fn planar8_avx2(
     above: __m256i,
     x: usize,
-    n: usize,
-    left_y: i32,
-    tr: i32,
-    bl_part: i32,
-    ny: i32,
-    add: i32,
-    shift: i32,
+    row_ramp: __m256i,
+    slope: i32,
+    above_weight: __m256i,
+    shift: __m128i,
 ) -> __m256i {
-    let h = _mm256_add_epi32(
-        _mm256_mullo_epi32(nx_lanes8(n, x), _mm256_set1_epi32(left_y)),
-        mul_const(x_lanes8(x), tr),
-    );
-    let v = _mm256_add_epi32(mul_const(above, ny), _mm256_set1_epi32(bl_part));
-    round_shift_s32x8(_mm256_add_epi32(h, v), add, shift)
+    let horizontal = _mm256_add_epi32(row_ramp, _mm256_set1_epi32(x as i32 * slope));
+    let vertical = _mm256_mullo_epi32(above, above_weight);
+    _mm256_sra_epi32(_mm256_add_epi32(horizontal, vertical), shift)
 }
 
 #[inline]
@@ -230,74 +190,45 @@ fn store_planar_row_avx2(
     tr: i32,
     bl: i32,
     y: usize,
-    n: usize,
+    shift: __m128i,
 ) {
-    let shift = n.trailing_zeros() as i32 + 1;
-    let add = n as i32;
-    let ny = (n - 1 - y) as i32;
-    let bl_part = (y + 1) as i32 * bl;
-
-    if n == 2 {
-        let a = load_u16x4_as_i32x8(&above[1..]);
-        let v = planar8_avx2(a, 0, n, left_y, tr, bl_part, ny, add, shift);
-        store_i32x2_as_u16(out, v, _mm256_set1_epi32(i32::MAX));
-        return;
-    }
-
-    if n == 4 {
-        let a = load_u16x8_as_i32x8(&above[1..]);
-        let v = planar8_avx2(a, 0, n, left_y, tr, bl_part, ny, add, shift);
-        store_i32x4_as_u16(out, v, _mm256_set1_epi32(i32::MAX));
-        return;
-    }
+    let n = out.len();
+    let slope = tr - left_y;
+    // Expand (n - 1 - x) * left + (x + 1) * top_right into
+    // n * left + (x + 1) * slope. Include the bottom-left term and
+    // rounding bias in the base, so the horizontal ramp is built once.
+    let row_base = (n as i32) * (left_y + 1) + (y + 1) as i32 * bl;
+    let row_ramp = _mm256_add_epi32(
+        _mm256_set1_epi32(row_base),
+        _mm256_mullo_epi32(
+            _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 8),
+            _mm256_set1_epi32(slope),
+        ),
+    );
+    let above_weight = _mm256_set1_epi32((n - 1 - y) as i32);
 
     let above_row = &above[1..1 + n];
-    let (above16, above_rem) = above_row.as_chunks::<16>();
-    let (out16, out_rem) = out[..n].as_chunks_mut::<16>();
+    let (above16, _) = above_row.as_chunks::<16>();
+    let (out16, _) = out[..n].as_chunks_mut::<16>();
     for (block, (a, dst)) in above16.iter().zip(out16.iter_mut()).enumerate() {
         let x = block * 16;
         let lo = planar8_avx2(
             load_u16x8_as_i32x8(&a[..]),
             x,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         let hi = planar8_avx2(
             load_u16x8_as_i32x8(&a[8..]),
             x + 8,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         store_i32x16_as_u16(dst, lo, hi, _mm256_set1_epi32(i32::MAX));
-    }
-
-    let x8_base = above16.len() * 16;
-    let (above8, _) = above_rem.as_chunks::<8>();
-    let (out8, _) = out_rem.as_chunks_mut::<8>();
-    for (block, (a, dst)) in above8.iter().zip(out8.iter_mut()).enumerate() {
-        let x = x8_base + block * 8;
-        let v = planar8_avx2(
-            load_u16x8_as_i32x8(&a[..]),
-            x,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
-            shift,
-        );
-        store_i32x8_as_u16(dst, v, _mm256_set1_epi32(i32::MAX));
     }
 }
 
@@ -745,16 +676,68 @@ fn predict_angular_avx2(
 }
 
 #[target_feature(enable = "avx2")]
+fn predict_planar_small_avx2<const N: usize>(above: &[u16], left: &[u16], out: &mut [u16]) {
+    let tr = i32::from(above[N + 1]);
+    let bl = i32::from(left[N + 1]);
+    let (rows, _) = out[..N * N].as_chunks_mut::<N>();
+    for (y, row) in rows.iter_mut().enumerate() {
+        let left = i32::from(left[y + 1]);
+        let slope = tr - left;
+        let base = N as i32 * (left + 1) + (y + 1) as i32 * bl;
+        let above_weight = (N - 1 - y) as i32;
+        if N == 8 {
+            let a = load_u16x8_as_i32x8(&above[1..]);
+            let lanes = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+            let horizontal = _mm256_add_epi32(
+                _mm256_set1_epi32(base),
+                _mm256_mullo_epi32(lanes, _mm256_set1_epi32(slope)),
+            );
+            let vertical = _mm256_mullo_epi32(a, _mm256_set1_epi32(above_weight));
+            let value = _mm256_srai_epi32::<4>(_mm256_add_epi32(horizontal, vertical));
+            store_u16x8(row, pack_i32x8_to_u16x8(value));
+        } else {
+            let a = _mm_cvtepu16_epi32(load_u16x4(&above[1..]));
+            let lanes = _mm_setr_epi32(1, 2, 3, 4);
+            let horizontal = _mm_add_epi32(
+                _mm_set1_epi32(base),
+                _mm_mullo_epi32(lanes, _mm_set1_epi32(slope)),
+            );
+            let vertical = _mm_mullo_epi32(a, _mm_set1_epi32(above_weight));
+            let value = _mm_add_epi32(horizontal, vertical);
+            if N == 2 {
+                store_u16x2(
+                    row,
+                    _mm_packus_epi32(_mm_srai_epi32::<2>(value), _mm_setzero_si128()),
+                );
+            } else {
+                store_u16x4(
+                    row,
+                    _mm_packus_epi32(_mm_srai_epi32::<3>(value), _mm_setzero_si128()),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
 fn predict_planar_avx2(above: &[u16], left: &[u16], n: usize, out: &mut [u16]) {
     debug_assert!(supported_n(n));
     debug_assert!(above.len() > 2 * n);
     debug_assert!(left.len() > 2 * n);
     debug_assert!(out.len() >= n * n);
 
-    let tr = above[n + 1] as i32;
-    let bl = left[n + 1] as i32;
+    match n {
+        2 => return predict_planar_small_avx2::<2>(above, left, out),
+        4 => return predict_planar_small_avx2::<4>(above, left, out),
+        8 => return predict_planar_small_avx2::<8>(above, left, out),
+        _ => {}
+    }
+
+    let tr = i32::from(above[n + 1]);
+    let bl = i32::from(left[n + 1]);
+    let shift = _mm_cvtsi32_si128(n.trailing_zeros() as i32 + 1);
     for (y, row) in out[..n * n].chunks_exact_mut(n).enumerate() {
-        store_planar_row_avx2(row, above, left[y + 1] as i32, tr, bl, y, n);
+        store_planar_row_avx2(row, above, i32::from(left[y + 1]), tr, bl, y, shift);
     }
 }
 
@@ -858,6 +841,39 @@ pub(crate) fn predict_into_avx2(
             26 => predict_mode26_avx2(above, left, n, is_luma, bit_depth, out),
             2..=34 => predict_angular_avx2(mode, above, left, n, bit_depth, out, refs_ang),
             _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PLANAR, predict_into_avx2};
+    use crate::intra::predict_into_scalar;
+
+    #[test]
+    fn planar_ramp_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let ramp: [u16; 65] = std::array::from_fn(|i| (i * 8_341 + 19) as u16);
+        let inverse = ramp.map(|sample| u16::MAX - sample);
+        let black = [0; 65];
+        let white = [u16::MAX; 65];
+        let refs = [&ramp, &inverse, &black, &white];
+        let mut expected = [0u16; 32 * 32];
+        let mut actual = [0u16; 32 * 32];
+        let mut tmp = [0; 3 * 32 + 1];
+        for n in [2, 4, 8, 16, 32] {
+            for above in refs {
+                for left in refs {
+                    let above = &above[..2 * n + 1];
+                    let left = &left[..2 * n + 1];
+                    predict_into_scalar(PLANAR, above, left, n, true, 16, &mut expected, &mut tmp);
+                    predict_into_avx2(PLANAR, above, left, n, true, 16, &mut actual, &mut tmp);
+                    assert_eq!(&actual[..n * n], &expected[..n * n], "size {n}");
+                }
+            }
         }
     }
 }

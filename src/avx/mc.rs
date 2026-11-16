@@ -75,9 +75,15 @@ fn chroma_simd_bounds(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn load_u16x8_i32(src: &[u16]) -> __m256i {
+fn load_u16x8_raw(src: &[u16]) -> __m128i {
     debug_assert!(src.len() >= 8);
-    unsafe { _mm256_cvtepu16_epi32(_mm_loadu_si128(src.as_ptr().cast::<__m128i>())) }
+    unsafe { _mm_loadu_si128(src.as_ptr().cast::<__m128i>()) }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_u16x8_i32(src: &[u16]) -> __m256i {
+    _mm256_cvtepu16_epi32(load_u16x8_raw(src))
 }
 
 #[inline]
@@ -111,12 +117,53 @@ fn store_i16x8(dst: &mut [i16], v: __m256i) {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn conv_u16x8_i32_8tap(src: &[u16], f: &[i32; 8]) -> __m256i {
-    let mut acc = _mm256_setzero_si256();
-    for (i, &c) in f.iter().enumerate() {
-        let s = load_u16x8_i32(&src[i..]);
-        acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(s, _mm256_set1_epi32(c)));
-    }
+fn filter_luma_pairs(filter: &[i32; 8]) -> [__m256i; 4] {
+    std::array::from_fn(|pair| {
+        let tap = pair * 2;
+        let bits = i32::from(filter[tap] as u16) | (i32::from(filter[tap + 1] as u16) << 16);
+        _mm256_set1_epi32(bits)
+    })
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn conv_u16x8_i32_8tap(src: &[u16], f: &[__m256i; 4]) -> __m256i {
+    // Center u16 samples in signed lanes for paired widening multiplies.
+    // HEVC filters sum to 64, so one bias correction restores the unsigned sum.
+    let bias = _mm_set1_epi16(i16::MIN);
+    let first = _mm_xor_si128(load_u16x8_raw(src), bias);
+    let last = _mm_xor_si128(load_u16x8_raw(&src[7..]), bias);
+    // The second load ends at the final tap's last sample. Rotate its
+    // lanes so alignment sees samples 8 and later after the first load.
+    let next = _mm_alignr_epi8::<2>(last, last);
+    let middle = _mm_alignr_epi8::<8>(next, first);
+    let left = _mm256_set_m128i(middle, first);
+    // Each half of the 256-bit value covers four outputs. These lane-local
+    // shuffles interleave samples for taps 0/1 and 2/3 of each window.
+    let pair01 = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9,
+    ));
+    let pair23 = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        4, 5, 6, 7, 6, 7, 8, 9, 8, 9, 10, 11, 10, 11, 12, 13,
+    ));
+    let mut acc = _mm256_set1_epi32(64 * (1 << 15));
+    acc = _mm256_add_epi32(
+        acc,
+        _mm256_madd_epi16(_mm256_shuffle_epi8(left, pair01), f[0]),
+    );
+    acc = _mm256_add_epi32(
+        acc,
+        _mm256_madd_epi16(_mm256_shuffle_epi8(left, pair23), f[1]),
+    );
+    let right = _mm256_set_m128i(next, middle);
+    acc = _mm256_add_epi32(
+        acc,
+        _mm256_madd_epi16(_mm256_shuffle_epi8(right, pair01), f[2]),
+    );
+    acc = _mm256_add_epi32(
+        acc,
+        _mm256_madd_epi16(_mm256_shuffle_epi8(right, pair23), f[3]),
+    );
     acc
 }
 
@@ -149,9 +196,10 @@ fn copy_scaled_row_avx2(src: &[u16], dst: &mut [i16], s1: i32) {
 #[target_feature(enable = "avx2")]
 fn filter_h_8tap_row_avx2(src: &[u16], dst: &mut [i16], f: &[i32; 8], s1: i32) {
     let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let pairs = filter_luma_pairs(f);
     for (chunk_idx, dst) in dst8.iter_mut().enumerate() {
         let x = chunk_idx * 8;
-        store_i16x8(dst, shr_s32(conv_u16x8_i32_8tap(&src[x..], f), s1));
+        store_i16x8(dst, shr_s32(conv_u16x8_i32_8tap(&src[x..], &pairs), s1));
     }
     let x0 = dst8.len() * 8;
     for (x, out) in dst_tail.iter_mut().enumerate() {
@@ -187,9 +235,10 @@ fn filter_h_4tap_row_avx2(src: &[u16], dst: &mut [i16], f: &[i32; 4], s1: i32) {
 #[target_feature(enable = "avx2")]
 fn filter_h_8tap_tmp_row_avx2(src: &[u16], dst: &mut [i32], f: &[i32; 8], s1: i32) {
     let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let pairs = filter_luma_pairs(f);
     for (chunk_idx, dst) in dst8.iter_mut().enumerate() {
         let x = chunk_idx * 8;
-        store_i32x8(dst, shr_s32(conv_u16x8_i32_8tap(&src[x..], f), s1));
+        store_i32x8(dst, shr_s32(conv_u16x8_i32_8tap(&src[x..], &pairs), s1));
     }
     let x0 = dst8.len() * 8;
     for (x, out) in dst_tail.iter_mut().enumerate() {

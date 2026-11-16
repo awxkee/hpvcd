@@ -402,7 +402,7 @@ pub(crate) fn residual_coding(
     transquant_bypass: bool,
     rext: &RextResidual,
     coeffs: &mut [i32],
-) -> (bool, usize, usize, i32, RdpcmDir) {
+) -> (bool, usize, u64, i32, RdpcmDir) {
     let n = 1usize << log2_ts;
     coeffs[..n * n].fill(0);
     let mut max_x = 0usize;
@@ -444,9 +444,7 @@ pub(crate) fn residual_coding(
     }
     // Scan tables
     let sb_w = (n / 4).max(1);
-    let sb_table = scan_tables.table(sb_w, scan_idx); // sub-block grid scan
     let pos_table = scan_tables.table(4, scan_idx); // within 4×4 sub-block
-    let sb_scan = sb_table.order();
     let pos_scan = pos_table.order();
     let sig_ctx_table = scan_tables.sig_ctx_table(log2_ts, scan_idx, is_luma);
     // §9.3.4.2.5 uses one dedicated sig-coeff context for TS/TQB blocks
@@ -457,10 +455,17 @@ pub(crate) fn residual_coding(
         None
     };
 
-    // Find last scan position within its sub-block + which sub-block.
-    let last_sbx = last_x >> 2;
-    let last_sby = last_y >> 2;
-    let last_sb = sb_table.index(last_sbx, last_sby);
+    // When intra coefficients fit in the first group, its position is
+    // independent of the scan and no group grid lookup is needed.
+    let single_group = !rext.is_inter && (last_x | last_y) < 4;
+    let sb_scan: &[(usize, usize)] = if single_group {
+        &[(0, 0)]
+    } else {
+        let sb_table = scan_tables.table(sb_w, scan_idx);
+        let last_sb = sb_table.index(last_x >> 2, last_y >> 2);
+        &sb_table.order()[..=last_sb]
+    };
+    let last_sb = sb_scan.len() - 1;
     let last_in_sb = pos_table.index(last_x & 3, last_y & 3);
 
     // Coded-sub-block flags fit in one u64 (the grid is at most 8×8).
@@ -468,7 +473,7 @@ pub(crate) fn residual_coding(
     let mut c1_carry = 1i32; // greater1 ctx carried across sub-blocks
     let mut first_subblock = true;
 
-    for (i, &(sbx, sby)) in sb_scan[..=last_sb].iter().enumerate().rev() {
+    for (i, &(sbx, sby)) in sb_scan.iter().enumerate().rev() {
         let sb_grid = sbx + sby * sb_w;
         let right = if sbx + 1 < sb_w {
             ((csbf >> (sb_grid + 1)) & 1) as u8
@@ -496,49 +501,30 @@ pub(crate) fn residual_coding(
             continue;
         }
 
-        let scan_top = if i == last_sb { last_in_sb } else { 15 };
-
-        // Store both the coefficient destination and the 4×4 scan position in
-        // one compact entry.  Entries remain in high→low scan order.
-        let mut sig_entries = [0u16; 16];
-        let mut sig_len = 0usize;
-        if i == last_sb {
-            let coeff_index = last_y * n + last_x;
-            sig_entries[0] = ((coeff_index as u16) << 4) | last_in_sb as u16;
-            sig_len = 1;
-        }
-        let start = if i == last_sb {
-            last_in_sb.checked_sub(1)
+        // Decode flags from high to low so each bit ends up at its scan
+        // position. The last coefficient is already known to be significant.
+        let (flag_count, mut sig_mask) = if i == last_sb {
+            (last_in_sb, 1u16)
         } else {
-            Some(scan_top)
+            (16, 0u16)
         };
-        if let Some(start) = start {
+        if flag_count != 0 {
             let sig_ctx =
                 forced_sig_ctx.unwrap_or_else(|| sig_ctx_table.subblock(sb_grid, prev_csbf));
-            let coeff_base = 4 * (sby * n + sbx);
-            for (k, (&(px, py), &ci)) in pos_scan[..=start]
-                .iter()
-                .zip(&sig_ctx[..=start])
-                .enumerate()
-                .rev()
-            {
-                let significant = (k == 0 && infer_dc && sig_len == 0)
-                    || dec.decode_bin(&mut ctx.sig_coeff_flag[usize::from(ci)]) != 0;
-
-                // This write is always in-bounds: before each of the at most 16
-                // candidates, sig_len is at most 15.  Advancing conditionally
-                // avoids the unpredictable append branch from the old loop.
-                let coeff_index = coeff_base + py * n + px;
-                sig_entries[sig_len] = ((coeff_index as u16) << 4) | k as u16;
-                sig_len += significant as usize;
+            for &ci in sig_ctx[1..flag_count].iter().rev() {
+                let significant = dec.decode_bin(&mut ctx.sig_coeff_flag[usize::from(ci)]);
+                sig_mask = (sig_mask << 1) | u16::from(significant);
             }
+            let dc_significant = (infer_dc && sig_mask == 0)
+                || dec.decode_bin(&mut ctx.sig_coeff_flag[usize::from(sig_ctx[0])]) != 0;
+            sig_mask = (sig_mask << 1) | u16::from(dc_significant);
         }
-        if sig_len == 0 {
+        if sig_mask == 0 {
             continue;
         }
-        let sig_entries = &sig_entries[..sig_len];
-        let last_sig_pos = usize::from(sig_entries[0] & 15); // highest k
-        let first_sig_pos = usize::from(sig_entries[sig_len - 1] & 15); // lowest k
+        let sig_len = sig_mask.count_ones() as usize;
+        let last_sig_pos = u16::BITS - 1 - sig_mask.leading_zeros();
+        let first_sig_pos = sig_mask.trailing_zeros();
         // ── greater1 ──
         let mut ctx_set: i32 = if i == 0 || !is_luma { 0 } else { 2 };
         if !first_subblock && c1_carry == 0 {
@@ -587,7 +573,7 @@ pub(crate) fn residual_coding(
         // the arithmetic offset before coeff_abs_level_remaining.
         let rdpcm_active = rdpcm.is_some() || (transform_skip && rext.implicit_rdpcm);
         let sign_hidden = sign_data_hiding
-            && (last_sig_pos as i32 - first_sig_pos as i32) > 3
+            && last_sig_pos - first_sig_pos > 3
             && !transquant_bypass
             && !rdpcm_active;
 
@@ -595,7 +581,7 @@ pub(crate) fn residual_coding(
         // all coded signs form one contiguous bypass run.  Reverse once to make
         // bit j correspond directly to significant entry j.
         let sign_count = sig_len - sign_hidden as usize;
-        let coded_signs = dec.decode_bypass_bits(sign_count as u32) as u16;
+        let coded_signs = dec.decode_coeff_signs(sign_count as u32, !rext.is_inter) as u16;
         let sign_mask = if sign_count == 0 {
             0
         } else {
@@ -613,7 +599,10 @@ pub(crate) fn residual_coding(
         };
         let mut first_rem_in_sb = true;
         let mut abs_parity = 0i32;
-        for (j, &entry) in sig_entries.iter().enumerate() {
+        let coeff_base = 4 * (sby * n + sbx);
+        for j in 0..sig_len {
+            let pos = u16::BITS - 1 - sig_mask.leading_zeros();
+            sig_mask ^= 1 << pos;
             let g1 = ((gr1_mask >> j) & 1) as i32;
             let has_gr2 = j == first_gr1_idx;
             let base = 1 + g1 + (has_gr2 && gr2) as i32;
@@ -652,8 +641,9 @@ pub(crate) fn residual_coding(
             let level = base + rem as i32;
             max_abs_level = max_abs_level.max(level);
 
-            let coeff_index = usize::from(entry >> 4);
-            let xc = coeff_index & (n - 1);
+            let (px, py) = pos_scan[pos as usize];
+            let coeff_index = coeff_base + py * n + px;
+            let xc = 4 * sbx + px;
             let negative = ((sign_mask >> j) & 1) != 0;
             coeffs[coeff_index] = if negative { -level } else { level };
             max_x = max_x.max(xc);
@@ -662,7 +652,8 @@ pub(crate) fn residual_coding(
 
         // Resolve hidden sign by parity.
         if sign_hidden {
-            let coeff_index = usize::from(sig_entries[sig_len - 1] >> 4);
+            let (px, py) = pos_scan[first_sig_pos as usize];
+            let coeff_index = coeff_base + py * n + px;
             let coeff = &mut coeffs[coeff_index];
             *coeff = if abs_parity != 0 {
                 -coeff.abs()
@@ -672,5 +663,5 @@ pub(crate) fn residual_coding(
         }
     }
 
-    (transform_skip, max_x, last_y, max_abs_level, rdpcm)
+    (transform_skip, max_x, csbf, max_abs_level, rdpcm)
 }

@@ -505,30 +505,26 @@ fn inv_dct_n_into<const N: usize, S: Coeff>(
     let clip_max = (1i32 << max_log2_tr_dynamic_range) - 1;
     // Extended precision raises the normative transform range above i16, so
     // the scalar reference path keeps the complete stage-1 result in i32.
-    let mut tmp = [0i32; 32 * 32];
+    let mut tmp = [[0i32; N]; N];
 
     // Columns >= nx are all-zero on input, so their stage-1 output stays zero in tmp.
     let nx = nx.min(N);
     for c in 0..nx {
         let col: [i32; N] = std::array::from_fn(|k| coeff[k * N + c].to_i32());
         let raw = idct_raw::<N>(col);
-        for (m, &raw) in raw.iter().enumerate() {
-            tmp[m * N + c] = ((raw + add1) >> shift1).clamp(clip_min, clip_max);
+        for (row, raw) in tmp.iter_mut().zip(raw) {
+            row[c] = ((raw + add1) >> shift1).clamp(clip_min, clip_max);
         }
     }
 
-    for (tmp_row, out_row) in tmp
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<N>().0.iter_mut())
-    {
-        let row: [i32; N] = std::array::from_fn(|k| tmp_row[k]);
-        let raw = idct_raw::<N>(row);
+    let out_rows = out.as_chunks_mut::<N>().0;
+    for (tmp_row, out_row) in tmp.iter().zip(out_rows.iter_mut()) {
+        let raw = idct_raw::<N>(*tmp_row);
         for (dst, &raw) in out_row.iter_mut().zip(raw.iter()) {
             *dst = S::from_i32((raw + add2) >> shift2);
         }
     }
+    clear_transform_tail(out_rows);
 }
 
 #[inline]
@@ -548,7 +544,7 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
     let clip_min = -(1i32 << max_log2_tr_dynamic_range);
     let clip_max = (1i32 << max_log2_tr_dynamic_range) - 1;
 
-    let mut tmp = [0i32; 32 * 32];
+    let mut tmp = [[0i32; N]; N];
     let mut acc = [0i32; N];
 
     let nx = nx.min(N);
@@ -564,17 +560,13 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
                 *acc += tm * ck;
             }
         }
-        for (m, &acc) in acc[..N].iter().enumerate() {
-            tmp[m * N + c] = ((acc + add1) >> shift1).clamp(clip_min, clip_max);
+        for (row, &acc) in tmp.iter_mut().zip(&acc) {
+            row[c] = ((acc + add1) >> shift1).clamp(clip_min, clip_max);
         }
     }
 
-    for (rowv, out_row) in tmp
-        .as_chunks::<N>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<N>().0.iter_mut())
-    {
+    let out_rows = out.as_chunks_mut::<N>().0;
+    for (rowv, out_row) in tmp.iter().zip(out_rows.iter_mut()) {
         acc[..N].fill(0);
         for (&rk, trow) in rowv.iter().zip(t.iter()) {
             if rk == 0 {
@@ -587,6 +579,16 @@ fn inv_transform_n_into<const N: usize, S: Coeff>(
         for (dst, &acc) in out_row.iter_mut().zip(acc[..N].iter()) {
             *dst = S::from_i32((acc + add2) >> shift2);
         }
+    }
+    clear_transform_tail(out_rows);
+}
+
+#[inline]
+fn clear_transform_tail<const N: usize, S: Coeff>(rows: &mut [[S; N]]) {
+    // Preserve the zero-filled complete rows of an oversized output slice.
+    let end = rows.len().min(32 * 32 / N);
+    if end > N {
+        rows[N..end].fill([S::from_i32(0); N]);
     }
 }
 
@@ -683,7 +685,12 @@ impl<'a> ScalingMatrix<'a> {
     }
 
     /// Four coefficients starting at a four-sample-aligned transform position.
-    #[cfg(any(test, all(feature = "neon", target_arch = "aarch64")))]
+    #[cfg(any(
+        test,
+        all(feature = "neon", target_arch = "aarch64"),
+        all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")),
+        all(feature = "avx", target_arch = "x86_64"),
+    ))]
     #[inline]
     pub(crate) fn coeffs4(self, idx: usize) -> [u8; 4] {
         debug_assert_eq!(idx % 4, 0);
@@ -702,6 +709,38 @@ impl<'a> ScalingMatrix<'a> {
                 [if idx == 0 { self.dc } else { a }, a, a, a]
             }
             _ => std::array::from_fn(|lane| self.coeff(idx + lane) as u8),
+        }
+    }
+
+    /// Scale one aligned group of sixteen transform coefficients.
+    #[cfg(any(
+        test,
+        all(feature = "neon", target_arch = "aarch64"),
+        all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")),
+        all(feature = "avx", target_arch = "x86_64"),
+    ))]
+    #[inline(always)]
+    pub(crate) fn factors16(self, idx: usize, base_factor: i64) -> [[i32; 4]; 4] {
+        debug_assert_eq!(idx % 16, 0);
+        let scale = |coeff| (base_factor * i64::from(coeff)) as i32;
+        match self.log2_size {
+            2 | 3 => {
+                let groups = self.coeffs.as_chunks::<16>().0;
+                let coeffs = groups[idx / 16].as_chunks::<4>().0;
+                std::array::from_fn(|group| coeffs[group].map(scale))
+            }
+            4 => {
+                let [a, b, c, d, e, f, g, h] = self.coeffs.as_chunks::<8>().0[idx / 32].map(scale);
+                let first = if idx == 0 { scale(self.dc) } else { a };
+                [[first, a, b, b], [c, c, d, d], [e, e, f, f], [g, g, h, h]]
+            }
+            5 => {
+                let group = (idx / 128) * 2 + (idx % 32) / 16;
+                let [a, b, c, d] = self.coeffs.as_chunks::<4>().0[group].map(scale);
+                let first = if idx == 0 { scale(self.dc) } else { a };
+                [[first, a, a, a], [b; 4], [c; 4], [d; 4]]
+            }
+            _ => std::array::from_fn(|group| self.coeffs4(idx + group * 4).map(scale)),
         }
     }
 
@@ -1185,11 +1224,14 @@ pub(crate) type InvTransformFn = fn(&[i32], usize, u8, usize, &mut [i32]);
 pub(crate) type InvTransform4Fn = fn(&[i32], u8, &mut [i32]);
 pub(crate) type InvTransformFn16 = fn(&[i16], usize, u8, usize, &mut [i16]);
 pub(crate) type InvTransform4Fn16 = fn(&[i16], u8, &mut [i16]);
+pub(crate) type InvTransformCoded32Fn16 = fn(&[i16], u8, usize, u64, &mut [i16]);
 
 static INV_TRANSFORM: std::sync::OnceLock<InvTransformFn> = std::sync::OnceLock::new();
 static INV_TRANSFORM_DST4: std::sync::OnceLock<InvTransform4Fn> = std::sync::OnceLock::new();
 static INV_TRANSFORM16: std::sync::OnceLock<InvTransformFn16> = std::sync::OnceLock::new();
 static INV_TRANSFORM_DST4_16: std::sync::OnceLock<InvTransform4Fn16> = std::sync::OnceLock::new();
+static INV_TRANSFORM_CODED32_16: std::sync::OnceLock<Option<InvTransformCoded32Fn16>> =
+    std::sync::OnceLock::new();
 
 #[inline]
 pub(crate) fn resolve_inv_transform() -> InvTransformFn {
@@ -1272,6 +1314,31 @@ pub(crate) fn resolve_inv_transform16() -> InvTransformFn16 {
         }
 
         _f
+    })
+}
+
+#[inline]
+pub(crate) fn resolve_inv_transform_coded32_16() -> Option<InvTransformCoded32Fn16> {
+    *INV_TRANSFORM_CODED32_16.get_or_init(|| {
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            Some(crate::neon::inv_transform_coded32_into_neon16)
+        }
+
+        #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
+        {
+            #[cfg(all(feature = "avx", target_arch = "x86_64"))]
+            if std::is_x86_feature_detected!("avx2") {
+                return Some(crate::avx::inv_transform_coded32_into_avx2_16);
+            }
+
+            #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+            if std::is_x86_feature_detected!("sse4.1") {
+                return Some(crate::sse::inv_transform_coded32_into_sse41_16);
+            }
+
+            None
+        }
     })
 }
 
@@ -1385,7 +1452,8 @@ mod tests {
         dequantize_transform_skip_into_scalar_i32,
         dequantize_transform_skip_scaled_into_scalar_i16,
         dequantize_transform_skip_scaled_into_scalar_i32, inv_transform_into_scalar_extended,
-        max_log2_transform_dynamic_range, transform_skip_params,
+        inv_transform_into_scalar16, max_log2_transform_dynamic_range,
+        resolve_inv_transform_coded32_16, resolve_inv_transform16, transform_skip_params,
     };
 
     const SCALING_COEFFS: [u8; 64] = [
@@ -1406,6 +1474,32 @@ mod tests {
 
     fn max_abs_level(levels: &[i32]) -> i32 {
         levels.iter().map(|v| v.abs()).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn scalar_inverse_transforms_preserve_oversized_output_rows() {
+        let coeff = [17; 16];
+        for dst_only in [false, true] {
+            let run = |out: &mut [i32]| {
+                if dst_only {
+                    super::inv_transform_dst_into_scalar_extended(&coeff, 12, out);
+                } else {
+                    inv_transform_into_scalar_extended(&coeff, 4, 12, 4, out);
+                }
+            };
+            let mut block = [1; 16];
+            let mut partial = [1; 23];
+            let mut oversized = [1; 1027];
+            run(&mut block);
+            run(&mut partial);
+            run(&mut oversized);
+            assert_eq!(&partial[..16], &block);
+            assert_eq!(&partial[16..20], &[0; 4]);
+            assert_eq!(&partial[20..], &[1; 3]);
+            assert_eq!(&oversized[..16], &block);
+            assert!(oversized[16..1024].iter().all(|&v| v == 0));
+            assert_eq!(&oversized[1024..], &[1; 3]);
+        }
     }
 
     #[test]
@@ -1470,6 +1564,67 @@ mod tests {
                 let expected = std::array::from_fn(|lane| scaling.coeff(idx + lane) as u8);
                 assert_eq!(scaling.coeffs4(idx), expected, "{n}x{n}, index {idx}");
             }
+            let base_factor = 51 << 8;
+            for idx in (0..n * n).step_by(16) {
+                let expected = std::array::from_fn(|group| {
+                    std::array::from_fn(|lane| {
+                        (base_factor * scaling.coeff(idx + group * 4 + lane)) as i32
+                    })
+                });
+                assert_eq!(
+                    scaling.factors16(idx, base_factor),
+                    expected,
+                    "{n}x{n}, index {idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coded_32x32_transform_matches_full_transform() {
+        let Some(transform) = resolve_inv_transform_coded32_16() else {
+            return;
+        };
+        let dense_transform = resolve_inv_transform16();
+        let masks = (0..64).map(|group| 1u64 << group).chain([
+            0,
+            u64::MAX,
+            0x0000_0000_0001_0202,
+            0x8100_1000_0080_0242,
+            0x5500_5500_5500_5500,
+        ]);
+        for groups in masks {
+            let mut coeff = [0i16; 1024];
+            let mut nx = 0;
+            for group in (0..64).filter(|&group| groups & (1 << group) != 0) {
+                let width = 1 + ((group + group / 8) % 4);
+                let x0 = group % 8 * 4;
+                let y0 = group / 8 * 4;
+                nx = nx.max(x0 + width);
+                for y in y0..y0 + 4 {
+                    for x in x0..x0 + width {
+                        coeff[y * 32 + x] = (7_313 * y + 3_973 * x + 1) as i16;
+                    }
+                }
+            }
+            for bit_depth in [8, 10, 12, 16] {
+                let mut expected = [0i16; 1024];
+                let mut actual = [i16::MIN; 1025];
+                if bit_depth == 8 {
+                    inv_transform_into_scalar16(&coeff, 32, bit_depth, nx, &mut expected);
+                } else {
+                    // The decoder uses i16 only through 8-bit. At higher depths,
+                    // compare the two SIMD paths with the same saturating stores.
+                    dense_transform(&coeff, 32, bit_depth, nx, &mut expected);
+                }
+                transform(&coeff, bit_depth, nx, groups, &mut actual);
+                assert_eq!(
+                    &actual[..1024],
+                    &expected,
+                    "groups {groups:#x}, depth {bit_depth}"
+                );
+                assert_eq!(actual[1024], i16::MIN);
+            }
         }
     }
 
@@ -1486,8 +1641,7 @@ mod tests {
     ) {
         let scaling = ScalingMatrix::new(&SCALING_COEFFS, 16, 4, false);
 
-        // Every SIMD implementation is a 4x4 kernel. Exercise both its normal
-        // multiply path and its overflow-safe path against the scalar oracle.
+        // Exercise both the normal multiply and overflow-safe paths.
         for bit_depth in [8u8, 10, 12] {
             let max_qp_prime = 51 + 6 * (i32::from(bit_depth) - 8);
             for qp_prime in [0, max_qp_prime / 2, max_qp_prime] {
@@ -1644,16 +1798,44 @@ mod tests {
             }
         }
 
-        // RExt permits transform skip beyond 4x4. SIMD entry points must route
-        // those sizes to the generic implementation rather than processing only
-        // the first vector/block. Verify every output sample for all legal sizes.
         for n in [8usize, 16, 32] {
+            let scaling = ScalingMatrix::new(&SCALING_COEFFS, 209, n, false);
+            let mut expected32 = vec![0i32; n * n];
+            let mut actual32 = vec![i32::MIN; n * n];
+            let mut expected16 = vec![0i16; n * n];
+            let mut actual16 = vec![i16::MIN; n * n];
+
+            for (qp_prime, stress) in [(23, false), (75, true)] {
+                let levels = levels(n * n, stress);
+                let max_abs = max_abs_level(&levels);
+                let params = dequant_params(n, qp_prime, 12, false);
+                dequantize_scaled_into_scalar_i32(
+                    &levels,
+                    n,
+                    params,
+                    scaling,
+                    max_abs,
+                    &mut expected32,
+                );
+                dequantize_scaled_into_scalar_i16(
+                    &levels,
+                    n,
+                    params,
+                    scaling,
+                    max_abs,
+                    &mut expected16,
+                );
+                dequant_scaled(&levels, n, params, scaling, max_abs, &mut actual32);
+                dequant_scaled16(&levels, n, params, scaling, max_abs, &mut actual16);
+                assert_eq!(actual32, expected32, "{backend} {n}x{n} scaled i32");
+                assert_eq!(actual16, expected16, "{backend} {n}x{n} scaled i16");
+            }
+
+            // RExt permits transform skip beyond 4x4 via the generic path.
             let levels = levels(n * n, true);
             let max_abs = max_abs_level(&levels);
             let params = transform_skip_params(n, 75, 12, false);
 
-            let mut expected32 = vec![0i32; n * n];
-            let mut actual32 = vec![i32::MIN; n * n];
             dequantize_transform_skip_into_scalar_i32(&levels, n, params, max_abs, &mut expected32);
             dequant_skip(&levels, n, params, max_abs, &mut actual32);
             assert_eq!(
@@ -1661,8 +1843,6 @@ mod tests {
                 "{backend} {n}x{n} TS fallback mismatch"
             );
 
-            let mut expected16 = vec![0i16; n * n];
-            let mut actual16 = vec![i16::MIN; n * n];
             dequantize_transform_skip_into_scalar_i16(&levels, n, params, max_abs, &mut expected16);
             dequant_skip16(&levels, n, params, max_abs, &mut actual16);
             assert_eq!(

@@ -307,10 +307,10 @@ pub(crate) struct RefPlane<'a> {
 
 impl<'a> RefPlane<'a> {
     #[inline]
-    pub(crate) fn sample(&self, x: isize, y: isize) -> i32 {
-        let xc = x.clamp(0, self.width as isize - 1) as usize;
+    fn row(&self, y: isize) -> &[u16] {
         let yc = y.clamp(0, self.height as isize - 1) as usize;
-        self.data[yc * self.stride + xc] as i32
+        let start = yc * self.stride;
+        &self.data[start..start + self.width]
     }
 }
 
@@ -344,9 +344,7 @@ pub(crate) fn interp_in_bounds(
     x_min >= 0 && y_min >= 0 && x_max <= r.width as isize && y_max <= r.height as isize
 }
 
-/// Luma fractional interpolation of a `w x h` block at integer position
-/// `(x0, y0)` with quarter-pel fraction `(fx, fy)` into `dst` (16-bit
-/// intermediate, stride = w). Follows the separable H-then-V approach.
+/// Luma fractional interpolation at quarter-pel precision.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn luma_interp_scalar_scratch(
     r: &RefPlane,
@@ -360,84 +358,21 @@ pub(crate) fn luma_interp_scalar_scratch(
     dst: &mut [i16],
     tmp: &mut Vec<i32>,
 ) {
-    let s1 = shift1(bd);
-    let dst = &mut dst[..w * h];
-
-    if fx == 0 && fy == 0 {
-        for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-            let sy = y0 + y as isize;
-            for (x, out) in dst_row.iter_mut().enumerate() {
-                let v = r.sample(x0 + x as isize, sy) << 6 >> s1;
-                *out = v as i16;
-            }
-        }
-        return;
-    }
-
-    let hf = &LUMA_FILTER[fx];
-    let vf = &LUMA_FILTER[fy];
-
-    if fy == 0 {
-        for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-            let sy = y0 + y as isize;
-            for (x, out) in dst_row.iter_mut().enumerate() {
-                let sx = x0 + x as isize - 3;
-                let acc = hf
-                    .iter()
-                    .enumerate()
-                    .fold(0i32, |acc, (t, &c)| acc + c * r.sample(sx + t as isize, sy));
-                *out = (acc >> s1) as i16;
-            }
-        }
-        return;
-    }
-
-    if fx == 0 {
-        for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-            let sy = y0 + y as isize - 3;
-            for (x, out) in dst_row.iter_mut().enumerate() {
-                let sx = x0 + x as isize;
-                let acc = vf
-                    .iter()
-                    .enumerate()
-                    .fold(0i32, |acc, (t, &c)| acc + c * r.sample(sx, sy + t as isize));
-                *out = (acc >> s1) as i16;
-            }
-        }
-        return;
-    }
-
-    // Separable: horizontal into scratch of height h+7, then vertical.
-    let tmp_h = h + 7;
-    tmp.clear();
-    tmp.resize(w * tmp_h, 0);
-    let tmp = &mut tmp[..w * tmp_h];
-    for (ty, tmp_row) in tmp.chunks_exact_mut(w).enumerate() {
-        let sy = y0 + ty as isize - 3;
-        for (x, out) in tmp_row.iter_mut().enumerate() {
-            let sx = x0 + x as isize - 3;
-            let acc = hf
-                .iter()
-                .enumerate()
-                .fold(0i32, |acc, (t, &c)| acc + c * r.sample(sx + t as isize, sy));
-            *out = acc >> s1;
-        }
-    }
-
-    let vshift = 6u32;
-    for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-        let tmp_rows = &tmp[y * w..(y + 8) * w];
-        for (x, out) in dst_row.iter_mut().enumerate() {
-            let acc = tmp_rows
-                .chunks_exact(w)
-                .zip(vf.iter())
-                .fold(0i32, |acc, (tmp_row, &c)| acc + c * tmp_row[x]);
-            *out = (acc >> vshift) as i16;
-        }
-    }
+    interp_scalar_scratch(
+        r,
+        x0,
+        y0,
+        (fx != 0).then(|| &LUMA_FILTER[fx]),
+        (fy != 0).then(|| &LUMA_FILTER[fy]),
+        w,
+        h,
+        bd,
+        dst,
+        tmp,
+    );
 }
 
-/// Chroma fractional interpolation (4-tap, eighth-pel fractions).
+/// Chroma fractional interpolation at eighth-pel precision.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chroma_interp_scalar_scratch(
     r: &RefPlane,
@@ -451,78 +386,151 @@ pub(crate) fn chroma_interp_scalar_scratch(
     dst: &mut [i16],
     tmp: &mut Vec<i32>,
 ) {
-    let s1 = shift1(bd);
-    let dst = &mut dst[..w * h];
+    interp_scalar_scratch(
+        r,
+        x0,
+        y0,
+        (fx != 0).then(|| &CHROMA_FILTER[fx]),
+        (fy != 0).then(|| &CHROMA_FILTER[fy]),
+        w,
+        h,
+        bd,
+        dst,
+        tmp,
+    );
+}
 
-    if fx == 0 && fy == 0 {
-        for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-            let sy = y0 + y as isize;
-            for (x, out) in dst_row.iter_mut().enumerate() {
-                let v = r.sample(x0 + x as isize, sy) << 6 >> s1;
-                *out = v as i16;
-            }
-        }
-        return;
+// One CTB-wide chunk and up to seven extra horizontal luma taps.
+const INTERP_CHUNK: usize = 64;
+const INTERP_ROW: usize = INTERP_CHUNK + 7;
+
+#[inline]
+fn extended_row<'a>(src: &'a [u16], x0: isize, pad: &'a mut [u16]) -> &'a [u16] {
+    let start = x0.max(0) as usize;
+    if x0 >= 0
+        && let Some(inside) = src.get(start..start + pad.len())
+    {
+        return inside;
     }
 
-    let hf = &CHROMA_FILTER[fx];
-    let vf = &CHROMA_FILTER[fy];
+    let left = x0.saturating_neg().clamp(0, pad.len() as isize) as usize;
+    let start = start.min(src.len());
+    let count = (src.len() - start).min(pad.len() - left);
+    let (left, rest) = pad.split_at_mut(left);
+    let (inside, right) = rest.split_at_mut(count);
+    left.fill(src[0]);
+    inside.copy_from_slice(&src[start..start + count]);
+    right.fill(src[src.len() - 1]);
+    pad
+}
 
-    if fy == 0 {
-        for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-            let sy = y0 + y as isize;
-            for (x, out) in dst_row.iter_mut().enumerate() {
-                let sx = x0 + x as isize - 1;
-                let acc = hf
-                    .iter()
-                    .enumerate()
-                    .fold(0i32, |acc, (t, &c)| acc + c * r.sample(sx + t as isize, sy));
-                *out = (acc >> s1) as i16;
-            }
-        }
-        return;
-    }
-
-    if fx == 0 {
-        for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-            let sy = y0 + y as isize - 1;
-            for (x, out) in dst_row.iter_mut().enumerate() {
-                let sx = x0 + x as isize;
-                let acc = vf
-                    .iter()
-                    .enumerate()
-                    .fold(0i32, |acc, (t, &c)| acc + c * r.sample(sx, sy + t as isize));
-                *out = (acc >> s1) as i16;
-            }
-        }
-        return;
-    }
-
-    let tmp_h = h + 3;
-    tmp.clear();
-    tmp.resize(w * tmp_h, 0);
-    let tmp = &mut tmp[..w * tmp_h];
-    for (ty, tmp_row) in tmp.chunks_exact_mut(w).enumerate() {
-        let sy = y0 + ty as isize - 1;
-        for (x, out) in tmp_row.iter_mut().enumerate() {
-            let sx = x0 + x as isize - 1;
-            let acc = hf
+#[inline]
+fn filter_horizontal_row<const N: usize, T>(
+    src: &[u16],
+    x0: isize,
+    filter: &[i32; N],
+    pad: &mut [u16; INTERP_ROW],
+    dst: &mut [T],
+    convert: impl Fn(i32) -> T,
+) {
+    for (chunk, out) in dst.chunks_mut(INTERP_CHUNK).enumerate() {
+        let start = x0 + (chunk * INTERP_CHUNK) as isize;
+        let src = extended_row(src, start, &mut pad[..out.len() + N - 1]);
+        for (sample, taps) in out.iter_mut().zip(src.windows(N)) {
+            let acc = taps
                 .iter()
-                .enumerate()
-                .fold(0i32, |acc, (t, &c)| acc + c * r.sample(sx + t as isize, sy));
-            *out = acc >> s1;
+                .zip(filter)
+                .map(|(&p, &c)| i32::from(p) * c)
+                .sum();
+            *sample = convert(acc);
         }
     }
+}
 
-    let vshift = 6u32;
-    for (y, dst_row) in dst.chunks_exact_mut(w).enumerate() {
-        let tmp_rows = &tmp[y * w..(y + 4) * w];
-        for (x, out) in dst_row.iter_mut().enumerate() {
-            let acc = tmp_rows
-                .chunks_exact(w)
-                .zip(vf.iter())
-                .fold(0i32, |acc, (tmp_row, &c)| acc + c * tmp_row[x]);
-            *out = (acc >> vshift) as i16;
+#[inline]
+fn filter_vertical_row<const N: usize, T: Copy + Into<i32>>(
+    rows: [&[T]; N],
+    col: impl Fn(usize) -> usize,
+    filter: &[i32; N],
+    shift: u32,
+    dst: &mut [i16],
+) {
+    for (x, out) in dst.iter_mut().enumerate() {
+        let sx = col(x);
+        let acc: i32 = rows
+            .iter()
+            .zip(filter)
+            .map(|(row, &c)| row[sx].into() * c)
+            .sum();
+        *out = (acc >> shift) as i16;
+    }
+}
+
+/// Separable interpolation into a 14-bit internal-precision prediction.
+#[allow(clippy::too_many_arguments)]
+fn interp_scalar_scratch<const N: usize>(
+    r: &RefPlane,
+    x0: isize,
+    y0: isize,
+    horizontal: Option<&[i32; N]>,
+    vertical: Option<&[i32; N]>,
+    w: usize,
+    h: usize,
+    bd: u8,
+    dst: &mut [i16],
+    tmp: &mut Vec<i32>,
+) {
+    let s1 = shift1(bd);
+    let halo = (N / 2 - 1) as isize;
+    let dst = &mut dst[..w * h];
+    let mut pad = [0; INTERP_ROW];
+
+    match (horizontal, vertical) {
+        (None, None) => {
+            for (y, out) in dst.chunks_exact_mut(w).enumerate() {
+                filter_horizontal_row(r.row(y0 + y as isize), x0, &[64], &mut pad, out, |acc| {
+                    (acc >> s1) as i16
+                });
+            }
+        }
+        (Some(hf), None) => {
+            for (y, out) in dst.chunks_exact_mut(w).enumerate() {
+                filter_horizontal_row(
+                    r.row(y0 + y as isize),
+                    x0 - halo,
+                    hf,
+                    &mut pad,
+                    out,
+                    |acc| (acc >> s1) as i16,
+                );
+            }
+        }
+        (None, Some(vf)) => {
+            for (y, out) in dst.chunks_exact_mut(w).enumerate() {
+                let sy = y0 + y as isize - halo;
+                let rows = std::array::from_fn(|i| r.row(sy + i as isize));
+                let col = |x| (x0 + x as isize).clamp(0, r.width as isize - 1) as usize;
+                filter_vertical_row(rows, col, vf, s1, out);
+            }
+        }
+        (Some(hf), Some(vf)) => {
+            // Every horizontal intermediate is overwritten before the vertical pass.
+            tmp.resize(w * (h + N - 1), 0);
+            for (y, row) in tmp.chunks_exact_mut(w).enumerate() {
+                filter_horizontal_row(
+                    r.row(y0 + y as isize - halo),
+                    x0 - halo,
+                    hf,
+                    &mut pad,
+                    row,
+                    |acc| acc >> s1,
+                );
+            }
+
+            for (y, out) in dst.chunks_exact_mut(w).enumerate() {
+                let rows = std::array::from_fn(|i| &tmp[(y + i) * w..(y + i + 1) * w]);
+                filter_vertical_row(rows, |x| x, vf, 6, out);
+            }
         }
     }
 }
@@ -736,7 +744,117 @@ pub(crate) fn bi_mc_weighted_scalar(
 
 #[cfg(test)]
 mod tests {
-    use super::{bi_mc_weighted_scalar, uni_mc_weighted_scalar};
+    use super::{
+        CHROMA_FILTER, LUMA_FILTER, LumaInterpFn, RefPlane, bi_mc_weighted_scalar,
+        chroma_interp_scalar_scratch, luma_interp_scalar_scratch, shift1, uni_mc_weighted_scalar,
+    };
+
+    fn compare_clamped_interpolation<const N: usize>(interp: LumaInterpFn, filters: &[[i32; N]]) {
+        let halo = (N / 2 - 1) as isize;
+        let mut tmp = vec![i32::MIN; 1024];
+        for (width, height, stride, w, h) in [
+            (19, 14, 23, 7, 5),
+            (1, 1, 2, 3, 2),
+            (73, 11, 78, 67, 4),
+            (N + 7, N + 7, N + 7, 8, 8),
+            // The interior position exercises multiple SIMD chunks and a tail.
+            (81, 18, 86, 67, 8),
+        ] {
+            for bd in [8, 10, 12] {
+                let s1 = shift1(bd);
+                let data: Vec<u16> = (0..stride * height)
+                    .map(|i| (((i * 1877) ^ (i * i * 93)) & ((1 << bd) - 1)) as u16)
+                    .collect();
+                let r = RefPlane {
+                    data: &data,
+                    stride,
+                    width,
+                    height,
+                };
+                let sample = |x: isize, y: isize| {
+                    let x = x.clamp(0, width as isize - 1) as usize;
+                    let y = y.clamp(0, height as isize - 1) as usize;
+                    i32::from(data[y * stride + x])
+                };
+                let positions = [
+                    (-90, -30),
+                    (-4, 4),
+                    (width as isize - 2, -2),
+                    (halo, halo),
+                    (4, 4),
+                    (3, height as isize + 50),
+                    (width as isize + 70, height as isize + 60),
+                ];
+                let mut dst = vec![i16::MIN; w * h];
+                for (x0, y0) in positions {
+                    for (fx, hf) in filters.iter().enumerate() {
+                        for (fy, vf) in filters.iter().enumerate() {
+                            interp(&r, x0, y0, fx, fy, w, h, bd, &mut dst, &mut tmp);
+                            for (index, &actual) in dst.iter().enumerate() {
+                                let x = x0 + (index % w) as isize;
+                                let y = y0 + (index / w) as isize;
+                                let horizontal = |y| {
+                                    let sum: i32 = hf
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &c)| c * sample(x + i as isize - halo, y))
+                                        .sum();
+                                    sum >> s1
+                                };
+                                let vertical = |row: &dyn Fn(isize) -> i32| {
+                                    vf.iter()
+                                        .enumerate()
+                                        .map(|(i, &c)| c * row(y + i as isize - halo))
+                                        .sum::<i32>()
+                                };
+                                let expected = match (fx, fy) {
+                                    (0, 0) => (sample(x, y) << 6) >> s1,
+                                    (_, 0) => horizontal(y),
+                                    (0, _) => vertical(&|y| sample(x, y)) >> s1,
+                                    _ => vertical(&horizontal) >> 6,
+                                };
+                                assert_eq!(
+                                    actual, expected as i16,
+                                    "{N} taps, {bd} bit, ({fx}, {fy}) at ({x}, {y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_interpolation_matches_per_tap_edge_clamping() {
+        compare_clamped_interpolation(luma_interp_scalar_scratch, &LUMA_FILTER);
+        compare_clamped_interpolation(chroma_interp_scalar_scratch, &CHROMA_FILTER);
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_interpolation_matches_per_tap_edge_clamping() {
+        compare_clamped_interpolation(crate::neon::luma_interp_neon, &LUMA_FILTER);
+        compare_clamped_interpolation(crate::neon::chroma_interp_neon, &CHROMA_FILTER);
+    }
+
+    #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn sse41_interpolation_matches_per_tap_edge_clamping() {
+        if std::is_x86_feature_detected!("sse4.1") {
+            compare_clamped_interpolation(crate::sse::luma_interp_sse41, &LUMA_FILTER);
+            compare_clamped_interpolation(crate::sse::chroma_interp_sse41, &CHROMA_FILTER);
+        }
+    }
+
+    #[cfg(all(feature = "avx", target_arch = "x86_64"))]
+    #[test]
+    fn avx2_interpolation_matches_per_tap_edge_clamping() {
+        if std::is_x86_feature_detected!("avx2") {
+            compare_clamped_interpolation(crate::avx::luma_interp_avx2, &LUMA_FILTER);
+            compare_clamped_interpolation(crate::avx::chroma_interp_avx2, &CHROMA_FILTER);
+        }
+    }
 
     #[test]
     fn weighted_uni_consumes_sample_domain_offset() {

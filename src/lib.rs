@@ -1414,9 +1414,9 @@ fn decode_hevc_item_as<O: StillPictureOutput>(
     let first_sub_starts: Vec<usize> = if first.hdr.entry_points.is_empty() {
         Vec::new()
     } else {
-        let src_of = bitreader::rbsp_src_map(&first.source);
+        let offsets = bitreader::RbspOffsetMap::from_nal(&first.source);
         wpp::substream_starts_rbsp_rel(
-            &src_of,
+            &offsets,
             first.hdr.cabac_offset,
             &first.hdr.entry_points,
             first.rbsp.len(),
@@ -1456,9 +1456,9 @@ fn decode_hevc_item_as<O: StillPictureOutput>(
         let sub_starts: Vec<usize> = if segment.hdr.entry_points.is_empty() {
             Vec::new()
         } else {
-            let src_of = bitreader::rbsp_src_map(&segment.source);
+            let offsets = bitreader::RbspOffsetMap::from_nal(&segment.source);
             wpp::substream_starts_rbsp_rel(
-                &src_of,
+                &offsets,
                 segment.hdr.cabac_offset,
                 &segment.hdr.entry_points,
                 segment.rbsp.len(),

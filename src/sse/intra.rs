@@ -83,38 +83,8 @@ fn store_u16x2(dst: &mut [u16], v: __m128i) {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn mul_const(v: __m128i, c: i32) -> __m128i {
-    _mm_mullo_epi32(v, _mm_set1_epi32(c))
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn round_shift_s32x4(v: __m128i, add: i32, shift: i32) -> __m128i {
-    _mm_sra_epi32(
-        _mm_add_epi32(v, _mm_set1_epi32(add)),
-        _mm_cvtsi32_si128(shift),
-    )
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
 fn pack_u16x8(lo: __m128i, hi: __m128i) -> __m128i {
     _mm_packus_epi32(lo, hi)
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn x_lanes(base: usize) -> __m128i {
-    _mm_add_epi32(_mm_set1_epi32(base as i32), _mm_setr_epi32(1, 2, 3, 4))
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn nx_lanes(n: usize, base: usize) -> __m128i {
-    _mm_sub_epi32(
-        _mm_set1_epi32((n - 1 - base) as i32),
-        _mm_setr_epi32(0, 1, 2, 3),
-    )
 }
 
 #[inline]
@@ -131,24 +101,17 @@ fn u16x8_hi_to_i32x4(v: __m128i, zero: __m128i) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-#[allow(clippy::too_many_arguments)]
 fn planar4_wide_sse41(
     above: __m128i,
     x: usize,
-    n: usize,
-    left_y: i32,
-    tr: i32,
-    bl_part: i32,
-    ny: i32,
-    add: i32,
-    shift: i32,
+    row_ramp: __m128i,
+    slope: i32,
+    above_weight: __m128i,
+    shift: __m128i,
 ) -> __m128i {
-    let h = _mm_add_epi32(
-        _mm_mullo_epi32(nx_lanes(n, x), _mm_set1_epi32(left_y)),
-        mul_const(x_lanes(x), tr),
-    );
-    let v = _mm_add_epi32(mul_const(above, ny), _mm_set1_epi32(bl_part));
-    round_shift_s32x4(_mm_add_epi32(h, v), add, shift)
+    let horizontal = _mm_add_epi32(row_ramp, _mm_set1_epi32(x as i32 * slope));
+    let vertical = _mm_mullo_epi32(above, above_weight);
+    _mm_sra_epi32(_mm_add_epi32(horizontal, vertical), shift)
 }
 
 #[inline]
@@ -160,17 +123,24 @@ fn store_planar_row_sse41(
     tr: i32,
     bl: i32,
     y: usize,
-    n: usize,
+    shift: __m128i,
 ) {
-    let shift = n.trailing_zeros() as i32 + 1;
-    let add = n as i32;
-    let ny = (n - 1 - y) as i32;
-    let bl_part = (y + 1) as i32 * bl;
+    let n = out.len();
+    let slope = tr - left_y;
+    // Expand (n - 1 - x) * left + (x + 1) * top_right into
+    // n * left + (x + 1) * slope. Include the bottom-left term and
+    // rounding bias in the base, so the horizontal ramp is built once.
+    let row_base = (n as i32) * (left_y + 1) + (y + 1) as i32 * bl;
+    let row_ramp = _mm_add_epi32(
+        _mm_set1_epi32(row_base),
+        _mm_mullo_epi32(_mm_setr_epi32(1, 2, 3, 4), _mm_set1_epi32(slope)),
+    );
+    let above_weight = _mm_set1_epi32((n - 1 - y) as i32);
     let zero = _mm_setzero_si128();
 
     if n == 2 {
         let a = u16x8_lo_to_i32x4(load_u16x4(&above[1..]), zero);
-        let lo = planar4_wide_sse41(a, 0, n, left_y, tr, bl_part, ny, add, shift);
+        let lo = planar4_wide_sse41(a, 0, row_ramp, slope, above_weight, shift);
         store_u16x2(out, pack_u16x8(lo, zero));
         return;
     }
@@ -185,45 +155,33 @@ fn store_planar_row_sse41(
         let lo0 = planar4_wide_sse41(
             u16x8_lo_to_i32x4(a0, zero),
             x,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         let hi0 = planar4_wide_sse41(
             u16x8_hi_to_i32x4(a0, zero),
             x + 4,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         let lo1 = planar4_wide_sse41(
             u16x8_lo_to_i32x4(a1, zero),
             x + 8,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         let hi1 = planar4_wide_sse41(
             u16x8_hi_to_i32x4(a1, zero),
             x + 12,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         store_u16x8(&mut dst[..], pack_u16x8(lo0, hi0));
@@ -239,23 +197,17 @@ fn store_planar_row_sse41(
         let lo = planar4_wide_sse41(
             u16x8_lo_to_i32x4(a, zero),
             x,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         let hi = planar4_wide_sse41(
             u16x8_hi_to_i32x4(a, zero),
             x + 4,
-            n,
-            left_y,
-            tr,
-            bl_part,
-            ny,
-            add,
+            row_ramp,
+            slope,
+            above_weight,
             shift,
         );
         store_u16x8(&mut dst[..], pack_u16x8(lo, hi));
@@ -264,7 +216,7 @@ fn store_planar_row_sse41(
     if !above_tail.is_empty() {
         let x = x8_base + above8.len() * 8;
         let a = u16x8_lo_to_i32x4(load_u16x8(&above[1 + x..]), zero);
-        let lo = planar4_wide_sse41(a, x, n, left_y, tr, bl_part, ny, add, shift);
+        let lo = planar4_wide_sse41(a, x, row_ramp, slope, above_weight, shift);
         store_u16x4(out_tail, pack_u16x8(lo, zero));
     }
 }
@@ -656,10 +608,11 @@ fn predict_planar_sse41(above: &[u16], left: &[u16], n: usize, out: &mut [u16]) 
     debug_assert!(left.len() > 2 * n);
     debug_assert!(out.len() >= n * n);
 
-    let tr = above[n + 1] as i32;
-    let bl = left[n + 1] as i32;
+    let tr = i32::from(above[n + 1]);
+    let bl = i32::from(left[n + 1]);
+    let shift = _mm_cvtsi32_si128(n.trailing_zeros() as i32 + 1);
     for (y, row) in out[..n * n].chunks_exact_mut(n).enumerate() {
-        store_planar_row_sse41(row, above, left[y + 1] as i32, tr, bl, y, n);
+        store_planar_row_sse41(row, above, i32::from(left[y + 1]), tr, bl, y, shift);
     }
 }
 
@@ -769,6 +722,38 @@ pub(crate) fn predict_into_sse41(
             26 => predict_mode26_sse41(above, left, n, is_luma, bit_depth, out),
             2..=34 => predict_angular_sse41(mode, above, left, n, bit_depth, out, refs_ang),
             _ => predict_into_scalar(mode, above, left, n, is_luma, bit_depth, out, refs_ang),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PLANAR, predict_into_scalar, predict_into_sse41};
+
+    #[test]
+    fn planar_ramp_matches_scalar() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+
+        let ramp: [u16; 65] = std::array::from_fn(|i| (i * 8_341 + 19) as u16);
+        let inverse = ramp.map(|sample| u16::MAX - sample);
+        let black = [0; 65];
+        let white = [u16::MAX; 65];
+        let refs = [&ramp, &inverse, &black, &white];
+        let mut expected = [0u16; 32 * 32];
+        let mut actual = [0u16; 32 * 32];
+        let mut tmp = [0; 3 * 32 + 1];
+        for n in [2, 4, 8, 16, 32] {
+            for above in refs {
+                for left in refs {
+                    let above = &above[..2 * n + 1];
+                    let left = &left[..2 * n + 1];
+                    predict_into_scalar(PLANAR, above, left, n, true, 16, &mut expected, &mut tmp);
+                    predict_into_sse41(PLANAR, above, left, n, true, 16, &mut actual, &mut tmp);
+                    assert_eq!(&actual[..n * n], &expected[..n * n], "size {n}");
+                }
+            }
         }
     }
 }
